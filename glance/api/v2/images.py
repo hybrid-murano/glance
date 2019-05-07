@@ -21,9 +21,11 @@ from oslo_log import log as logging
 from oslo_serialization import jsonutils as json
 from oslo_utils import encodeutils
 import six
+from six.moves import http_client as http
 import six.moves.urllib.parse as urlparse
 import webob.exc
 
+from glance.api import common
 from glance.api import policy
 from glance.common import exception
 from glance.common import location_strategy
@@ -86,6 +88,87 @@ class ImagesController(object):
 
         return image
 
+    @utils.mutating
+    def import_image(self, req, image_id, body):
+        image_repo = self.gateway.get_repo(req.context)
+        task_factory = self.gateway.get_task_factory(req.context)
+        executor_factory = self.gateway.get_task_executor_factory(req.context)
+        task_repo = self.gateway.get_task_repo(req.context)
+        import_method = body.get('method').get('name')
+        uri = body.get('method').get('uri')
+
+        try:
+            image = image_repo.get(image_id)
+            if image.status == 'active':
+                msg = _("Image with status active cannot be target for import")
+                raise exception.Conflict(msg)
+            if image.status != 'queued' and import_method == 'web-download':
+                msg = _("Image needs to be in 'queued' state to use "
+                        "'web-download' method")
+                raise exception.Conflict(msg)
+            if (image.status != 'uploading' and
+                    import_method == 'glance-direct'):
+                msg = _("Image needs to be staged before 'glance-direct' "
+                        "method can be used")
+                raise exception.Conflict(msg)
+            if not getattr(image, 'container_format', None):
+                msg = _("'container_format' needs to be set before import")
+                raise exception.Conflict(msg)
+            if not getattr(image, 'disk_format', None):
+                msg = _("'disk_format' needs to be set before import")
+                raise exception.Conflict(msg)
+
+            backend = None
+            if CONF.enabled_backends:
+                backend = req.headers.get('x-image-meta-store',
+                                          CONF.glance_store.default_backend)
+                try:
+                    glance_store.get_store_from_store_identifier(backend)
+                except glance_store.UnknownScheme:
+                    msg = _("Store for scheme %s not found") % backend
+                    LOG.warn(msg)
+                    raise exception.Conflict(msg)
+        except exception.Conflict as e:
+            raise webob.exc.HTTPConflict(explanation=e.msg)
+        except exception.NotFound as e:
+            raise webob.exc.HTTPNotFound(explanation=e.msg)
+
+        task_input = {'image_id': image_id,
+                      'import_req': body,
+                      'backend': backend}
+
+        if (import_method == 'web-download' and
+           not utils.validate_import_uri(uri)):
+                LOG.debug("URI for web-download does not pass filtering: %s",
+                          uri)
+                msg = (_("URI for web-download does not pass filtering: %s") %
+                       uri)
+                raise webob.exc.HTTPBadRequest(explanation=msg)
+
+        try:
+            import_task = task_factory.new_task(task_type='api_image_import',
+                                                owner=req.context.owner,
+                                                task_input=task_input)
+            task_repo.add(import_task)
+            task_executor = executor_factory.new_task_executor(req.context)
+            pool = common.get_thread_pool("tasks_eventlet_pool")
+            pool.spawn_n(import_task.run, task_executor)
+        except exception.Forbidden as e:
+            LOG.debug("User not permitted to create image import task.")
+            raise webob.exc.HTTPForbidden(explanation=e.msg)
+        except exception.Conflict as e:
+            raise webob.exc.HTTPConflict(explanation=e.msg)
+        except exception.InvalidImageStatusTransition as e:
+            raise webob.exc.HTTPConflict(explanation=e.msg)
+        except ValueError as e:
+            LOG.debug("Cannot import data for image %(id)s: %(e)s",
+                      {'id': image_id,
+                       'e': encodeutils.exception_to_unicode(e)})
+            raise webob.exc.HTTPBadRequest(
+                explanation=encodeutils.exception_to_unicode(e))
+
+        return image_id
+
     def index(self, req, marker=None, limit=None, sort_key=None,
               sort_dir=None, filters=None, member_status='accepted'):
         sort_key = ['created_at'] if not sort_key else sort_key
@@ -96,6 +179,23 @@ class ImagesController(object):
         if filters is None:
             filters = {}
         filters['deleted'] = False
+
+        os_hidden = filters.get('os_hidden', 'false').lower()
+        if os_hidden not in ['true', 'false']:
+            message = _("Invalid value '%s' for 'os_hidden' filter."
+                        " Valid values are 'true' or 'false'.") % os_hidden
+            raise webob.exc.HTTPBadRequest(explanation=message)
+        # ensure the type of os_hidden is boolean
+        filters['os_hidden'] = os_hidden == 'true'
+
+        protected = filters.get('protected')
+        if protected is not None:
+            if protected not in ['true', 'false']:
+                message = _("Invalid value '%s' for 'protected' filter."
+                            " Valid values are 'true' or 'false'.") % protected
+                raise webob.exc.HTTPBadRequest(explanation=message)
+            # ensure the type of protected is boolean
+            filters['protected'] = protected == 'true'
 
         if limit is None:
             limit = CONF.limit_param_default
@@ -174,10 +274,10 @@ class ImagesController(object):
         path = change['path']
         path_root = path[0]
         value = change['value']
-        if path_root == 'locations' and value == []:
+        if path_root == 'locations' and not value:
             msg = _("Cannot set locations to empty list.")
             raise webob.exc.HTTPForbidden(msg)
-        elif path_root == 'locations' and value != []:
+        elif path_root == 'locations' and value:
             self._do_replace_locations(image, value)
         elif path_root == 'owner' and req.context.is_admin == False:
             msg = _("Owner can't be updated by non admin.")
@@ -232,6 +332,14 @@ class ImagesController(object):
         image_repo = self.gateway.get_repo(req.context)
         try:
             image = image_repo.get(image_id)
+
+            if image.status == 'uploading':
+                file_path = str(CONF.node_staging_uri + '/' + image.image_id)
+                if CONF.enabled_backends:
+                    self.store_api.delete(file_path, None)
+                else:
+                    self.store_api.delete_from_backend(file_path)
+
             image.delete()
             image_repo.remove(image)
         except (glance_store.Forbidden, exception.Forbidden) as e:
@@ -274,12 +382,15 @@ class ImagesController(object):
                     "invisible.")
             raise webob.exc.HTTPForbidden(explanation=msg)
 
+        if image.status not in ('active', 'queued'):
+            msg = _("It's not allowed to replace locations if image status is "
+                    "%s.") % image.status
+            raise webob.exc.HTTPConflict(explanation=msg)
+
         try:
             # NOTE(flwang): _locations_proxy's setattr method will check if
             # the update is acceptable.
             image.locations = value
-            if image.status == 'queued':
-                image.status = 'active'
         except (exception.BadStoreUri, exception.DuplicateLocation) as e:
             raise webob.exc.HTTPBadRequest(explanation=e.msg)
         except ValueError as ve:    # update image status failed.
@@ -291,6 +402,11 @@ class ImagesController(object):
             msg = _("It's not allowed to add locations if locations are "
                     "invisible.")
             raise webob.exc.HTTPForbidden(explanation=msg)
+
+        if image.status not in ('active', 'queued'):
+            msg = _("It's not allowed to add locations if image status is "
+                    "%s.") % image.status
+            raise webob.exc.HTTPConflict(explanation=msg)
 
         pos = self._get_locations_op_pos(path_pos,
                                          len(image.locations), True)
@@ -312,6 +428,11 @@ class ImagesController(object):
             msg = _("It's not allowed to remove locations if locations are "
                     "invisible.")
             raise webob.exc.HTTPForbidden(explanation=msg)
+
+        if image.status not in ('active'):
+            msg = _("It's not allowed to remove locations if image status is "
+                    "%s.") % image.status
+            raise webob.exc.HTTPConflict(explanation=msg)
 
         if len(image.locations) == 1:
             LOG.debug("User forbidden to remove last location of image %s",
@@ -339,12 +460,13 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
     _disallowed_properties = ('direct_url', 'self', 'file', 'schema')
     _readonly_properties = ('created_at', 'updated_at', 'status', 'checksum',
                             'size', 'virtual_size', 'direct_url', 'self',
-                            'file', 'schema', 'id')
+                            'file', 'schema', 'id', 'os_hash_algo',
+                            'os_hash_value')
     _reserved_properties = ('location', 'deleted', 'deleted_at')
     _base_properties = ('checksum', 'created_at', 'container_format',
                         'disk_format', 'id', 'min_disk', 'min_ram', 'name',
                         'size', 'virtual_size', 'status', 'tags', 'owner',
-                        'updated_at', 'visibility', 'protected')
+                        'updated_at', 'visibility', 'protected', 'os_hidden')
     _available_sort_keys = ('name', 'status', 'container_format',
                             'disk_format', 'size', 'id', 'created_at',
                             'updated_at')
@@ -397,6 +519,15 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
                     image[key] = properties.pop(key)
             except KeyError:
                 pass
+
+        # NOTE(abhishekk): Check if custom property key name is less than 255
+        # characters. Reference LP #1737952
+        for key in properties:
+            if len(key) > 255:
+                msg = (_("Custom property should not be greater than 255 "
+                         "characters."))
+                raise webob.exc.HTTPBadRequest(explanation=msg)
+
         return dict(image=image, extra_properties=properties, tags=tags)
 
     def _get_change_operation_d10(self, raw_change):
@@ -500,13 +631,13 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
             partial_image = {path_root: change['value']}
         elif ((path_root in get_base_properties().keys()) and
               (get_base_properties()[path_root].get('type', '') == 'array')):
-            # NOTE(zhiyan): cient can use PATCH API to adding element to
-            # the image's existing set property directly.
-            # Such as: 1. using '/locations/N' path to adding a location
-            #             to the image's 'locations' list at N position.
+            # NOTE(zhiyan): client can use the PATCH API to add an element
+            # directly to an existing property
+            # Such as: 1. using '/locations/N' path to add a location
+            #             to the image's 'locations' list at position N.
             #             (implemented)
-            #          2. using '/tags/-' path to appending a tag to the
-            #             image's 'tags' list at last. (Not implemented)
+            #          2. using '/tags/-' path to append a tag to the
+            #             image's 'tags' list at the end. (Not implemented)
             partial_image = {path_root: [change['value']]}
 
         if partial_image:
@@ -618,10 +749,10 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
     def _get_filters(self, filters):
         visibility = filters.get('visibility')
         if visibility:
-            if visibility not in ['public', 'private', 'shared']:
+            if visibility not in ['community', 'public', 'private', 'shared']:
                 msg = _('Invalid visibility value: %s') % visibility
                 raise webob.exc.HTTPBadRequest(explanation=msg)
-        changes_since = filters.get('changes-since', None)
+        changes_since = filters.get('changes-since')
         if changes_since:
             msg = _('The "changes-since" filter is no longer available on v2.')
             raise webob.exc.HTTPBadRequest(explanation=msg)
@@ -721,6 +852,28 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
 
         return query_params
 
+    def _validate_import_body(self, body):
+        # TODO(rosmaita): do schema validation of body instead
+        # of this ad-hoc stuff
+        try:
+            method = body['method']
+        except KeyError:
+            msg = _("Import request requires a 'method' field.")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        try:
+            method_name = method['name']
+        except KeyError:
+            msg = _("Import request requires a 'name' field.")
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+        if method_name not in CONF.enabled_import_methods:
+            msg = _("Unknown import method name '%s'.") % method_name
+            raise webob.exc.HTTPBadRequest(explanation=msg)
+
+    def import_image(self, request):
+        body = self._get_request_body(request)
+        self._validate_import_body(body)
+        return {'body': body}
+
 
 class ResponseSerializer(wsgi.JSONResponseSerializer):
     def __init__(self, schema=None):
@@ -746,7 +899,8 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
             attributes = ['name', 'disk_format', 'container_format',
                           'visibility', 'size', 'virtual_size', 'status',
                           'checksum', 'protected', 'min_ram', 'min_disk',
-                          'owner']
+                          'owner', 'os_hidden', 'os_hash_algo',
+                          'os_hash_value']
             for key in attributes:
                 image_view[key] = getattr(image, key)
             image_view['id'] = image.image_id
@@ -767,8 +921,8 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
                     # image.locations is None to indicate it's allowed to show
                     # locations but it's just non-existent.
                     image_view['locations'] = []
-                    LOG.debug("There is not available location "
-                              "for image %s", image.image_id)
+                    LOG.debug("The 'locations' list of image %s is empty",
+                              image.image_id)
 
             if CONF.show_image_direct_url:
                 locations = _get_image_locations(image)
@@ -777,22 +931,48 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
                     l = location_strategy.choose_best_location(locations)
                     image_view['direct_url'] = l['url']
                 else:
-                    LOG.debug("There is not available location "
-                              "for image %s", image.image_id)
+                    LOG.debug("The 'locations' list of image %s is empty, "
+                              "not including 'direct_url' in response",
+                              image.image_id)
 
             image_view['tags'] = list(image.tags)
             image_view['self'] = self._get_image_href(image)
             image_view['file'] = self._get_image_href(image, 'file')
             image_view['schema'] = '/v2/schemas/image'
             image_view = self.schema.filter(image_view)  # domain
+
+            # add store information to image
+            if CONF.enabled_backends:
+                locations = _get_image_locations(image)
+                if locations:
+                    stores = []
+                    for loc in locations:
+                        backend = loc['metadata'].get('backend')
+                        if backend:
+                            stores.append(backend)
+
+                    if stores:
+                        image_view['stores'] = ",".join(stores)
+
             return image_view
         except exception.Forbidden as e:
             raise webob.exc.HTTPForbidden(explanation=e.msg)
 
     def create(self, response, image):
-        response.status_int = 201
+        response.status_int = http.CREATED
         self.show(response, image)
         response.location = self._get_image_href(image)
+        # according to RFC7230, headers should not have empty fields
+        # see http://httpwg.org/specs/rfc7230.html#field.components
+        if CONF.enabled_import_methods:
+            import_methods = ("OpenStack-image-import-methods",
+                              ','.join(CONF.enabled_import_methods))
+            response.headerlist.append(import_methods)
+
+        if CONF.enabled_backends:
+            enabled_backends = ("OpenStack-image-store-ids",
+                                ','.join(CONF.enabled_backends.keys()))
+            response.headerlist.append(enabled_backends)
 
     def show(self, response, image):
         image_view = self._format_image(image)
@@ -826,7 +1006,10 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         response.content_type = 'application/json'
 
     def delete(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
+
+    def import_image(self, response, result):
+        response.status_int = http.ACCEPTED
 
 
 def get_base_properties():
@@ -847,22 +1030,41 @@ def get_base_properties():
             'readOnly': True,
             'description': _('Status of the image'),
             'enum': ['queued', 'saving', 'active', 'killed',
-                     'deleted', 'pending_delete', 'deactivated'],
+                     'deleted', 'uploading', 'importing',
+                     'pending_delete', 'deactivated'],
         },
         'visibility': {
             'type': 'string',
             'description': _('Scope of image accessibility'),
-            'enum': ['public', 'private'],
+            'enum': ['community', 'public', 'private', 'shared'],
         },
         'protected': {
             'type': 'boolean',
             'description': _('If true, image will not be deletable.'),
+        },
+        'os_hidden': {
+            'type': 'boolean',
+            'description': _('If true, image will not appear in default '
+                             'image list response.'),
         },
         'checksum': {
             'type': ['null', 'string'],
             'readOnly': True,
             'description': _('md5 hash of image contents.'),
             'maxLength': 32,
+        },
+        'os_hash_algo': {
+            'type': ['null', 'string'],
+            'readOnly': True,
+            'description': _('Algorithm to calculate the os_hash_value'),
+            'maxLength': 64,
+        },
+        'os_hash_value': {
+            'type': ['null', 'string'],
+            'readOnly': True,
+            'description': _('Hexdigest of the image contents using the '
+                             'algorithm specified by the os_hash_algo'),
+            'maxLength': 128,
         },
         'owner': {
             'type': ['null', 'string'],
@@ -937,6 +1139,11 @@ def get_base_properties():
             'type': 'string',
             'readOnly': True,
             'description': _('An image file url'),
+        },
+        'backend': {
+            'type': 'string',
+            'readOnly': True,
+            'description': _('Backend store to upload image to'),
         },
         'schema': {
             'type': 'string',

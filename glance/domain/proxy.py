@@ -172,8 +172,11 @@ class Image(object):
     min_disk = _proxy('base', 'min_disk')
     min_ram = _proxy('base', 'min_ram')
     protected = _proxy('base', 'protected')
+    os_hidden = _proxy('base', 'os_hidden')
     locations = _proxy('base', 'locations')
     checksum = _proxy('base', 'checksum')
+    os_hash_algo = _proxy('base', 'os_hash_algo')
+    os_hash_value = _proxy('base', 'os_hash_value')
     owner = _proxy('base', 'owner')
     disk_format = _proxy('base', 'disk_format')
     container_format = _proxy('base', 'container_format')
@@ -191,8 +194,8 @@ class Image(object):
     def reactivate(self):
         self.base.reactivate()
 
-    def set_data(self, data, size=None):
-        self.base.set_data(data, size)
+    def set_data(self, data, size=None, backend=None):
+        self.base.set_data(data, size, backend=backend)
 
     def get_data(self, *args, **kwargs):
         return self.base.get_data(*args, **kwargs)

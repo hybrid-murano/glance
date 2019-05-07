@@ -18,15 +18,17 @@ import copy
 import functools
 import uuid
 
+from oslo_config import cfg
 from oslo_log import log as logging
 import six
 
 from glance.common import exception
 from glance.common import timeutils
 from glance.common import utils
+from glance.db import utils as db_utils
 from glance.i18n import _, _LI, _LW
 
-
+CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
 DATA = {
@@ -42,12 +44,6 @@ DATA = {
     'locations': [],
     'tasks': {},
     'task_info': {},
-    'artifacts': {},
-    'artifact_properties': {},
-    'artifact_tags': {},
-    'artifact_dependencies': {},
-    'artifact_blobs': {},
-    'artifact_blob_locations': {}
 }
 
 INDEX = 0
@@ -69,6 +65,15 @@ def log_call(func):
     return wrapped
 
 
+def configure():
+    if CONF.workers not in [0, 1]:
+        msg = _('CONF.workers should be set to 0 or 1 when using the '
+                'db.simple.api backend. Fore more info, see '
+                'https://bugs.launchpad.net/glance/+bug/1619508')
+        LOG.critical(msg)
+        raise SystemExit(msg)
+
+
 def reset():
     global DATA
     DATA = {
@@ -84,7 +89,6 @@ def reset():
         'locations': [],
         'tasks': {},
         'task_info': {},
-        'artifacts': {}
     }
 
 
@@ -199,6 +203,7 @@ def _image_update(image, values, properties):
     if 'properties' not in image.keys():
         image['properties'] = []
     image['properties'].extend(properties)
+    values = db_utils.ensure_image_dict_v2_compliant(values)
     image.update(values)
     return image
 
@@ -212,7 +217,7 @@ def _image_format(image_id, **values):
         'locations': [],
         'status': 'queued',
         'protected': False,
-        'is_public': False,
+        'visibility': 'shared',
         'container_format': None,
         'disk_format': None,
         'min_ram': 0,
@@ -220,11 +225,14 @@ def _image_format(image_id, **values):
         'size': None,
         'virtual_size': None,
         'checksum': None,
+        'os_hash_algo': None,
+        'os_hash_value': None,
         'tags': [],
         'created_at': dt,
         'updated_at': dt,
         'deleted_at': None,
         'deleted': False,
+        'os_hidden': False
     }
 
     locations = values.pop('locations', None)
@@ -253,33 +261,51 @@ def _filter_images(images, filters, context,
         status = None
 
     visibility = filters.pop('visibility', None)
+    os_hidden = filters.pop('os_hidden', False)
 
     for image in images:
         member = image_member_find(context, image_id=image['id'],
                                    member=context.owner, status=status)
         is_member = len(member) > 0
         has_ownership = context.owner and image['owner'] == context.owner
-        can_see = (image['is_public'] or has_ownership or is_member or
-                   (context.is_admin and not admin_as_user))
+        image_is_public = image['visibility'] == 'public'
+        image_is_community = image['visibility'] == 'community'
+        image_is_shared = image['visibility'] == 'shared'
+        image_is_hidden = image['os_hidden'] == True
+        acts_as_admin = context.is_admin and not admin_as_user
+        can_see = (image_is_public
+                   or image_is_community
+                   or has_ownership
+                   or (is_member and image_is_shared)
+                   or acts_as_admin)
         if not can_see:
             continue
 
         if visibility:
             if visibility == 'public':
-                if not image['is_public']:
+                if not image_is_public:
                     continue
             elif visibility == 'private':
-                if image['is_public']:
+                if not (image['visibility'] == 'private'):
                     continue
-                if not (has_ownership or (context.is_admin
-                        and not admin_as_user)):
+                if not (has_ownership or acts_as_admin):
                     continue
             elif visibility == 'shared':
-                if not is_member:
+                if not image_is_shared:
                     continue
+            elif visibility == 'community':
+                if not image_is_community:
+                    continue
+        else:
+            if (not has_ownership) and image_is_community:
+                continue
 
         if is_public is not None:
-            if not image['is_public'] == is_public:
+            if not image_is_public == is_public:
+                continue
+
+        if os_hidden:
+            if image_is_hidden:
                 continue
 
         to_add = True
@@ -420,17 +446,21 @@ def _image_get(context, image_id, force_show_deleted=False, status=None):
 
 
 @log_call
-def image_get(context, image_id, session=None, force_show_deleted=False):
-    image = _image_get(context, image_id, force_show_deleted)
-    return _normalize_locations(context, copy.deepcopy(image),
-                                force_show_deleted=force_show_deleted)
+def image_get(context, image_id, session=None, force_show_deleted=False,
+              v1_mode=False):
+    image = copy.deepcopy(_image_get(context, image_id, force_show_deleted))
+    image = _normalize_locations(context, image,
+                                 force_show_deleted=force_show_deleted)
+    if v1_mode:
+        image = db_utils.mutate_image_dict_to_v1(image)
+    return image
 
 
 @log_call
 def image_get_all(context, filters=None, marker=None, limit=None,
                   sort_key=None, sort_dir=None,
                   member_status='accepted', is_public=None,
-                  admin_as_user=False, return_tag=False):
+                  admin_as_user=False, return_tag=False, v1_mode=False):
     filters = filters or {}
     images = DATA['images'].values()
     images = _filter_images(images, filters, context, member_status,
@@ -446,8 +476,22 @@ def image_get_all(context, filters=None, marker=None, limit=None,
                                    force_show_deleted=force_show_deleted)
         if return_tag:
             img['tags'] = image_tag_get_all(context, img['id'])
+
+        if v1_mode:
+            img = db_utils.mutate_image_dict_to_v1(img)
         res.append(img)
     return res
+
+
+def image_restore(context, image_id):
+    """Restore the pending-delete image to active."""
+    image = _image_get(context, image_id)
+    if image['status'] != 'pending_delete':
+        msg = (_('cannot restore the image from %s to active (wanted '
+                 'from_state=pending_delete)') % image['status'])
+        raise exception.Conflict(msg)
+    values = {'status': 'active', 'deleted': 0}
+    image_update(context, image_id, values)
 
 
 @log_call
@@ -514,6 +558,7 @@ def image_member_count(context, image_id):
 
 
 @log_call
+@utils.no_4byte_params
 def image_member_create(context, values):
     member = _image_member_format(values['image_id'],
                                   values['member'],
@@ -667,7 +712,7 @@ def _normalize_locations(context, image, force_show_deleted=False):
     if force_show_deleted:
         locations = image['locations']
     else:
-        locations = filter(lambda x: not x['deleted'], image['locations'])
+        locations = [x for x in image['locations'] if not x['deleted']]
     image['locations'] = [{'id': loc['id'],
                            'url': loc['url'],
                            'metadata': loc['metadata'],
@@ -677,7 +722,7 @@ def _normalize_locations(context, image, force_show_deleted=False):
 
 
 @log_call
-def image_create(context, image_values):
+def image_create(context, image_values, v1_mode=False):
     global DATA
     image_id = image_values.get('id', str(uuid.uuid4()))
 
@@ -691,7 +736,8 @@ def image_create(context, image_values):
                         'virtual_size', 'checksum', 'locations', 'owner',
                         'protected', 'is_public', 'container_format',
                         'disk_format', 'created_at', 'updated_at', 'deleted',
-                        'deleted_at', 'properties', 'tags'])
+                        'deleted_at', 'properties', 'tags', 'visibility',
+                        'os_hidden', 'os_hash_algo', 'os_hash_value'])
 
     incorrect_keys = set(image_values.keys()) - allowed_keys
     if incorrect_keys:
@@ -702,12 +748,15 @@ def image_create(context, image_values):
     DATA['images'][image_id] = image
     DATA['tags'][image_id] = image.pop('tags', [])
 
-    return _normalize_locations(context, copy.deepcopy(image))
+    image = _normalize_locations(context, copy.deepcopy(image))
+    if v1_mode:
+        image = db_utils.mutate_image_dict_to_v1(image)
+    return image
 
 
 @log_call
 def image_update(context, image_id, image_values, purge_props=False,
-                 from_state=None):
+                 from_state=None, v1_mode=False):
     global DATA
     try:
         image = DATA['images'][image_id]
@@ -730,7 +779,11 @@ def image_update(context, image_id, image_values, purge_props=False,
     image['updated_at'] = timeutils.utcnow()
     _image_update(image, image_values, new_properties)
     DATA['images'][image_id] = image
-    return _normalize_locations(context, copy.deepcopy(image))
+
+    image = _normalize_locations(context, copy.deepcopy(image))
+    if v1_mode:
+        image = db_utils.mutate_image_dict_to_v1(image)
+    return image
 
 
 @log_call
@@ -784,7 +837,7 @@ def image_tag_get(context, image_id, value):
 @log_call
 def image_tag_set_all(context, image_id, values):
     global DATA
-    DATA['tags'][image_id] = values
+    DATA['tags'][image_id] = list(values)
 
 
 @log_call
@@ -804,51 +857,10 @@ def image_tag_delete(context, image_id, value):
         raise exception.NotFound()
 
 
-def is_image_mutable(context, image):
-    """Return True if the image is mutable in this context."""
-    # Is admin == image mutable
-    if context.is_admin:
-        return True
-
-    # No owner == image not mutable
-    if image['owner'] is None or context.owner is None:
-        return False
-
-    # Image only mutable by its owner
-    return image['owner'] == context.owner
-
-
 def is_image_visible(context, image, status=None):
-    """Return True if the image is visible in this context."""
-    # Is admin == image visible
-    if context.is_admin:
-        return True
-
-    # No owner == image visible
-    if image['owner'] is None:
-        return True
-
-    # Image is_public == image visible
-    if image['is_public']:
-        return True
-
-    # Perform tests based on whether we have an owner
-    if context.owner is not None:
-        if context.owner == image['owner']:
-            return True
-
-        # Figure out if this image is shared with that tenant
-        if status == 'all':
-            status = None
-        members = image_member_find(context,
-                                    image_id=image['id'],
-                                    member=context.owner,
-                                    status=status)
-        if members:
-            return True
-
-    # Private image
-    return False
+    if status == 'all':
+        status = None
+    return db_utils.is_image_visible(context, image, image_member_find, status)
 
 
 def user_get_storage_usage(context, owner_id, image_id=None, session=None):
@@ -959,6 +971,20 @@ def task_delete(context, task_id):
         raise exception.TaskNotFound(task_id=task_id)
 
 
+def _task_soft_delete(context):
+    """Scrub task entities which are expired """
+    global DATA
+    now = timeutils.utcnow()
+    tasks = DATA['tasks'].values()
+
+    for task in tasks:
+        if(task['owner'] == context.owner and task['deleted'] == False
+           and task['expires_at'] <= now):
+
+            task['deleted'] = True
+            task['deleted_at'] = timeutils.utcnow()
+
+
 @log_call
 def task_get_all(context, filters=None, marker=None, limit=None,
                  sort_key='created_at', sort_dir='desc'):
@@ -972,6 +998,7 @@ def task_get_all(context, filters=None, marker=None, limit=None,
     :param sort_dir: direction in which results should be sorted (asc, desc)
     :returns: tasks set
     """
+    _task_soft_delete(context)
     filters = filters or {}
     tasks = DATA['tasks'].values()
     tasks = _filter_tasks(tasks, filters, context)
@@ -1107,6 +1134,7 @@ def _metadef_delete_namespace_content(get_func, key, context, namespace_name):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_namespace_create(context, values):
     """Create a namespace object"""
     global DATA
@@ -1140,6 +1168,7 @@ def metadef_namespace_create(context, values):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_namespace_update(context, namespace_id, values):
     """Update a namespace object"""
     global DATA
@@ -1213,7 +1242,7 @@ def metadef_namespace_get_all(context,
                               filters=None):
     """Get a namespaces list"""
     resource_types = filters.get('resource_types', []) if filters else []
-    visibility = filters.get('visibility', None) if filters else None
+    visibility = filters.get('visibility') if filters else None
 
     namespaces = []
     for namespace in DATA['metadef_namespaces']:
@@ -1327,6 +1356,7 @@ def metadef_object_get_all(context, namespace_name):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_object_create(context, namespace_name, values):
     """Create a metadef object"""
     global DATA
@@ -1367,6 +1397,7 @@ def metadef_object_create(context, namespace_name, values):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_object_update(context, namespace_name, object_id, values):
     """Update a metadef object"""
     global DATA
@@ -1450,6 +1481,7 @@ def metadef_property_count(context, namespace_name):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_property_create(context, namespace_name, values):
     """Create a metadef property"""
     global DATA
@@ -1493,6 +1525,7 @@ def metadef_property_create(context, namespace_name, values):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_property_update(context, namespace_name, property_id, values):
     """Update a metadef property"""
     global DATA
@@ -1785,6 +1818,7 @@ def metadef_tag_get_all(context, namespace_name, filters=None, marker=None,
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_tag_create(context, namespace_name, values):
     """Create a metadef tag"""
     global DATA
@@ -1867,6 +1901,7 @@ def metadef_tag_create_tags(context, namespace_name, tag_list):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_tag_update(context, namespace_name, id, values):
     """Update a metadef tag"""
     global DATA
@@ -1927,96 +1962,6 @@ def metadef_tag_count(context, namespace_name):
             count = count + 1
 
     return count
-
-
-def _artifact_format(artifact_id, **values):
-    dt = timeutils.utcnow()
-    artifact = {
-        'id': artifact_id,
-        'type_name': None,
-        'type_version_prefix': None,
-        'type_version_suffix': None,
-        'type_version_meta': None,
-        'version_prefix': None,
-        'version_suffix': None,
-        'version_meta': None,
-        'description': None,
-        'visibility': None,
-        'state': None,
-        'owner': None,
-        'scope': None,
-        'tags': [],
-        'properties': {},
-        'blobs': [],
-        'created_at': dt,
-        'updated_at': dt,
-        'deleted_at': None,
-        'deleted': False,
-    }
-
-    artifact.update(values)
-    return artifact
-
-
-@log_call
-def artifact_create(context, values, type_name, type_version):
-    global DATA
-    artifact_id = values.get('id', str(uuid.uuid4()))
-
-    if artifact_id in DATA['artifacts']:
-        raise exception.Duplicate()
-
-    if 'state' not in values:
-        raise exception.Invalid('state is a required attribute')
-
-    allowed_keys = set(['id',
-                        'type_name',
-                        'type_version',
-                        'name',
-                        'version',
-                        'description',
-                        'visibility',
-                        'state',
-                        'owner',
-                        'scope'])
-
-    incorrect_keys = set(values.keys()) - allowed_keys
-    if incorrect_keys:
-        raise exception.Invalid(
-            'The keys %s are not valid' % str(incorrect_keys))
-
-    artifact = _artifact_format(artifact_id, **values)
-    DATA['artifacts'][artifact_id] = artifact
-
-    return copy.deepcopy(artifact)
-
-
-def _artifact_get(context, artifact_id, type_name,
-                  type_version=None):
-    try:
-        artifact = DATA['artifacts'][artifact_id]
-        if (artifact['type_name'] != type_name or
-                (type_version is not None and
-                 artifact['type_version'] != type_version)):
-            raise KeyError
-    except KeyError:
-        LOG.info(_LI('Could not find artifact %s'), artifact_id)
-        raise exception.NotFound()
-
-    if artifact['deleted_at']:
-        LOG.info(_LI('Unable to get deleted image'))
-        raise exception.NotFound()
-
-    return artifact
-
-
-@log_call
-def artifact_get(context, artifact_id,
-                 type_name,
-                 type_version=None, session=None):
-    artifact = _artifact_get(context, artifact_id, type_name,
-                             type_version)
-    return copy.deepcopy(artifact)
 
 
 def _format_association(namespace, resource_type, association_values):

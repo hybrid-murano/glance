@@ -28,6 +28,7 @@ from oslo_config import cfg
 from oslo_db import exception as db_exception
 from oslo_db.sqlalchemy import session
 from oslo_log import log as logging
+from oslo_utils import excutils
 import osprofiler.sqlalchemy
 from retrying import retry
 import six
@@ -43,7 +44,6 @@ import sqlalchemy.sql as sa_sql
 from glance.common import exception
 from glance.common import timeutils
 from glance.common import utils
-from glance.db.sqlalchemy import glare
 from glance.db.sqlalchemy.metadef_api import (resource_type
                                               as metadef_resource_type_api)
 from glance.db.sqlalchemy.metadef_api import (resource_type_association
@@ -53,16 +53,15 @@ from glance.db.sqlalchemy.metadef_api import object as metadef_object_api
 from glance.db.sqlalchemy.metadef_api import property as metadef_property_api
 from glance.db.sqlalchemy.metadef_api import tag as metadef_tag_api
 from glance.db.sqlalchemy import models
-from glance import glare as ga
-from glance.i18n import _, _LW, _LE, _LI
+from glance.db import utils as db_utils
+from glance.i18n import _, _LW, _LI, _LE
 
-BASE = models.BASE
 sa_logger = None
 LOG = logging.getLogger(__name__)
 
 
 STATUSES = ['active', 'saving', 'queued', 'killed', 'pending_delete',
-            'deleted', 'deactivated']
+            'deleted', 'deactivated', 'importing', 'uploading']
 
 CONF = cfg.CONF
 CONF.import_group("profiler", "glance.common.wsgi")
@@ -105,6 +104,23 @@ def get_session(autocommit=True, expire_on_commit=False):
                               expire_on_commit=expire_on_commit)
 
 
+def _validate_db_int(**kwargs):
+    """Make sure that all arguments are less than or equal to 2 ** 31 - 1.
+
+    This limitation is introduced because databases stores INT in 4 bytes.
+    If the validation fails for some argument, exception.Invalid is raised with
+    appropriate information.
+    """
+    max_int = (2 ** 31) - 1
+
+    for param_key, param_value in kwargs.items():
+        if param_value and param_value > max_int:
+            msg = _("'%(param)s' value out of range, "
+                    "must not exceed %(max)d.") % {"param": param_key,
+                                                   "max": max_int}
+            raise exception.Invalid(msg)
+
+
 def clear_db_env():
     """
     Unset global configuration variables for database.
@@ -117,28 +133,50 @@ def _check_mutate_authorization(context, image_ref):
     if not is_image_mutable(context, image_ref):
         LOG.warn(_LW("Attempted to modify image user did not own."))
         msg = _("You do not own this image")
-        if image_ref.is_public:
-            exc_class = exception.ForbiddenPublicImage
-        else:
+        if image_ref.visibility in ['private', 'shared']:
             exc_class = exception.Forbidden
+        else:
+            # 'public', or 'community'
+            exc_class = exception.ForbiddenPublicImage
 
         raise exc_class(msg)
 
 
-def image_create(context, values):
+def image_create(context, values, v1_mode=False):
     """Create an image from the values dictionary."""
-    return _image_update(context, values, None, purge_props=False)
+    image = _image_update(context, values, None, purge_props=False)
+    if v1_mode:
+        image = db_utils.mutate_image_dict_to_v1(image)
+    return image
 
 
 def image_update(context, image_id, values, purge_props=False,
-                 from_state=None):
+                 from_state=None, v1_mode=False):
     """
     Set the given properties on an image and update it.
 
     :raises: ImageNotFound if image does not exist.
     """
-    return _image_update(context, values, image_id, purge_props,
-                         from_state=from_state)
+    image = _image_update(context, values, image_id, purge_props,
+                          from_state=from_state)
+    if v1_mode:
+        image = db_utils.mutate_image_dict_to_v1(image)
+    return image
+
+
+def image_restore(context, image_id):
+    """Restore the pending-delete image to active."""
+    session = get_session()
+    with session.begin():
+        image_ref = _image_get(context, image_id, session=session)
+        if image_ref.status != 'pending_delete':
+            msg = (_('cannot restore the image from %s to active (wanted '
+                     'from_state=pending_delete)') % image_ref.status)
+            raise exception.Conflict(msg)
+
+        query = session.query(models.Image).filter_by(id=image_id)
+        values = {'status': 'active', 'deleted': 0}
+        query.update(values, synchronize_session='fetch')
 
 
 @retry(retry_on_exception=_retry_on_deadlock, wait_fixed=500,
@@ -182,7 +220,7 @@ def _normalize_locations(context, image, force_show_deleted=False):
     if force_show_deleted:
         locations = image['locations']
     else:
-        locations = filter(lambda x: not x.deleted, image['locations'])
+        locations = [x for x in image['locations'] if not x.deleted]
     image['locations'] = [{'id': loc['id'],
                            'url': loc['value'],
                            'metadata': loc['meta_data'],
@@ -192,16 +230,19 @@ def _normalize_locations(context, image, force_show_deleted=False):
 
 
 def _normalize_tags(image):
-    undeleted_tags = filter(lambda x: not x.deleted, image['tags'])
+    undeleted_tags = [x for x in image['tags'] if not x.deleted]
     image['tags'] = [tag['value'] for tag in undeleted_tags]
     return image
 
 
-def image_get(context, image_id, session=None, force_show_deleted=False):
+def image_get(context, image_id, session=None, force_show_deleted=False,
+              v1_mode=False):
     image = _image_get(context, image_id, session=session,
                        force_show_deleted=force_show_deleted)
     image = _normalize_locations(context, image.to_dict(),
                                  force_show_deleted=force_show_deleted)
+    if v1_mode:
+        image = db_utils.mutate_image_dict_to_v1(image)
     return image
 
 
@@ -266,33 +307,7 @@ def is_image_mutable(context, image):
 
 def is_image_visible(context, image, status=None):
     """Return True if the image is visible in this context."""
-    # Is admin == image visible
-    if context.is_admin:
-        return True
-
-    # No owner == image visible
-    if image['owner'] is None:
-        return True
-
-    # Image is_public == image visible
-    if image['is_public']:
-        return True
-
-    # Perform tests based on whether we have an owner
-    if context.owner is not None:
-        if context.owner == image['owner']:
-            return True
-
-        # Figure out if this image is shared with that tenant
-        members = image_member_find(context,
-                                    image_id=image['id'],
-                                    member=context.owner,
-                                    status=status)
-        if members:
-            return True
-
-    # Private image
-    return False
+    return db_utils.is_image_visible(context, image, image_member_find, status)
 
 
 def _get_default_column_value(column_type):
@@ -440,17 +455,22 @@ def _make_conditions_from_filters(filters, is_public=None):
     tag_conditions = []
 
     if is_public is not None:
-        image_conditions.append(models.Image.is_public == is_public)
+        if is_public:
+            image_conditions.append(models.Image.visibility == 'public')
+        else:
+            image_conditions.append(models.Image.visibility != 'public')
+
+    if 'os_hidden' in filters:
+        os_hidden = filters.pop('os_hidden')
+        image_conditions.append(models.Image.os_hidden == os_hidden)
 
     if 'checksum' in filters:
         checksum = filters.pop('checksum')
         image_conditions.append(models.Image.checksum == checksum)
 
-    if 'is_public' in filters:
-        key = 'is_public'
-        value = filters.pop('is_public')
-        prop_filters = _make_image_property_condition(key=key, value=value)
-        prop_conditions.append(prop_filters)
+    if 'os_hash_value' in filters:
+        os_hash_value = filters.pop('os_hash_value')
+        image_conditions.append(models.Image.os_hash_value == os_hash_value)
 
     for (k, v) in filters.pop('properties', {}).items():
         prop_filters = _make_image_property_condition(key=k, value=v)
@@ -555,6 +575,7 @@ def _select_images_query(context, image_conditions, admin_as_user,
         models.Image.members).filter(img_conditional_clause)
     if regular_user:
         member_filters = [models.ImageMember.deleted == False]
+        member_filters.extend([models.Image.visibility == 'shared'])
         if context.owner is not None:
             member_filters.extend([models.ImageMember.member == context.owner])
             if member_status != 'all':
@@ -562,14 +583,13 @@ def _select_images_query(context, image_conditions, admin_as_user,
                     models.ImageMember.status == member_status])
         query_member = query_member.filter(sa_sql.and_(*member_filters))
 
-    # NOTE(venkatesh) if the 'visibility' is set to 'shared', we just
-    # query the image members table. No union is required.
-    if visibility is not None and visibility == 'shared':
-        return query_member
-
     query_image = session.query(models.Image).filter(img_conditional_clause)
     if regular_user:
-        query_image = query_image.filter(models.Image.is_public == True)
+        visibility_filters = [
+            models.Image.visibility == 'public',
+            models.Image.visibility == 'community',
+        ]
+        query_image = query_image .filter(sa_sql.or_(*visibility_filters))
         query_image_owner = None
         if context.owner is not None:
             query_image_owner = session.query(models.Image).filter(
@@ -588,7 +608,7 @@ def _select_images_query(context, image_conditions, admin_as_user,
 def image_get_all(context, filters=None, marker=None, limit=None,
                   sort_key=None, sort_dir=None,
                   member_status='accepted', is_public=None,
-                  admin_as_user=False, return_tag=False):
+                  admin_as_user=False, return_tag=False, v1_mode=False):
     """
     Get all images that match zero or more filters.
 
@@ -609,6 +629,8 @@ def image_get_all(context, filters=None, marker=None, limit=None,
     :param return_tag: To indicates whether image entry in result includes it
                        relevant tag entries. This could improve upper-layer
                        query performance, to prevent using separated calls
+    :param v1_mode: If true, mutates the 'visibility' value of each image
+                    into the v1-compatible field 'is_public'
     """
     sort_key = ['created_at'] if not sort_key else sort_key
 
@@ -634,12 +656,22 @@ def image_get_all(context, filters=None, marker=None, limit=None,
                                  admin_as_user,
                                  member_status,
                                  visibility)
-
     if visibility is not None:
-        if visibility == 'public':
-            query = query.filter(models.Image.is_public == True)
-        elif visibility == 'private':
-            query = query.filter(models.Image.is_public == False)
+        # with a visibility, we always and only include images with that
+        # visibility
+        query = query.filter(models.Image.visibility == visibility)
+    elif context.owner is None:
+        # without either a visibility or an owner, we never include
+        # 'community' images
+        query = query.filter(models.Image.visibility != 'community')
+    else:
+        # without a visibility and with an owner, we only want to include
+        # 'community' images if and only if they are owned by this owner
+        community_filters = [
+            models.Image.owner == context.owner,
+            models.Image.visibility != 'community',
+        ]
+        query = query.filter(sa_sql.or_(*community_filters))
 
     if prop_cond:
         for prop_condition in prop_cond:
@@ -681,6 +713,8 @@ def image_get_all(context, filters=None, marker=None, limit=None,
                                           force_show_deleted=showing_deleted)
         if return_tag:
             image_dict = _normalize_tags(image_dict)
+        if v1_mode:
+            image_dict = db_utils.mutate_image_dict_to_v1(image_dict)
         images.append(image_dict)
     return images
 
@@ -731,8 +765,8 @@ def _validate_image(values, mandatory_status=True):
             raise exception.Invalid(msg)
 
     # validate integer values to eliminate DBError on save
-    utils.validate_mysql_int(min_disk=values.get('min_disk'),
-                             min_ram=values.get('min_ram'))
+    _validate_db_int(min_disk=values.get('min_disk'),
+                     min_ram=values.get('min_ram'))
 
     return values
 
@@ -772,7 +806,7 @@ def _image_update(context, values, image_id, purge_props=False,
 
         location_data = values.pop('locations', None)
 
-        new_status = values.get('status', None)
+        new_status = values.get('status')
         if image_id:
             image_ref = _image_get(context, image_id, session=session)
             current = image_ref.status
@@ -788,9 +822,10 @@ def _image_update(context, values, image_id, purge_props=False,
             if 'min_disk' in values:
                 values['min_disk'] = int(values['min_disk'] or 0)
 
-            values['is_public'] = bool(values.get('is_public', False))
             values['protected'] = bool(values.get('protected', False))
             image_ref = models.Image()
+
+        values = db_utils.ensure_image_dict_v2_compliant(values)
 
         # Need to canonicalize ownership
         if 'owner' in values and not values['owner']:
@@ -1060,6 +1095,7 @@ def _image_property_delete_all(context, image_id, delete_time=None,
     return props_updated_count
 
 
+@utils.no_4byte_params
 def image_member_create(context, values, session=None):
     """Create an ImageMember object."""
     memb_ref = models.ImageMember()
@@ -1273,20 +1309,8 @@ def purge_deleted_rows(context, age_in_days, max_rows, session=None):
     Deletes rows of table images, table tasks and all dependent tables
     according to given age for relevant models.
     """
-    try:
-        age_in_days = int(age_in_days)
-    except ValueError:
-        LOG.exception(_LE('Invalid value for age, %(age)d'),
-                      {'age': age_in_days})
-        raise exception.InvalidParameterValue(value=age_in_days,
-                                              param='age_in_days')
-    try:
-        max_rows = int(max_rows)
-    except ValueError:
-        LOG.exception(_LE('Invalid value for max_rows, %(max_rows)d'),
-                      {'max_rows': max_rows})
-        raise exception.InvalidParameterValue(value=max_rows,
-                                              param='max_rows')
+    # check max_rows for its maximum limit
+    _validate_db_int(max_rows=max_rows)
 
     session = session or get_session()
     metadata = MetaData(get_engine())
@@ -1298,7 +1322,7 @@ def purge_deleted_rows(context, age_in_days, max_rows, session=None):
             continue
         if hasattr(model_class, 'deleted'):
             tables.append(model_class.__tablename__)
-    # get rid of FX constraints
+    # get rid of FK constraints
     for tbl in ('images', 'tasks'):
         try:
             tables.remove(tbl)
@@ -1306,6 +1330,11 @@ def purge_deleted_rows(context, age_in_days, max_rows, session=None):
             LOG.warning(_LW('Expected table %(tbl)s was not found in DB.'),
                         {'tbl': tbl})
         else:
+            # NOTE(abhishekk): To mitigate OSSN-0075 images records should be
+            # purged with new ``purge-images-table`` command.
+            if tbl == 'images':
+                continue
+
             tables.append(tbl)
 
     for tbl in tables:
@@ -1324,12 +1353,62 @@ def purge_deleted_rows(context, age_in_days, max_rows, session=None):
 
         delete_statement = DeleteFromSelect(tab, query_delete, column)
 
-        with session.begin():
-            result = session.execute(delete_statement)
+        try:
+            with session.begin():
+                result = session.execute(delete_statement)
+        except db_exception.DBReferenceError as ex:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_LE('DBError detected when purging from '
+                          "%(tablename)s: %(error)s"),
+                          {'tablename': tbl, 'error': six.text_type(ex)})
 
         rows = result.rowcount
         LOG.info(_LI('Deleted %(rows)d row(s) from table %(tbl)s'),
                  {'rows': rows, 'tbl': tbl})
+
+
+def purge_deleted_rows_from_images(context, age_in_days, max_rows,
+                                   session=None):
+    """Purges soft deleted rows
+
+    Deletes rows of table images table according to given age for
+    relevant models.
+    """
+    # check max_rows for its maximum limit
+    _validate_db_int(max_rows=max_rows)
+
+    session = session or get_session()
+    metadata = MetaData(get_engine())
+    deleted_age = timeutils.utcnow() - datetime.timedelta(days=age_in_days)
+
+    tbl = 'images'
+    tab = Table(tbl, metadata, autoload=True)
+    LOG.info(
+        _LI('Purging deleted rows older than %(age_in_days)d day(s) '
+            'from table %(tbl)s'),
+        {'age_in_days': age_in_days, 'tbl': tbl})
+
+    column = tab.c.id
+    deleted_at_column = tab.c.deleted_at
+
+    query_delete = sql.select(
+        [column], deleted_at_column < deleted_age).order_by(
+        deleted_at_column).limit(max_rows)
+
+    delete_statement = DeleteFromSelect(tab, query_delete, column)
+
+    try:
+        with session.begin():
+            result = session.execute(delete_statement)
+    except db_exception.DBReferenceError as ex:
+        with excutils.save_and_reraise_exception():
+            LOG.error(_LE('DBError detected when purging from '
+                      "%(tablename)s: %(error)s"),
+                      {'tablename': tbl, 'error': six.text_type(ex)})
+
+    rows = result.rowcount
+    LOG.info(_LI('Deleted %(rows)d row(s) from table %(tbl)s'),
+             {'rows': rows, 'tbl': tbl})
 
 
 def user_get_storage_usage(context, owner_id, image_id=None, session=None):
@@ -1408,7 +1487,7 @@ def task_create(context, values, session=None):
 
 def _pop_task_info_values(values):
     task_info_values = {}
-    for k, v in values.items():
+    for k, v in list(values.items()):
         if k in ['input', 'result', 'message']:
             values.pop(k)
             task_info_values[k] = v
@@ -1455,6 +1534,21 @@ def task_delete(context, task_id, session=None):
     return _task_format(task_ref, task_ref.info)
 
 
+def _task_soft_delete(context, session=None):
+    """Scrub task entities which are expired """
+    expires_at = models.Task.expires_at
+    session = session or get_session()
+    query = session.query(models.Task)
+
+    query = (query.filter(models.Task.owner == context.owner)
+                  .filter_by(deleted=False)
+                  .filter(expires_at <= timeutils.utcnow()))
+    values = {'deleted': True, 'deleted_at': timeutils.utcnow()}
+
+    with session.begin():
+        query.update(values)
+
+
 def task_get_all(context, filters=None, marker=None, limit=None,
                  sort_key='created_at', sort_dir='desc', admin_as_user=False):
     """
@@ -1477,6 +1571,8 @@ def task_get_all(context, filters=None, marker=None, limit=None,
 
     if not (context.is_admin or admin_as_user) and context.owner is not None:
         query = query.filter(models.Task.owner == context.owner)
+
+    _task_soft_delete(context, session=session)
 
     showing_deleted = False
 
@@ -1606,12 +1702,14 @@ def metadef_namespace_get(context, namespace_name, session=None):
         context, namespace_name, session)
 
 
+@utils.no_4byte_params
 def metadef_namespace_create(context, values, session=None):
     """Create a namespace or raise if it already exists."""
     session = session or get_session()
     return metadef_namespace_api.create(context, values, session)
 
 
+@utils.no_4byte_params
 def metadef_namespace_update(context, namespace_id, namespace_dict,
                              session=None):
     """Update a namespace or raise if it does not exist or not visible"""
@@ -1641,6 +1739,7 @@ def metadef_object_get(context, namespace_name, object_name, session=None):
         context, namespace_name, object_name, session)
 
 
+@utils.no_4byte_params
 def metadef_object_create(context, namespace_name, object_dict,
                           session=None):
     """Create a metadata-schema object or raise if it already exists."""
@@ -1649,6 +1748,7 @@ def metadef_object_create(context, namespace_name, object_dict,
         context, namespace_name, object_dict, session)
 
 
+@utils.no_4byte_params
 def metadef_object_update(context, namespace_name, object_id, object_dict,
                           session=None):
     """Update an object or raise if it does not exist or not visible."""
@@ -1693,6 +1793,7 @@ def metadef_property_get(context, namespace_name,
         context, namespace_name, property_name, session)
 
 
+@utils.no_4byte_params
 def metadef_property_create(context, namespace_name, property_dict,
                             session=None):
     """Create a metadef property or raise if it already exists."""
@@ -1701,6 +1802,7 @@ def metadef_property_create(context, namespace_name, property_dict,
         context, namespace_name, property_dict, session)
 
 
+@utils.no_4byte_params
 def metadef_property_update(context, namespace_name, property_id,
                             property_dict, session=None):
     """Update an object or raise if it does not exist or not visible."""
@@ -1803,6 +1905,7 @@ def metadef_tag_get(context, namespace_name, name, session=None):
         context, namespace_name, name, session)
 
 
+@utils.no_4byte_params
 def metadef_tag_create(context, namespace_name, tag_dict,
                        session=None):
     """Create a metadata-schema tag or raise if it already exists."""
@@ -1819,6 +1922,7 @@ def metadef_tag_create_tags(context, namespace_name, tag_list,
         context, namespace_name, tag_list, session)
 
 
+@utils.no_4byte_params
 def metadef_tag_update(context, namespace_name, id, tag_dict,
                        session=None):
     """Update an tag or raise if it does not exist or not visible."""
@@ -1847,58 +1951,3 @@ def metadef_tag_count(context, namespace_name, session=None):
     """Get count of tags for a namespace, raise if ns doesn't exist."""
     session = session or get_session()
     return metadef_tag_api.count(context, namespace_name, session)
-
-
-def artifact_create(context, values, type_name,
-                    type_version=None, session=None):
-    session = session or get_session()
-    artifact = glare.create(context, values, session, type_name,
-                            type_version)
-    return artifact
-
-
-def artifact_delete(context, artifact_id, type_name,
-                    type_version=None, session=None):
-    session = session or get_session()
-    artifact = glare.delete(context, artifact_id, session, type_name,
-                            type_version)
-    return artifact
-
-
-def artifact_update(context, values, artifact_id, type_name,
-                    type_version=None, session=None):
-    session = session or get_session()
-    artifact = glare.update(context, values, artifact_id, session,
-                            type_name, type_version)
-    return artifact
-
-
-def artifact_get(context, artifact_id,
-                 type_name=None,
-                 type_version=None,
-                 show_level=ga.Showlevel.BASIC,
-                 session=None):
-    session = session or get_session()
-    return glare.get(context, artifact_id, session, type_name,
-                     type_version, show_level)
-
-
-def artifact_publish(context,
-                     artifact_id,
-                     type_name,
-                     type_version=None,
-                     session=None):
-    session = session or get_session()
-    return glare.publish(context,
-                         artifact_id,
-                         session,
-                         type_name,
-                         type_version)
-
-
-def artifact_get_all(context, marker=None, limit=None, sort_keys=None,
-                     sort_dirs=None, filters=None,
-                     show_level=ga.Showlevel.NONE, session=None):
-    session = session or get_session()
-    return glare.get_all(context, session, marker, limit, sort_keys,
-                         sort_dirs, filters, show_level)

@@ -14,13 +14,13 @@
 #    under the License.
 
 import json
-import logging
 import os
 
 import glance_store as store_api
 from glance_store import backend
 from oslo_concurrency import processutils as putils
 from oslo_config import cfg
+from oslo_log import log as logging
 from oslo_utils import encodeutils
 from oslo_utils import excutils
 import six
@@ -30,6 +30,7 @@ from taskflow import retry
 from taskflow import task
 from taskflow.types import failure
 
+from glance.async import utils
 from glance.common import exception
 from glance.common.scripts.image_import import main as image_import
 from glance.common.scripts import utils as script_utils
@@ -70,13 +71,16 @@ class _CreateImage(task.Task):
         return image.image_id
 
     def revert(self, *args, **kwargs):
-        # TODO(flaper87): Define the revert rules for images on failures.
-        # Deleting the image may not be what we want since users could upload
-        # the image data in a separate step. However, it really depends on
-        # when the failure happened. I guess we should check if data has been
-        # written, although at that point failures are (should be) unexpected,
-        # at least image-workflow wise.
-        pass
+        # TODO(NiallBunting): Deleting the image like this could be considered
+        # a brute force way of reverting images. It may be worth checking if
+        # data has been written.
+        result = kwargs.get('result', None)
+        if result is not None:
+            if kwargs.get('flow_failures', None) is not None:
+                image = self.image_repo.get(result)
+                LOG.debug("Deleting image whilst reverting.")
+                image.delete()
+                self.image_repo.remove(image)
 
 
 class _ImportToFS(task.Task):
@@ -114,8 +118,7 @@ class _ImportToFS(task.Task):
         backend.register_opts(conf)
         conf.set_override('filesystem_store_datadir',
                           CONF.task.work_dir,
-                          group='glance_store',
-                          enforce_type=True)
+                          group='glance_store')
 
         # NOTE(flaper87): Do not even try to judge me for this... :(
         # With the glance_store refactor, this code will change, until
@@ -154,14 +157,14 @@ class _ImportToFS(task.Task):
             # place that other tasks can consume as well.
             stdout, stderr = putils.trycmd('qemu-img', 'info',
                                            '--output=json', path,
+                                           prlimit=utils.QEMU_IMG_PROC_LIMITS,
                                            log_errors=putils.LOG_ALL_ERRORS)
         except OSError as exc:
             with excutils.save_and_reraise_exception():
                 exc_message = encodeutils.exception_to_unicode(exc)
-                msg = (_LE('Failed to execute security checks on the image '
-                           '%(task_id)s: %(exc)s') %
-                       {'task_id': self.task_id, 'exc': exc_message})
-                LOG.error(msg)
+                msg = _LE('Failed to execute security checks on the image '
+                          '%(task_id)s: %(exc)s')
+                LOG.error(msg, {'task_id': self.task_id, 'exc': exc_message})
 
         metadata = json.loads(stdout)
 
@@ -177,7 +180,7 @@ class _ImportToFS(task.Task):
     def revert(self, image_id, result, **kwargs):
         if isinstance(result, failure.Failure):
             LOG.exception(_LE('Task: %(task_id)s failed to import image '
-                              '%(image_id)s to the filesystem.') %
+                              '%(image_id)s to the filesystem.'),
                           {'task_id': self.task_id, 'image_id': image_id})
             return
 
@@ -306,9 +309,14 @@ class _ImportToStore(task.Task):
         #     os.rename(file_path, image_path)
         #
         # image_import.set_image_data(image, image_path, None)
-
-        image_import.set_image_data(image, file_path or self.uri, self.task_id)
-
+        try:
+            image_import.set_image_data(image,
+                                        file_path or self.uri, self.task_id)
+        except IOError as e:
+            msg = (_('Uploading the image failed due to: %(exc)s') %
+                   {'exc': encodeutils.exception_to_unicode(e)})
+            LOG.error(msg)
+            raise exception.UploadException(message=msg)
         # NOTE(flaper87): We need to save the image again after the locations
         # have been set in the image.
         self.image_repo.save(image)
@@ -363,12 +371,15 @@ class _CompleteTask(task.Task):
 
             # TODO(nikhil): need to bring back save_and_reraise_exception when
             # necessary
-            err_msg = ("Error: " + six.text_type(type(e)) + ': ' +
-                       encodeutils.exception_to_unicode(e))
-            log_msg = err_msg + _LE("Task ID %s") % task.task_id
-            LOG.exception(log_msg)
+            log_msg = _LE("Task ID %(task_id)s failed. Error: %(exc_type)s: "
+                          "%(e)s")
+            LOG.exception(log_msg, {'exc_type': six.text_type(type(e)),
+                                    'e': encodeutils.exception_to_unicode(e),
+                                    'task_id': task.task_id})
 
-            task.fail(err_msg)
+            err_msg = _("Error: %(exc_type)s: %(e)s")
+            task.fail(err_msg % {'exc_type': six.text_type(type(e)),
+                                 'e': encodeutils.exception_to_unicode(e)})
         finally:
             self.task_repo.save(task)
 
@@ -457,9 +468,10 @@ def get_flow(**kwargs):
             flow.add(delete_flow)
         else:
             flow.add(import_to_store)
-    except exception.BadTaskConfiguration:
+    except exception.BadTaskConfiguration as exc:
         # NOTE(flaper87): If something goes wrong with the load of
         # import tasks, make sure we go on.
+        LOG.error(_LE('Bad task configuration: %s'), exc.message)
         flow.add(import_to_store)
 
     flow.add(

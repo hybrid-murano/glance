@@ -26,6 +26,7 @@ from sqlalchemy import BigInteger
 from sqlalchemy import Boolean
 from sqlalchemy import Column
 from sqlalchemy import DateTime
+from sqlalchemy import Enum
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import ForeignKey
 from sqlalchemy import Index
@@ -114,11 +115,13 @@ class Image(BASE, GlanceBase):
     """Represents an image in the datastore."""
     __tablename__ = 'images'
     __table_args__ = (Index('checksum_image_idx', 'checksum'),
-                      Index('ix_images_is_public', 'is_public'),
+                      Index('visibility_image_idx', 'visibility'),
                       Index('ix_images_deleted', 'deleted'),
                       Index('owner_image_idx', 'owner'),
                       Index('created_at_image_idx', 'created_at'),
-                      Index('updated_at_image_idx', 'updated_at'))
+                      Index('updated_at_image_idx', 'updated_at'),
+                      Index('os_hidden_image_idx', 'os_hidden'),
+                      Index('os_hash_value_image_idx', 'os_hash_value'))
 
     id = Column(String(36), primary_key=True,
                 default=lambda: str(uuid.uuid4()))
@@ -128,12 +131,18 @@ class Image(BASE, GlanceBase):
     size = Column(BigInteger().with_variant(Integer, "sqlite"))
     virtual_size = Column(BigInteger().with_variant(Integer, "sqlite"))
     status = Column(String(30), nullable=False)
-    is_public = Column(Boolean, nullable=False, default=False)
+    visibility = Column(Enum('private', 'public', 'shared', 'community',
+                        name='image_visibility'), nullable=False,
+                        server_default='shared')
     checksum = Column(String(32))
+    os_hash_algo = Column(String(64))
+    os_hash_value = Column(String(128))
     min_disk = Column(Integer, nullable=False, default=0)
     min_ram = Column(Integer, nullable=False, default=0)
     owner = Column(String(255))
     protected = Column(Boolean, nullable=False, default=False,
+                       server_default=sql.expression.false())
+    os_hidden = Column(Boolean, nullable=False, default=False,
                        server_default=sql.expression.false())
 
 

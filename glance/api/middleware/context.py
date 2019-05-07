@@ -21,24 +21,93 @@ import webob.exc
 from glance.api import policy
 from glance.common import wsgi
 import glance.context
-from glance.i18n import _
+from glance.i18n import _, _LW
 
 
 context_opts = [
-    cfg.BoolOpt('owner_is_tenant', default=True,
-                help=_('When true, this option sets the owner of an image '
-                       'to be the tenant. Otherwise, the owner of the '
-                       ' image will be the authenticated user issuing the '
-                       'request.')),
+    cfg.BoolOpt('owner_is_tenant',
+                default=True,
+                deprecated_for_removal=True,
+                deprecated_since="Rocky",
+                deprecated_reason=_("""
+The non-default setting for this option misaligns Glance with other
+OpenStack services with respect to resource ownership.  Further, surveys
+indicate that this option is not used by operators.  The option will be
+removed early in the 'S' development cycle following the standard OpenStack
+deprecation policy.  As the option is not in wide use, no migration path is
+proposed.
+"""),
+                help=_("""
+Set the image owner to tenant or the authenticated user.
+
+Assign a boolean value to determine the owner of an image. When set to
+True, the owner of the image is the tenant. When set to False, the
+owner of the image will be the authenticated user issuing the request.
+Setting it to False makes the image private to the associated user and
+sharing with other users within the same tenant (or "project")
+requires explicit image sharing via image membership.
+
+Possible values:
+    * True
+    * False
+
+Related options:
+    * None
+
+""")),
+
     cfg.StrOpt('admin_role', default='admin',
-               help=_('Role used to identify an authenticated user as '
-                      'administrator.')),
+               help=_("""
+Role used to identify an authenticated user as administrator.
+
+Provide a string value representing a Keystone role to identify an
+administrative user. Users with this role will be granted
+administrative privileges. The default value for this option is
+'admin'.
+
+Possible values:
+    * A string value which is a valid Keystone role
+
+Related options:
+    * None
+
+""")),
+
     cfg.BoolOpt('allow_anonymous_access', default=False,
-                help=_('Allow unauthenticated users to access the API with '
-                       'read-only privileges. This only applies when using '
-                       'ContextMiddleware.')),
-    cfg.IntOpt('max_request_id_length', default=64,
-               help=_('Limits request ID length.')),
+                help=_("""
+Allow limited access to unauthenticated users.
+
+Assign a boolean to determine API access for unathenticated
+users. When set to False, the API cannot be accessed by
+unauthenticated users. When set to True, unauthenticated users can
+access the API with read-only privileges. This however only applies
+when using ContextMiddleware.
+
+Possible values:
+    * True
+    * False
+
+Related options:
+    * None
+
+""")),
+
+    cfg.IntOpt('max_request_id_length', default=64, min=0,
+               help=_("""
+Limit the request ID length.
+
+Provide  an integer value to limit the length of the request ID to
+the specified length. The default value is 64. Users can change this
+to any ineteger value between 0 and 16384 however keeping in mind that
+a larger value may flood the logs.
+
+Possible values:
+    * Integer value between 0 and 16384
+
+Related options:
+    * None
+
+""")),
 ]
 
 CONF = cfg.CONF
@@ -52,7 +121,7 @@ class BaseContextMiddleware(wsgi.Middleware):
         try:
             request_id = resp.request.context.request_id
         except AttributeError:
-            LOG.warn(_('Unable to retrieve request id from context'))
+            LOG.warn(_LW('Unable to retrieve request id from context'))
         else:
             # For python 3 compatibility need to use bytes type
             prefix = b'req-' if isinstance(request_id, bytes) else 'req-'
@@ -78,7 +147,7 @@ class ContextMiddleware(BaseContextMiddleware):
         of the req object.
 
         :param req: wsgi request object that will be given the context object
-        :raises: webob.exc.HTTPUnauthorized: when value of the
+        :raises webob.exc.HTTPUnauthorized: when value of the
                                             X-Identity-Status  header is not
                                             'Confirmed' and anonymous access
                                             is disallowed
@@ -102,14 +171,6 @@ class ContextMiddleware(BaseContextMiddleware):
         return glance.context.RequestContext(**kwargs)
 
     def _get_authenticated_context(self, req):
-        # NOTE(bcwaldon): X-Roles is a csv string, but we need to parse
-        # it into a list to be useful
-        roles_header = req.headers.get('X-Roles', '')
-        roles = [r.strip().lower() for r in roles_header.split(',')]
-
-        # NOTE(bcwaldon): This header is deprecated in favor of X-Auth-Token
-        deprecated_token = req.headers.get('X-Storage-Token')
-
         service_catalog = None
         if req.headers.get('X-Service-Catalog') is not None:
             try:
@@ -127,18 +188,25 @@ class ContextMiddleware(BaseContextMiddleware):
             return webob.exc.HTTPRequestHeaderFieldsTooLarge(comment=msg)
 
         kwargs = {
-            'user': req.headers.get('X-User-Id'),
-            'tenant': req.headers.get('X-Tenant-Id'),
-            'roles': roles,
-            'is_admin': CONF.admin_role.strip().lower() in roles,
-            'auth_token': req.headers.get('X-Auth-Token', deprecated_token),
             'owner_is_tenant': CONF.owner_is_tenant,
             'service_catalog': service_catalog,
             'policy_enforcer': self.policy_enforcer,
             'request_id': request_id,
         }
 
-        return glance.context.RequestContext(**kwargs)
+        ctxt = glance.context.RequestContext.from_environ(req.environ,
+                                                          **kwargs)
+
+        # FIXME(jamielennox): glance has traditionally lowercased its roles.
+        # This was related to bug #1010519 where at least the admin role was
+        # case insensitive. This seems to no longer be the case and should be
+        # fixed.
+        ctxt.roles = [r.lower() for r in ctxt.roles]
+
+        if CONF.admin_role.strip().lower() in ctxt.roles:
+            ctxt.is_admin = True
+
+        return ctxt
 
 
 class UnauthenticatedContextMiddleware(BaseContextMiddleware):

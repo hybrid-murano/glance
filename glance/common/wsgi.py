@@ -28,7 +28,6 @@ import signal
 import sys
 import time
 
-import eventlet
 from eventlet.green import socket
 from eventlet.green import ssl
 import eventlet.greenio
@@ -40,7 +39,7 @@ from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 from oslo_utils import strutils
-import routes
+from osprofiler import opts as profiler_opts
 import routes.middleware
 import six
 import webob.dec
@@ -54,64 +53,275 @@ from glance import i18n
 from glance.i18n import _, _LE, _LI, _LW
 
 
+try:
+    from webob.acceptparse import AcceptLanguageValidHeader  # noqa
+    USING_WEBOB_1_8 = True
+except ImportError:
+    USING_WEBOB_1_8 = False
+
 bind_opts = [
-    cfg.StrOpt('bind_host', default='0.0.0.0',
-               help=_('Address to bind the server.  Useful when '
-                      'selecting a particular network interface.')),
+    cfg.HostAddressOpt('bind_host',
+                       default='0.0.0.0',
+                       help=_("""
+IP address to bind the glance servers to.
+
+Provide an IP address to bind the glance server to. The default
+value is ``0.0.0.0``.
+
+Edit this option to enable the server to listen on one particular
+IP address on the network card. This facilitates selection of a
+particular network interface for the server.
+
+Possible values:
+    * A valid IPv4 address
+    * A valid IPv6 address
+
+Related options:
+    * None
+
+""")),
+
     cfg.PortOpt('bind_port',
-                help=_('The port on which the server will listen.')),
+                help=_("""
+Port number on which the server will listen.
+
+Provide a valid port number to bind the server's socket to. This
+port is then set to identify processes and forward network messages
+that arrive at the server. The default bind_port value for the API
+server is 9292 and for the registry server is 9191.
+
+Possible values:
+    * A valid port number (0 to 65535)
+
+Related options:
+    * None
+
+""")),
 ]
 
 socket_opts = [
-    cfg.IntOpt('backlog', default=4096,
-               help=_('The backlog value that will be used when creating the '
-                      'TCP listener socket.')),
-    cfg.IntOpt('tcp_keepidle', default=600,
-               help=_('The value for the socket option TCP_KEEPIDLE.  This is '
-                      'the time in seconds that the connection must be idle '
-                      'before TCP starts sending keepalive probes.')),
-    cfg.StrOpt('ca_file', help=_('CA certificate file to use to verify '
-                                 'connecting clients.')),
-    cfg.StrOpt('cert_file', help=_('Certificate file to use when starting API '
-                                   'server securely.')),
-    cfg.StrOpt('key_file', help=_('Private key file to use when starting API '
-                                  'server securely.')),
+    cfg.IntOpt('backlog',
+               default=4096,
+               min=1,
+               help=_("""
+Set the number of incoming connection requests.
+
+Provide a positive integer value to limit the number of requests in
+the backlog queue. The default queue size is 4096.
+
+An incoming connection to a TCP listener socket is queued before a
+connection can be established with the server. Setting the backlog
+for a TCP socket ensures a limited queue size for incoming traffic.
+
+Possible values:
+    * Positive integer
+
+Related options:
+    * None
+
+""")),
+
+    cfg.IntOpt('tcp_keepidle',
+               default=600,
+               min=1,
+               help=_("""
+Set the wait time before a connection recheck.
+
+Provide a positive integer value representing time in seconds which
+is set as the idle wait time before a TCP keep alive packet can be
+sent to the host. The default value is 600 seconds.
+
+Setting ``tcp_keepidle`` helps verify at regular intervals that a
+connection is intact and prevents frequent TCP connection
+reestablishment.
+
+Possible values:
+    * Positive integer value representing time in seconds
+
+Related options:
+    * None
+
+""")),
+
+    cfg.StrOpt('ca_file',
+               sample_default='/etc/ssl/cafile',
+               help=_("""
+Absolute path to the CA file.
+
+Provide a string value representing a valid absolute path to
+the Certificate Authority file to use for client authentication.
+
+A CA file typically contains necessary trusted certificates to
+use for the client authentication. This is essential to ensure
+that a secure connection is established to the server via the
+internet.
+
+Possible values:
+    * Valid absolute path to the CA file
+
+Related options:
+    * None
+
+""")),
+
+    cfg.StrOpt('cert_file',
+               sample_default='/etc/ssl/certs',
+               help=_("""
+Absolute path to the certificate file.
+
+Provide a string value representing a valid absolute path to the
+certificate file which is required to start the API service
+securely.
+
+A certificate file typically is a public key container and includes
+the server's public key, server name, server information and the
+signature which was a result of the verification process using the
+CA certificate. This is required for a secure connection
+establishment.
+
+Possible values:
+    * Valid absolute path to the certificate file
+
+Related options:
+    * None
+
+""")),
+
+    cfg.StrOpt('key_file',
+               sample_default='/etc/ssl/key/key-file.pem',
+               help=_("""
+Absolute path to a private key file.
+
+Provide a string value representing a valid absolute path to a
+private key file which is required to establish the client-server
+connection.
+
+Possible values:
+    * Absolute path to the private key file
+
+Related options:
+    * None
+
+""")),
 ]
 
 eventlet_opts = [
     cfg.IntOpt('workers',
-               help=_('The number of child process workers that will be '
-                      'created to service requests. The default will be '
-                      'equal to the number of CPUs available.')),
-    cfg.IntOpt('max_header_line', default=16384,
-               help=_('Maximum line size of message headers to be accepted. '
-                      'max_header_line may need to be increased when using '
-                      'large tokens (typically those generated by the '
-                      'Keystone v3 API with big service catalogs')),
-    cfg.BoolOpt('http_keepalive', default=True,
-                help=_('If False, server will return the header '
-                       '"Connection: close", '
-                       'If True, server will return "Connection: Keep-Alive" '
-                       'in its responses. In order to close the client socket '
-                       'connection explicitly after the response is sent and '
-                       'read successfully by the client, you simply have to '
-                       'set this option to False when you create a wsgi '
-                       'server.')),
-    cfg.IntOpt('client_socket_timeout', default=900,
-               help=_('Timeout for client connections\' socket operations. '
-                      'If an incoming connection is idle for this number of '
-                      'seconds it will be closed. A value of \'0\' means '
-                      'wait forever.')),
+               min=0,
+               help=_("""
+Number of Glance worker processes to start.
+
+Provide a non-negative integer value to set the number of child
+process workers to service requests. By default, the number of CPUs
+available is set as the value for ``workers`` limited to 8. For
+example if the processor count is 6, 6 workers will be used, if the
+processor count is 24 only 8 workers will be used. The limit will only
+apply to the default value, if 24 workers is configured, 24 is used.
+
+Each worker process is made to listen on the port set in the
+configuration file and contains a greenthread pool of size 1000.
+
+NOTE: Setting the number of workers to zero, triggers the creation
+of a single API process with a greenthread pool of size 1000.
+
+Possible values:
+    * 0
+    * Positive integer value (typically equal to the number of CPUs)
+
+Related options:
+    * None
+
+""")),
+
+    cfg.IntOpt('max_header_line',
+               default=16384,
+               min=0,
+               help=_("""
+Maximum line size of message headers.
+
+Provide an integer value representing a length to limit the size of
+message headers. The default value is 16384.
+
+NOTE: ``max_header_line`` may need to be increased when using large
+tokens (typically those generated by the Keystone v3 API with big
+service catalogs). However, it is to be kept in mind that larger
+values for ``max_header_line`` would flood the logs.
+
+Setting ``max_header_line`` to 0 sets no limit for the line size of
+message headers.
+
+Possible values:
+    * 0
+    * Positive integer
+
+Related options:
+    * None
+
+""")),
+
+    cfg.BoolOpt('http_keepalive',
+                default=True,
+                help=_("""
+Set keep alive option for HTTP over TCP.
+
+Provide a boolean value to determine sending of keep alive packets.
+If set to ``False``, the server returns the header
+"Connection: close". If set to ``True``, the server returns a
+"Connection: Keep-Alive" in its responses. This enables retention of
+the same TCP connection for HTTP conversations instead of opening a
+new one with each new request.
+
+This option must be set to ``False`` if the client socket connection
+needs to be closed explicitly after the response is received and
+read successfully by the client.
+
+Possible values:
+    * True
+    * False
+
+Related options:
+    * None
+
+""")),
+
+    cfg.IntOpt('client_socket_timeout',
+               default=900,
+               min=0,
+               help=_("""
+Timeout for client connections' socket operations.
+
+Provide a valid integer value representing time in seconds to set
+the period of wait before an incoming connection can be closed. The
+default value is 900 seconds.
+
+The value zero implies wait forever.
+
+Possible values:
+    * Zero
+    * Positive integer
+
+Related options:
+    * None
+
+""")),
 ]
 
-profiler_opts = [
-    cfg.BoolOpt("enabled", default=False,
-                help=_('If False fully disable profiling feature.')),
-    cfg.BoolOpt("trace_sqlalchemy", default=False,
-                help=_("If False doesn't trace SQL requests.")),
-    cfg.StrOpt("hmac_keys", default="SECRET_KEY",
-               help=_("Secret key to use to sign Glance API and Glance "
-                      "Registry services tracing messages.")),
+wsgi_opts = [
+    cfg.StrOpt('secure_proxy_ssl_header',
+               deprecated_for_removal=True,
+               deprecated_reason=_('Use the http_proxy_to_wsgi middleware '
+                                   'instead.'),
+               help=_('The HTTP header used to determine the scheme for the '
+                      'original request, even if it was removed by an SSL '
+                      'terminating proxy. Typical value is '
+                      '"HTTP_X_FORWARDED_PROTO".')),
+]
+
+store_opts = [
+    cfg.DictOpt('enabled_backends',
+                help=_('Key:Value pair of store identifier and store type. '
+                       'In case of multiple backends should be separated'
+                       'using comma.')),
 ]
 
 
@@ -121,16 +331,28 @@ CONF = cfg.CONF
 CONF.register_opts(bind_opts)
 CONF.register_opts(socket_opts)
 CONF.register_opts(eventlet_opts)
-CONF.register_opts(profiler_opts, group="profiler")
+CONF.register_opts(wsgi_opts)
+CONF.register_opts(store_opts)
+profiler_opts.set_defaults(CONF)
 
 ASYNC_EVENTLET_THREAD_POOL_LIST = []
+
+# Detect if we're running under the uwsgi server
+try:
+    import uwsgi
+    LOG.debug('Detected running under uwsgi')
+except ImportError:
+    LOG.debug('Detected not running under uwsgi')
+    uwsgi = None
 
 
 def get_num_workers():
     """Return the configured number of workers."""
     if CONF.workers is None:
-        # None implies the number of CPUs
-        return processutils.get_worker_count()
+        # None implies the number of CPUs limited to 8
+        # See Launchpad bug #1748916 and the config help text
+        workers = processutils.get_worker_count()
+        return workers if workers < 8 else 8
     return CONF.workers
 
 
@@ -234,6 +456,13 @@ def initialize_glance_store():
     glance_store.verify_default_store()
 
 
+def initialize_multi_store():
+    """Initialize glance multi store backends."""
+    glance_store.register_store_opts(CONF)
+    glance_store.create_multi_stores(CONF)
+    glance_store.verify_store()
+
+
 def get_asynchronous_eventlet_pool(size=1000):
     """Return eventlet pool to caller.
 
@@ -296,6 +525,7 @@ class Server(object):
         """Kills the entire process group."""
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
         self.running = False
         os.killpg(self.pgid, signal.SIGTERM)
 
@@ -384,7 +614,10 @@ class Server(object):
         self.client_socket_timeout = CONF.client_socket_timeout or None
         self.configure_socket(old_conf, has_changed)
         if self.initialize_glance_store:
-            initialize_glance_store()
+            if CONF.enabled_backends:
+                initialize_multi_store()
+            else:
+                initialize_glance_store()
 
     def reload(self):
         """
@@ -729,14 +962,81 @@ class Router(object):
         return app
 
 
+class _UWSGIChunkFile(object):
+
+    def read(self, length=None):
+        position = 0
+        if length == 0:
+            return b""
+
+        if length and length < 0:
+            length = None
+
+        response = []
+        while True:
+            data = uwsgi.chunked_read()
+            # Return everything if we reached the end of the file
+            if not data:
+                break
+            response.append(data)
+            # Return the data if we've reached the length
+            if length is not None:
+                position += len(data)
+                if position >= length:
+                    break
+        return b''.join(response)
+
+
 class Request(webob.Request):
     """Add some OpenStack API-specific logic to the base webob.Request."""
+
+    def __init__(self, environ, *args, **kwargs):
+        if CONF.secure_proxy_ssl_header:
+            scheme = environ.get(CONF.secure_proxy_ssl_header)
+            if scheme:
+                environ['wsgi.url_scheme'] = scheme
+        super(Request, self).__init__(environ, *args, **kwargs)
+
+    @property
+    def body_file(self):
+        if uwsgi:
+            if self.headers.get('transfer-encoding', '').lower() == 'chunked':
+                return _UWSGIChunkFile()
+        return super(Request, self).body_file
+
+    @body_file.setter
+    def body_file(self, value):
+        # NOTE(cdent): If you have a property setter in a superclass, it will
+        # not be inherited.
+        webob.Request.body_file.fset(self, value)
+
+    @property
+    def params(self):
+        """Override params property of webob.request.BaseRequest.
+
+        Added an 'encoded_params' attribute in case of PY2 to avoid
+        encoding values in next subsequent calls to the params property.
+        """
+        if six.PY2:
+            encoded_params = getattr(self, 'encoded_params', None)
+            if encoded_params is None:
+                params = super(Request, self).params
+                params_dict = multidict.MultiDict()
+                for key, value in params.items():
+                    params_dict.add(key, encodeutils.safe_encode(value))
+
+                setattr(self, 'encoded_params',
+                        multidict.NestedMultiDict(params_dict))
+            return self.encoded_params
+        return super(Request, self).params
 
     def best_match_content_type(self):
         """Determine the requested response content-type."""
         supported = ('application/json',)
-        bm = self.accept.best_match(supported)
-        return bm or 'application/json'
+        best_matches = self.accept.acceptable_offers(supported)
+        if not best_matches:
+            return 'application/json'
+        return best_matches[0][0]
 
     def get_content_type(self, allowed_content_types):
         """Determine content type of the request body."""
@@ -750,7 +1050,7 @@ class Request(webob.Request):
         else:
             return content_type
 
-    def best_match_language(self):
+    def _best_match_language_1_7(self):
         """Determines best available locale from the Accept-Language header.
 
         :returns: the best language match or None if the 'Accept-Language'
@@ -761,20 +1061,93 @@ class Request(webob.Request):
         langs = i18n.get_available_languages('glance')
         return self.accept_language.best_match(langs)
 
-    def get_content_range(self):
+    def _best_match_language_1_8(self):
+        """Determines best available locale from the Accept-Language header.
+
+        :returns: the best language match or None if the 'Accept-Language'
+                  header was not available in the request.
+        """
+        if not self.accept_language:
+            return None
+        langs = i18n.get_available_languages('glance')
+        # NOTE(rosmaita): give the webob lookup() function a sentinal value
+        # for default so we can preserve the behavior of this function as
+        # indicated by the current unit tests.  See Launchpad bug #1765748.
+        best_match = self.accept_language.lookup(langs, default='fake_LANG')
+        if best_match == 'fake_LANG':
+            best_match = None
+        return best_match
+
+    def best_match_language(self):
+        if USING_WEBOB_1_8:
+            return self._best_match_language_1_8()
+        else:
+            return self._best_match_language_1_7()
+
+    def get_range_from_request(self, image_size):
         """Return the `Range` in a request."""
-        range_str = self.headers.get('Content-Range')
+
+        range_str = self.headers.get('Range')
         if range_str is not None:
-            range_ = webob.byterange.ContentRange.parse(range_str)
-            if range_ is None:
-                msg = _('Malformed Content-Range header: %s') % range_str
+
+            # NOTE(dharinic): We do not support multi range requests.
+            if ',' in range_str:
+                msg = ("Requests with multiple ranges are not supported in "
+                       "Glance. You may make multiple single-range requests "
+                       "instead.")
                 raise webob.exc.HTTPBadRequest(explanation=msg)
+
+            range_ = webob.byterange.Range.parse(range_str)
+            if range_ is None:
+                msg = ("Invalid Range header.")
+                raise webob.exc.HTTPRequestRangeNotSatisfiable(msg)
+            # NOTE(dharinic): Ensure that a range like bytes=4- for an image
+            # size of 3 is invalidated as per rfc7233.
+            if range_.start >= image_size:
+                msg = ("Invalid start position in Range header. "
+                       "Start position MUST be in the inclusive range [0, %s]."
+                       % (image_size - 1))
+                raise webob.exc.HTTPRequestRangeNotSatisfiable(msg)
             return range_
+
+        # NOTE(dharinic): For backward compatibility reasons, we maintain
+        # support for 'Content-Range' in requests even though it's not
+        # correct to use it in requests..
+        c_range_str = self.headers.get('Content-Range')
+        if c_range_str is not None:
+            content_range = webob.byterange.ContentRange.parse(c_range_str)
+            # NOTE(dharinic): Ensure that a content range like 1-4/* for an
+            # image size of 3 is invalidated.
+            if content_range is None:
+                msg = ("Invalid Content-Range header.")
+                raise webob.exc.HTTPRequestRangeNotSatisfiable(msg)
+            if (content_range.length is None and
+                    content_range.stop > image_size):
+                msg = ("Invalid stop position in Content-Range header. "
+                       "The stop position MUST be in the inclusive range "
+                       "[0, %s]." % (image_size - 1))
+                raise webob.exc.HTTPRequestRangeNotSatisfiable(msg)
+            if content_range.start >= image_size:
+                msg = ("Invalid start position in Content-Range header. "
+                       "Start position MUST be in the inclusive range [0, %s]."
+                       % (image_size - 1))
+                raise webob.exc.HTTPRequestRangeNotSatisfiable(msg)
+            return content_range
 
 
 class JSONRequestDeserializer(object):
     valid_transfer_encoding = frozenset(['chunked', 'compress', 'deflate',
                                          'gzip', 'identity'])
+    httpverb_may_have_body = frozenset({'POST', 'PUT', 'PATCH'})
+
+    @classmethod
+    def is_valid_encoding(cls, request):
+        request_encoding = request.headers.get('transfer-encoding', '').lower()
+        return request_encoding in cls.valid_transfer_encoding
+
+    @classmethod
+    def is_valid_method(cls, request):
+        return request.method.upper() in cls.httpverb_may_have_body
 
     def has_body(self, request):
         """
@@ -782,11 +1155,12 @@ class JSONRequestDeserializer(object):
 
         :param request:  Webob.Request object
         """
-        request_encoding = request.headers.get('transfer-encoding', '').lower()
-        is_valid_encoding = request_encoding in self.valid_transfer_encoding
-        if is_valid_encoding and request.is_body_readable:
+
+        if self.is_valid_encoding(request) and self.is_valid_method(request):
+            request.is_body_readable = True
             return True
-        elif request.content_length is not None and request.content_length > 0:
+
+        if request.content_length is not None and request.content_length > 0:
             return True
 
         return False
@@ -914,6 +1288,10 @@ class Resource(object):
                           encodeutils.exception_to_unicode(e))
             response = webob.exc.HTTPInternalServerError()
             return response
+
+        # We cannot serialize an Exception, so return the action_result
+        if isinstance(action_result, Exception):
+            return action_result
 
         try:
             response = webob.Response(request=request)

@@ -13,29 +13,25 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import logging
 import os
 import re
 import shutil
 import tarfile
 
 try:
-    import xml.etree.cElementTree as ET
+    from defusedxml import cElementTree as ET
 except ImportError:
-    import xml.etree.ElementTree as ET
+    from defusedxml import ElementTree as ET
 
 from oslo_config import cfg
+from oslo_log import log as logging
 from oslo_serialization import jsonutils as json
 from six.moves import urllib
 from taskflow.patterns import linear_flow as lf
 from taskflow import task
 
-from glance import i18n
+from glance.i18n import _, _LW
 
-
-_ = i18n._
-_LE = i18n._LE
-_LW = i18n._LW
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
@@ -139,7 +135,7 @@ class OVAImageExtractor(object):
         :param ova: a file object containing the OVA file
         :returns: a tuple of extracted disk file object and dictionary of
             properties parsed from the OVF file
-        :raises: RuntimeError for malformed OVA and OVF files
+        :raises RuntimeError: an error for malformed OVA and OVF files
         """
         with tarfile.open(fileobj=ova) as tar_file:
             filenames = tar_file.getnames()
@@ -161,14 +157,14 @@ class OVAImageExtractor(object):
         """Parses the OVF file
 
         Parses the OVF file for specified metadata properties. Interested
-        properties must be specfied in ovf-metadata.json conf file.
+        properties must be specified in ovf-metadata.json conf file.
 
         The OVF file's qualified namespaces are removed from the included
         properties.
 
         :param ovf: a file object containing the OVF file
         :returns: a tuple of disk filename and a properties dictionary
-        :raises: RuntimeError for malformed OVF file
+        :raises RuntimeError: an error for malformed OVF file
         """
 
         def _get_namespace_and_tag(tag):
@@ -243,14 +239,14 @@ class OVAImageExtractor(object):
                 self.interested_properties = properties.get(
                     'cim_pasd', [])
                 if not self.interested_properties:
-                    LOG.warn(_('OVF metadata of interest was not specified '
-                               'in ovf-metadata.json config file. Please set '
-                               '"cim_pasd" to a list of interested '
-                               'CIM_ProcessorAllocationSettingData '
-                               'properties.'))
+                    LOG.warn(_LW('OVF metadata of interest was not specified '
+                                 'in ovf-metadata.json config file. Please '
+                                 'set "cim_pasd" to a list of interested '
+                                 'CIM_ProcessorAllocationSettingData '
+                                 'properties.'))
         else:
-            LOG.warn(_('OVF properties config file "ovf-metadata.json" was '
-                       'not found.'))
+            LOG.warn(_LW('OVF properties config file "ovf-metadata.json" was '
+                         'not found.'))
 
 
 def get_flow(**kwargs):

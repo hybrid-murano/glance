@@ -1,0 +1,326 @@
+- job:
+    name: glance-dsvm-grenade-multinode
+    parent: legacy-dsvm-base-multinode
+    run: playbooks/legacy/glance-dsvm-grenade-multinode/run.yaml
+    post-run: playbooks/legacy/glance-dsvm-grenade-multinode/post.yaml
+    timeout: 10800
+    required-projects:
+      - openstack/grenade
+      - openstack/devstack-gate
+      - openstack/glance
+    nodeset: legacy-ubuntu-xenial-2-node
+
+- job:
+    name: glance-eventlet-ssl-handshake-broken-py35
+    parent: tox
+    description: |
+      See https://bugs.launchpad.net/glance/+bug/1482633
+    vars:
+      tox_envlist: broken-py35-ssl-tests
+
+- job:
+    name: glance-tox-oslo-tips-base
+    parent: tox
+    abstract: true
+    description: Abstract job for Glance vs. oslo libraries
+    # NOTE(rosmaita): only need functional test jobs, oslo is
+    # already running periodic jobs using our unit tests
+    required-projects:
+      - name: openstack/debtcollector
+      - name: openstack/futurist
+      - name: openstack/oslo.concurrency
+      - name: openstack/oslo.config
+      - name: openstack/oslo.context
+      - name: openstack/oslo.db
+      - name: openstack/oslo.i18n
+      - name: openstack/oslo.log
+      - name: openstack/oslo.messaging
+      - name: openstack/oslo.middleware
+      - name: openstack/oslo.policy
+      - name: openstack/oslo.utils
+      - name: openstack/osprofiler
+      - name: openstack/stevedore
+      - name: openstack/taskflow
+
+- job:
+    name: glance-tox-functional-oslo-tips
+    parent: glance-tox-oslo-tips-base
+    description: |
+      Glance py27 functional tests vs. oslo libraries masters
+    vars:
+      tox_envlist: functional
+
+- job:
+    name: glance-tox-functional-py35-oslo-tips
+    parent: glance-tox-oslo-tips-base
+    description: |
+      Glance py35 functional tests vs. oslo libraries masters
+    vars:
+      tox_envlist: functional-py35
+
+- job:
+    name: glance-tox-keystone-tips-base
+    parent: tox
+    abstract: true
+    description: Abstract job for Glance vs. keystone
+    required-projects:
+      - name: openstack/keystoneauth
+      - name: openstack/keystonemiddleware
+      - name: openstack/python-keystoneclient
+
+- job:
+    name: glance-tox-py27-keystone-tips
+    parent: glance-tox-keystone-tips-base
+    description: |
+      Glance py27 unit tests vs. keystone masters
+    vars:
+      tox_envlist: py27
+
+- job:
+    name: glance-tox-py35-keystone-tips
+    parent: glance-tox-keystone-tips-base
+    description: |
+      Glance py35 unit tests vs. keystone masters
+    vars:
+      tox_envlist: py35
+
+- job:
+    name: glance-tox-functional-keystone-tips
+    parent: glance-tox-keystone-tips-base
+    description: |
+      Glance py27 functional tests vs. keystone masters
+    vars:
+      tox_envlist: functional
+
+- job:
+    name: glance-tox-functional-py35-keystone-tips
+    parent: glance-tox-keystone-tips-base
+    description: |
+      Glance py35 functional tests vs. keystone masters
+    vars:
+      tox_envlist: functional-py35
+
+- job:
+    name: glance-tox-glance_store-tips-base
+    parent: tox
+    abstract: true
+    description: Abstract job for Glance vs. glance_store
+    required-projects:
+      - name: openstack/glance_store
+
+- job:
+    name: glance-tox-py27-glance_store-tips
+    parent: glance-tox-glance_store-tips-base
+    description: |
+      Glance py27 unit tests vs. glance_store master
+    vars:
+      tox_envlist: py27
+
+- job:
+    name: glance-tox-py35-glance_store-tips
+    parent: glance-tox-glance_store-tips-base
+    description: |
+      Glance py35 unit tests vs. glance_store master
+    vars:
+      tox_envlist: py35
+
+- job:
+    name: glance-tox-functional-glance_store-tips
+    parent: glance-tox-glance_store-tips-base
+    description: |
+      Glance py27 functional tests vs. glance_store master
+    vars:
+      tox_envlist: functional
+
+- job:
+    name: glance-tox-functional-py35-glance_store-tips
+    parent: glance-tox-glance_store-tips-base
+    description: |
+      Glance py35 functional tests vs. glance_store master
+    vars:
+      tox_envlist: functional-py35
+
+- job:
+    name: glance-tox-cursive-tips-base
+    parent: tox
+    abstract: true
+    description: Abstract job for Glance vs. cursive and related libs
+    required-projects:
+      - name: x/cursive
+      - name: openstack/python-barbicanclient
+      - name: openstack/castellan
+
+- job:
+    name: glance-tox-py27-cursive-tips
+    parent: glance-tox-cursive-tips-base
+    description: |
+      Glance py27 unit tests vs. cursive (and related libs) master
+    vars:
+      tox_envlist: py27
+
+- job:
+    name: glance-tox-py35-cursive-tips
+    parent: glance-tox-cursive-tips-base
+    description: |
+      Glance py35 unit tests vs. cursive (and related libs) master
+    vars:
+      tox_envlist: py35
+
+- job:
+    name: glance-tox-functional-cursive-tips
+    parent: glance-tox-cursive-tips-base
+    description: |
+      Glance py27 functional tests vs. cursive (and related libs) master
+    vars:
+      tox_envlist: functional
+
+- job:
+    name: glance-tox-functional-py35-cursive-tips
+    parent: glance-tox-cursive-tips-base
+    description: |
+      Glance py35 functional tests vs. cursive (and related libs) master
+    vars:
+      tox_envlist: functional-py35
+
+- project:
+    templates:
+      - openstack-python35-jobs
+      - openstack-python-jobs
+      - publish-openstack-sphinx-docs
+      - periodic-stable-jobs
+      - check-requirements
+      - integrated-gate
+      - integrated-gate-py35
+      - release-notes-jobs
+    check:
+      jobs:
+        - openstack-tox-functional
+        - openstack-tox-functional-py35
+        - openstack-tox-lower-constraints
+        - glance-eventlet-ssl-handshake-broken-py35:
+            voting: false
+        - devstack-plugin-ceph-tempest:
+            voting: false
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^.*\.rst$
+              - ^api-ref/.*$
+              - ^doc/.*$
+              - ^releasenotes/.*$
+              - ^setup.cfg$
+              - ^tox.ini$
+        - tempest-full:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^.*\.rst$
+              - ^api-ref/.*$
+              - ^doc/.*$
+              - ^releasenotes/.*$
+              - ^setup.cfg$
+              - ^tox.ini$
+        - neutron-grenade:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^.*\.rst$
+              - ^api-ref/.*$
+              - ^doc/.*$
+              - ^releasenotes/.*$
+              - ^setup.cfg$
+              - ^tox.ini$
+    gate:
+      jobs:
+        - openstack-tox-functional
+        - openstack-tox-functional-py35
+        - openstack-tox-lower-constraints
+        - tempest-full:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^.*\.rst$
+              - ^api-ref/.*$
+              - ^doc/.*$
+              - ^releasenotes/.*$
+              - ^setup.cfg$
+              - ^tox.ini$
+        - neutron-grenade:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^.*\.rst$
+              - ^api-ref/.*$
+              - ^doc/.*$
+              - ^releasenotes/.*$
+              - ^setup.cfg$
+              - ^tox.ini$
+
+    experimental:
+      jobs:
+        - barbican-simple-crypto-devstack-tempest
+        - glance-dsvm-grenade-multinode
+        - devstack-plugin-ceph-tempest-py3:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^.*\.rst$
+              - ^api-ref/.*$
+              - ^doc/.*$
+              - ^releasenotes/.*$
+              - ^setup.cfg$
+              - ^tox.ini$
+        - legacy-tempest-dsvm-neutron-pg-full:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^.*\.rst$
+              - ^api-ref/.*$
+              - ^doc/.*$
+              - ^releasenotes/.*$
+              - ^setup.cfg$
+              - ^tox.ini$
+        - legacy-tempest-dsvm-neutron-full-opensuse-423:
+            irrelevant-files:
+              - ^(test-|)requirements.txt$
+              - ^.*\.rst$
+              - ^api-ref/.*$
+              - ^doc/.*$
+              - ^releasenotes/.*$
+              - ^setup.cfg$
+              - ^tox.ini$
+    periodic:
+      jobs:
+        # NOTE(rosmaita): we only want the "tips" jobs to be run against
+        # master, hence the 'branches' qualifiers below.  Without them, when
+        # a stable branch is cut, the tests would be run against the stable
+        # branch as well, which is pointless because these libraries are
+        # frozen (more or less) in the stable branches.
+        #
+        # The "tips" jobs can be removed from the stable branch .zuul.yaml
+        # files if someone is so inclined, but that would require manual
+        # maintenance, so we do not do it by default.  Another option is
+        # to define these jobs in the openstack/project-config repo.
+        # That would make us less agile in adjusting these tests, so we
+        # aren't doing that either.
+        - glance-tox-functional-oslo-tips:
+            branches: master
+        - glance-tox-functional-py35-oslo-tips:
+            branches: master
+        - glance-tox-py27-keystone-tips:
+            branches: master
+        - glance-tox-py35-keystone-tips:
+            branches: master
+        - glance-tox-functional-keystone-tips:
+            branches: master
+        - glance-tox-functional-py35-keystone-tips:
+            branches: master
+        - glance-tox-py27-glance_store-tips:
+            branches: master
+        - glance-tox-py35-glance_store-tips:
+            branches: master
+        - glance-tox-functional-glance_store-tips:
+            branches: master
+        - glance-tox-functional-py35-glance_store-tips:
+            branches: master
+        - glance-tox-py27-cursive-tips:
+            branches: master
+        - glance-tox-py35-cursive-tips:
+            branches: master
+        - glance-tox-functional-cursive-tips:
+            branches: master
+        - glance-tox-functional-py35-cursive-tips:
+            branches: master

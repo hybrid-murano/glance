@@ -17,6 +17,7 @@ from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 import six
+from six.moves import http_client as http
 import webob.exc
 from wsme.rest import json
 
@@ -123,6 +124,10 @@ class NamespacePropertiesController(object):
             LOG.debug("User not permitted to create metadata property within "
                       "'%s' namespace", namespace)
             raise webob.exc.HTTPForbidden(explanation=e.msg)
+        except exception.Invalid as e:
+            msg = (_("Couldn't create metadata property: %s")
+                   % encodeutils.exception_to_unicode(e))
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
         except exception.Duplicate as e:
@@ -140,6 +145,10 @@ class NamespacePropertiesController(object):
             db_property_type.name = property_type.name
             db_property_type.schema = (self._to_dict(property_type))['schema']
             updated_property_type = prop_repo.save(db_property_type)
+        except exception.Invalid as e:
+            msg = (_("Couldn't update metadata property: %s")
+                   % encodeutils.exception_to_unicode(e))
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.Forbidden as e:
             LOG.debug("User not permitted to update metadata property '%s' "
                       "within '%s' namespace", property_name, namespace)
@@ -237,15 +246,15 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         response.content_type = 'application/json'
 
     def create(self, response, result):
-        response.status_int = 201
+        response.status_int = http.CREATED
         self.show(response, result)
 
     def update(self, response, result):
-        response.status_int = 200
+        response.status_int = http.OK
         self.show(response, result)
 
     def delete(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
 
 def _get_base_definitions():
@@ -274,12 +283,13 @@ def _get_base_properties():
     return base_def['property']['additionalProperties']['properties']
 
 
-def get_schema():
+def get_schema(require_name=True):
     definitions = _get_base_definitions()
     properties = _get_base_properties()
     mandatory_attrs = PropertyType.get_mandatory_attrs()
-    # name is required attribute when use as single property type
-    mandatory_attrs.append('name')
+    if require_name:
+        # name is required attribute when use as single property type
+        mandatory_attrs.append('name')
     schema = glance.schema.Schema(
         'property',
         properties,

@@ -24,10 +24,8 @@ import oslo_utils.importutils
 import glance.async
 from glance.async import taskflow_executor
 from glance.common import exception
-from glance.common.glare import definitions
 from glance.common import timeutils
 from glance import domain
-from glance.glare import domain as artifacts_domain
 import glance.tests.utils as test_utils
 
 
@@ -50,7 +48,7 @@ class TestImageFactory(test_utils.BaseTestCase):
         self.assertIsNotNone(image.created_at)
         self.assertEqual(image.created_at, image.updated_at)
         self.assertEqual('queued', image.status)
-        self.assertEqual('private', image.visibility)
+        self.assertEqual('shared', image.visibility)
         self.assertIsNone(image.owner)
         self.assertIsNone(image.name)
         self.assertIsNone(image.size)
@@ -70,7 +68,7 @@ class TestImageFactory(test_utils.BaseTestCase):
         self.assertIsNotNone(image.created_at)
         self.assertEqual(image.created_at, image.updated_at)
         self.assertEqual('queued', image.status)
-        self.assertEqual('private', image.visibility)
+        self.assertEqual('shared', image.visibility)
         self.assertEqual(TENANT1, image.owner)
         self.assertEqual('image-1', image.name)
         self.assertIsNone(image.size)
@@ -93,7 +91,7 @@ class TestImageFactory(test_utils.BaseTestCase):
         self.assertIsNotNone(image.created_at)
         self.assertEqual(image.created_at, image.updated_at)
         self.assertEqual('queued', image.status)
-        self.assertEqual('private', image.visibility)
+        self.assertEqual('shared', image.visibility)
         self.assertIsNone(image.owner)
         self.assertEqual('image-1', image.name)
         self.assertIsNone(image.size)
@@ -153,6 +151,8 @@ class TestImage(test_utils.BaseTestCase):
     def test_visibility_enumerated(self):
         self.image.visibility = 'public'
         self.image.visibility = 'private'
+        self.image.visibility = 'shared'
+        self.image.visibility = 'community'
         self.assertRaises(ValueError, setattr,
                           self.image, 'visibility', 'ellison')
 
@@ -298,7 +298,7 @@ class TestExtraProperties(test_utils.BaseTestCase):
         a_dict = {'foo': 'bar', 'snitch': 'golden'}
         extra_properties = domain.ExtraProperties(a_dict)
         ref_extra_properties = {'boo': 'far', 'gnitch': 'solden'}
-        self.assertFalse(extra_properties.__eq__(ref_extra_properties))
+        self.assertNotEqual(ref_extra_properties, extra_properties)
 
     def test_eq_with_unequal_ExtraProperties_object(self):
         a_dict = {'foo': 'bar', 'snitch': 'golden'}
@@ -306,13 +306,13 @@ class TestExtraProperties(test_utils.BaseTestCase):
         ref_extra_properties = domain.ExtraProperties()
         ref_extra_properties['gnitch'] = 'solden'
         ref_extra_properties['boo'] = 'far'
-        self.assertFalse(extra_properties.__eq__(ref_extra_properties))
+        self.assertNotEqual(ref_extra_properties, extra_properties)
 
     def test_eq_with_incompatible_object(self):
         a_dict = {'foo': 'bar', 'snitch': 'golden'}
         extra_properties = domain.ExtraProperties(a_dict)
         random_list = ['foo', 'bar']
-        self.assertFalse(extra_properties.__eq__(random_list))
+        self.assertNotEqual(random_list, extra_properties)
 
 
 class TestTaskFactory(test_utils.BaseTestCase):
@@ -573,22 +573,3 @@ class TestTaskExecutorFactory(test_utils.BaseTestCase):
         # NOTE(flaper87): "eventlet" executor. short name to avoid > 79.
         te_evnt = task_executor_factory.new_task_executor(context)
         self.assertIsInstance(te_evnt, taskflow_executor.TaskExecutor)
-
-
-class TestArtifact(definitions.ArtifactType):
-    prop1 = definitions.Dict()
-    prop2 = definitions.Integer(min_value=10)
-
-
-class TestArtifactTypeFactory(test_utils.BaseTestCase):
-
-    def setUp(self):
-        super(TestArtifactTypeFactory, self).setUp()
-        context = mock.Mock(owner='me')
-        self.factory = artifacts_domain.ArtifactFactory(context, TestArtifact)
-
-    def test_new_artifact_min_params(self):
-        artifact = self.factory.new_artifact("foo", "1.0.0-alpha")
-        self.assertEqual('creating', artifact.state)
-        self.assertEqual('me', artifact.owner)
-        self.assertTrue(artifact.id is not None)

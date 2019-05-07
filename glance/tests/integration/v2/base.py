@@ -24,7 +24,6 @@ from oslo_db import options
 
 import glance.common.client
 from glance.common import config
-from glance.db import migration
 import glance.db.sqlalchemy.api
 import glance.registry.client.v1.client
 from glance import tests as glance_tests
@@ -156,8 +155,7 @@ class ApiTest(test_utils.BaseTestCase):
 
     def _setup_database(self):
         sql_connection = 'sqlite:////%s/tests.sqlite' % self.test_dir
-        options.set_defaults(CONF, connection=sql_connection,
-                             sqlite_db='glance.sqlite')
+        options.set_defaults(CONF, connection=sql_connection)
         glance.db.sqlalchemy.api.clear_db_env()
         glance_db_env = 'GLANCE_DB_TEST_SQLITE_FILE'
         if glance_db_env in os.environ:
@@ -167,7 +165,7 @@ class ApiTest(test_utils.BaseTestCase):
             test_utils.execute('cp %s %s/tests.sqlite'
                                % (db_location, self.test_dir))
         else:
-            migration.db_sync()
+            test_utils.db_sync()
 
             # copy the clean db to a temp location so that it
             # can be reused for future tests
@@ -199,7 +197,7 @@ class ApiTest(test_utils.BaseTestCase):
 
     def _load_paste_app(self, name, flavor, conf):
         conf_file_path = os.path.join(self.test_dir, '%s-paste.ini' % name)
-        with open(conf_file_path, 'wb') as conf_file:
+        with open(conf_file_path, 'w') as conf_file:
             conf_file.write(conf)
             conf_file.flush()
         return config.load_paste_app(name, flavor=flavor,

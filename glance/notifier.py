@@ -32,17 +32,53 @@ from glance.i18n import _, _LE
 
 
 notifier_opts = [
-    cfg.StrOpt('default_publisher_id', default="image.localhost",
-               help='Default publisher_id for outgoing notifications.'),
-    cfg.ListOpt('disabled_notifications', default=[],
-                help='List of disabled notifications. A notification can be '
-                     'given either as a notification type to disable a single '
-                     'event, or as a notification group prefix to disable all '
-                     'events within a group. Example: if this config option '
-                     'is set to ["image.create", "metadef_namespace"], then '
-                     '"image.create" notification will not be sent after '
-                     'image is created and none of the notifications for '
-                     'metadefinition namespaces will be sent.'),
+    cfg.StrOpt('default_publisher_id',
+               default="image.localhost",
+               help=_("""
+Default publisher_id for outgoing Glance notifications.
+
+This is the value that the notification driver will use to identify
+messages for events originating from the Glance service. Typically,
+this is the hostname of the instance that generated the message.
+
+Possible values:
+    * Any reasonable instance identifier, for example: image.host1
+
+Related options:
+    * None
+
+""")),
+    cfg.ListOpt('disabled_notifications',
+                default=[],
+                help=_("""
+List of notifications to be disabled.
+
+Specify a list of notifications that should not be emitted.
+A notification can be given either as a notification type to
+disable a single event notification, or as a notification group
+prefix to disable all event notifications within a group.
+
+Possible values:
+    A comma-separated list of individual notification types or
+    notification groups to be disabled. Currently supported groups:
+        * image
+        * image.member
+        * task
+        * metadef_namespace
+        * metadef_object
+        * metadef_property
+        * metadef_resource_type
+        * metadef_tag
+    For a complete listing and description of each event refer to:
+    http://docs.openstack.org/developer/glance/notifications.html
+
+    The values must be specified as: <group_name>.<event_name>
+    For example: image.create,task.success,metadef_tag
+
+Related options:
+    * None
+
+""")),
 ]
 
 CONF = cfg.CONF
@@ -50,19 +86,13 @@ CONF.register_opts(notifier_opts)
 
 LOG = logging.getLogger(__name__)
 
-_ALIASES = {
-    'glance.openstack.common.rpc.impl_kombu': 'rabbit',
-    'glance.openstack.common.rpc.impl_qpid': 'qpid',
-    'glance.openstack.common.rpc.impl_zmq': 'zmq',
-}
-
 
 def set_defaults(control_exchange='glance'):
     oslo_messaging.set_transport_defaults(control_exchange)
 
 
 def get_transport():
-    return oslo_messaging.get_transport(CONF, aliases=_ALIASES)
+    return oslo_messaging.get_notification_transport(CONF)
 
 
 class Notifier(object):
@@ -127,6 +157,7 @@ def format_image_notification(image):
         'size': image.size,
         'virtual_size': image.virtual_size,
         'is_public': image.visibility == 'public',
+        'visibility': image.visibility,
         'properties': dict(image.extra_properties),
         'tags': list(image.tags),
         'deleted': False,
@@ -284,10 +315,15 @@ class NotificationBase(object):
     def get_payload(self, obj):
         return {}
 
-    def send_notification(self, notification_id, obj, extra_payload=None):
+    def send_notification(self, notification_id, obj, extra_payload=None,
+                          backend=None):
         payload = self.get_payload(obj)
         if extra_payload is not None:
             payload.update(extra_payload)
+
+        # update backend information in the notification
+        if backend:
+            payload["backend"] = backend
 
         _send_notification(self.notifier.info, notification_id, payload)
 
@@ -388,12 +424,12 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
         data = self.repo.get_data(offset=offset, chunk_size=chunk_size)
         return self._get_chunk_data_iterator(data, chunk_size=chunk_size)
 
-    def set_data(self, data, size=None):
-        self.send_notification('image.prepare', self.repo)
+    def set_data(self, data, size=None, backend=None):
+        self.send_notification('image.prepare', self.repo, backend=backend)
 
         notify_error = self.notifier.error
         try:
-            self.repo.set_data(data, size)
+            self.repo.set_data(data, size, backend=backend)
         except glance_store.StorageFull as e:
             msg = (_("Image storage media is full: %s") %
                    encodeutils.exception_to_unicode(e))

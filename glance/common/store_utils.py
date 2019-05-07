@@ -27,6 +27,7 @@ from glance import scrubber
 LOG = logging.getLogger(__name__)
 
 CONF = cfg.CONF
+CONF.import_opt('use_user_token', 'glance.registry.client')
 
 RESTRICTED_URI_SCHEMAS = frozenset(['file', 'filesystem', 'swift+config'])
 
@@ -45,7 +46,15 @@ def safe_delete_from_backend(context, image_id, location):
     """
 
     try:
-        ret = store_api.delete_from_backend(location['url'], context=context)
+        if CONF.enabled_backends:
+            backend = location['metadata'].get('backend')
+            ret = store_api.delete(location['url'],
+                                   backend,
+                                   context=context)
+        else:
+            ret = store_api.delete_from_backend(location['url'],
+                                                context=context)
+
         location['status'] = 'deleted'
         if 'id' in location:
             db_api.get_api().image_location_delete(context, image_id,
@@ -118,7 +127,7 @@ def validate_external_location(uri):
     """
     Validate if URI of external location are supported.
 
-    Only over non-local store types are OK, i.e. S3, Swift,
+    Only over non-local store types are OK, i.e. Swift,
     HTTP. Note the absence of 'file://' for security reasons,
     see LP bug #942118, 1400966, 'swift+config://' is also
     absent for security reasons, see LP bug #1334196.
@@ -132,5 +141,9 @@ def validate_external_location(uri):
     # TODO(zhiyan): This function could be moved to glance_store.
     # TODO(gm): Use a whitelist of allowed schemes
     scheme = urlparse.urlparse(uri).scheme
-    return (scheme in store_api.get_known_schemes() and
+    known_schemes = store_api.get_known_schemes()
+    if CONF.enabled_backends:
+        known_schemes = store_api.get_known_schemes_for_multi_store()
+
+    return (scheme in known_schemes and
             scheme not in RESTRICTED_URI_SCHEMAS)

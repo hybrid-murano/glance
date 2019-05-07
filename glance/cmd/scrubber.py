@@ -18,8 +18,17 @@
 """
 Glance Scrub Service
 """
+import eventlet
+# NOTE(jokke): As per the eventlet commit
+# b756447bab51046dfc6f1e0e299cc997ab343701 there's circular import happening
+# which can be solved making sure the hubs are properly and fully imported
+# before calling monkey_patch(). This is solved in eventlet 0.22.0 but we
+# need to address it before that is widely used around.
+eventlet.hubs.get_hub()
+eventlet.patcher.monkey_patch()
 
 import os
+import subprocess
 import sys
 
 # If ../glance/__init__.py exists, add ../ to Python search path, so that
@@ -29,20 +38,19 @@ possible_topdir = os.path.normpath(os.path.join(os.path.abspath(sys.argv[0]),
                                    os.pardir))
 if os.path.exists(os.path.join(possible_topdir, 'glance', '__init__.py')):
     sys.path.insert(0, possible_topdir)
-import eventlet
 
 import glance_store
 from oslo_config import cfg
 from oslo_log import log as logging
 
 from glance.common import config
+from glance.common import exception
 from glance import scrubber
 
-eventlet.patcher.monkey_patch(all=False, socket=True, time=True, select=True,
-                              thread=True, os=True)
 
 CONF = cfg.CONF
 logging.register_options(CONF)
+CONF.set_default(name='use_stderr', default=True)
 
 
 def main():
@@ -59,12 +67,52 @@ def main():
 
         app = scrubber.Scrubber(glance_store)
 
-        if CONF.daemon:
+        if CONF.restore and CONF.daemon:
+            sys.exit("ERROR: The restore and daemon options should not be set "
+                     "together. Please use either of them in one request.")
+        if CONF.restore:
+            # Try to check the glance-scrubber is running or not.
+            # 1. Try to find the pid file if scrubber is controlled by
+            #    glance-control
+            # 2. Try to check the process name.
+            error_str = ("ERROR: The glance-scrubber process is running under "
+                         "daemon. Please stop it first.")
+            pid_file = '/var/run/glance/glance-scrubber.pid'
+            if os.path.exists(os.path.abspath(pid_file)):
+                sys.exit(error_str)
+
+            for glance_scrubber_name in ['glance-scrubber',
+                                         'glance.cmd.scrubber']:
+                cmd = subprocess.Popen(
+                    ['/usr/bin/pgrep', '-f', glance_scrubber_name],
+                    stdout=subprocess.PIPE, shell=False)
+                pids, _ = cmd.communicate()
+
+                # The response format of subprocess.Popen.communicate() is
+                # diffderent between py2 and py3. It's "string" in py2, but
+                # "bytes" in py3.
+                if isinstance(pids, bytes):
+                    pids = pids.decode()
+                self_pid = os.getpid()
+
+                if pids.count('\n') > 1 and str(self_pid) in pids:
+                    # One process is self, so if the process number is > 1, it
+                    # means that another glance-scrubber process is running.
+                    sys.exit(error_str)
+                elif pids.count('\n') > 0 and str(self_pid) not in pids:
+                    # If self is not in result and the pids number is still
+                    # > 0, it means that the another glance-scrubber process is
+                    # running.
+                    sys.exit(error_str)
+            app.revert_image_status(CONF.restore)
+        elif CONF.daemon:
             server = scrubber.Daemon(CONF.wakeup_time)
             server.start(app)
             server.wait()
         else:
             app.run()
+    except (exception.ImageNotFound, exception.Conflict) as e:
+        sys.exit("ERROR: %s" % e)
     except RuntimeError as e:
         sys.exit("ERROR: %s" % e)
 

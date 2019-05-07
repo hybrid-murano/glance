@@ -24,11 +24,9 @@ from wsme.rest import json
 from glance.api.v2.model.metadef_property_type import PropertyType
 from glance.common import crypt
 from glance.common import exception
-from glance.common.glare import serialization
 from glance.common import location_strategy
 import glance.domain
 import glance.domain.proxy
-from glance import glare as ga
 from glance.i18n import _
 
 CONF = cfg.CONF
@@ -36,10 +34,26 @@ CONF.import_opt('image_size_cap', 'glance.common.config')
 CONF.import_opt('metadata_encryption_key', 'glance.common.config')
 
 
-def get_api():
-    api = importutils.import_module(CONF.data_api)
+def get_api(v1_mode=False):
+    """
+    When using v2_registry with v2_api or alone, it is essential that the opt
+    'data_api' be set to 'glance.db.registry.api'. This requires us to
+    differentiate what this method returns as the db api. i.e., we do not want
+    to return 'glance.db.registry.api' for a call from v1 api.
+    Reference bug #1516706
+    """
+    if v1_mode:
+        # prevent v1_api from talking to v2_registry.
+        if CONF.data_api == 'glance.db.simple.api':
+            api = importutils.import_module(CONF.data_api)
+        else:
+            api = importutils.import_module('glance.db.sqlalchemy.api')
+    else:
+        api = importutils.import_module(CONF.data_api)
+
     if hasattr(api, 'configure'):
         api.configure()
+
     return api
 
 
@@ -57,99 +71,6 @@ IMAGE_ATTRS = BASE_MODEL_ATTRS | set(['name', 'status', 'size', 'virtual_size',
                                       'min_disk', 'min_ram', 'is_public',
                                       'locations', 'checksum', 'owner',
                                       'protected'])
-
-
-class ArtifactRepo(object):
-    fields = ['id', 'name', 'version', 'type_name', 'type_version',
-              'visibility', 'state', 'owner', 'scope', 'created_at',
-              'updated_at', 'tags', 'dependencies', 'blobs', 'properties']
-
-    def __init__(self, context, db_api, plugins):
-        self.context = context
-        self.db_api = db_api
-        self.plugins = plugins
-
-    def get(self, artifact_id, type_name=None, type_version=None,
-            show_level=None, include_deleted=False):
-        if show_level is None:
-            show_level = ga.Showlevel.BASIC
-        try:
-            db_api_artifact = self.db_api.artifact_get(self.context,
-                                                       artifact_id,
-                                                       type_name,
-                                                       type_version,
-                                                       show_level)
-            if db_api_artifact["state"] == 'deleted' and not include_deleted:
-                raise exception.ArtifactNotFound(artifact_id)
-        except (exception.ArtifactNotFound, exception.ArtifactForbidden):
-            msg = _("No artifact found with ID %s") % artifact_id
-            raise exception.ArtifactNotFound(msg)
-        return serialization.deserialize_from_db(db_api_artifact, self.plugins)
-
-    def list(self, marker=None, limit=None,
-             sort_keys=None, sort_dirs=None, filters=None,
-             show_level=None):
-        sort_keys = ['created_at'] if sort_keys is None else sort_keys
-        sort_dirs = ['desc'] if sort_dirs is None else sort_dirs
-        if show_level is None:
-            show_level = ga.Showlevel.NONE
-        db_api_artifacts = self.db_api.artifact_get_all(
-            self.context, filters=filters, marker=marker, limit=limit,
-            sort_keys=sort_keys, sort_dirs=sort_dirs, show_level=show_level)
-        artifacts = []
-        for db_api_artifact in db_api_artifacts:
-            artifact = serialization.deserialize_from_db(db_api_artifact,
-                                                         self.plugins)
-            artifacts.append(artifact)
-        return artifacts
-
-    def _format_artifact_from_db(self, db_artifact):
-        kwargs = {k: db_artifact.get(k, None) for k in self.fields}
-        return glance.domain.Artifact(**kwargs)
-
-    def add(self, artifact):
-        artifact_values = serialization.serialize_for_db(artifact)
-        artifact_values['updated_at'] = artifact.updated_at
-        self.db_api.artifact_create(self.context, artifact_values,
-                                    artifact.type_name, artifact.type_version)
-
-    def save(self, artifact):
-        artifact_values = serialization.serialize_for_db(artifact)
-        try:
-            db_api_artifact = self.db_api.artifact_update(
-                self.context,
-                artifact_values,
-                artifact.id,
-                artifact.type_name,
-                artifact.type_version)
-        except (exception.ArtifactNotFound,
-                exception.ArtifactForbidden):
-            msg = _("No artifact found with ID %s") % artifact.id
-            raise exception.ArtifactNotFound(msg)
-        return serialization.deserialize_from_db(db_api_artifact, self.plugins)
-
-    def remove(self, artifact):
-        try:
-            self.db_api.artifact_delete(self.context, artifact.id,
-                                        artifact.type_name,
-                                        artifact.type_version)
-        except (exception.NotFound, exception.Forbidden):
-            msg = _("No artifact found with ID %s") % artifact.id
-            raise exception.ArtifactNotFound(msg)
-
-    def publish(self, artifact):
-        try:
-            artifact_changed = (
-                self.db_api.artifact_publish(
-                    self.context,
-                    artifact.id,
-                    artifact.type_name,
-                    artifact.type_version))
-            return serialization.deserialize_from_db(artifact_changed,
-                                                     self.plugins)
-        except (exception.NotFound, exception.Forbidden):
-            msg = _("No artifact found with ID %s") % artifact.id
-            raise exception.ArtifactNotFound(msg)
 
 
 class ImageRepo(object):
@@ -186,7 +107,6 @@ class ImageRepo(object):
         return images
 
     def _format_image_from_db(self, db_image, db_tags):
-        visibility = 'public' if db_image['is_public'] else 'private'
         properties = {}
         for prop in db_image.pop('properties'):
             # NOTE(markwash) db api requires us to filter deleted
@@ -204,19 +124,22 @@ class ImageRepo(object):
             status=db_image['status'],
             created_at=db_image['created_at'],
             updated_at=db_image['updated_at'],
-            visibility=visibility,
+            visibility=db_image['visibility'],
             min_disk=db_image['min_disk'],
             min_ram=db_image['min_ram'],
             protected=db_image['protected'],
             locations=location_strategy.get_ordered_locations(locations),
             checksum=db_image['checksum'],
+            os_hash_algo=db_image['os_hash_algo'],
+            os_hash_value=db_image['os_hash_value'],
             owner=db_image['owner'],
             disk_format=db_image['disk_format'],
             container_format=db_image['container_format'],
             size=db_image['size'],
             virtual_size=db_image['virtual_size'],
             extra_properties=properties,
-            tags=db_tags
+            tags=db_tags,
+            os_hidden=db_image['os_hidden'],
         )
 
     def _format_image_to_db(self, image):
@@ -241,13 +164,16 @@ class ImageRepo(object):
             'protected': image.protected,
             'locations': locations,
             'checksum': image.checksum,
+            'os_hash_algo': image.os_hash_algo,
+            'os_hash_value': image.os_hash_value,
             'owner': image.owner,
             'disk_format': image.disk_format,
             'container_format': image.container_format,
             'size': image.size,
             'virtual_size': image.virtual_size,
-            'is_public': image.visibility == 'public',
+            'visibility': image.visibility,
             'properties': dict(image.extra_properties),
+            'os_hidden': image.os_hidden
         }
 
     def add(self, image):

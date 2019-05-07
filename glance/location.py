@@ -15,9 +15,11 @@
 
 import collections
 import copy
+import functools
 
 from cryptography import exceptions as crypto_exception
-import debtcollector
+from cursive import exception as cursive_exception
+from cursive import signature_utils
 import glance_store as store
 from oslo_config import cfg
 from oslo_log import log as logging
@@ -25,10 +27,9 @@ from oslo_utils import encodeutils
 from oslo_utils import excutils
 
 from glance.common import exception
-from glance.common import signature_utils
 from glance.common import utils
 import glance.domain.proxy
-from glance.i18n import _, _LE, _LI
+from glance.i18n import _, _LE, _LI, _LW
 
 
 CONF = cfg.CONF
@@ -58,9 +59,16 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
                                                      self.store_api)
             member_ids = [m.member_id for m in member_repo.list()]
         for location in image.locations:
-            self.store_api.set_acls(location['url'], public=public,
-                                    read_tenants=member_ids,
-                                    context=self.context)
+            if CONF.enabled_backends:
+                self.store_api.set_acls_for_multi_store(
+                    location['url'], location['metadata']['backend'],
+                    public=public, read_tenants=member_ids,
+                    context=self.context
+                )
+            else:
+                self.store_api.set_acls(location['url'], public=public,
+                                        read_tenants=member_ids,
+                                        context=self.context)
 
     def add(self, image):
         result = super(ImageRepoProxy, self).add(image)
@@ -74,27 +82,35 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
 
 
 def _get_member_repo_for_store(image, context, db_api, store_api):
-        image_member_repo = glance.db.ImageMemberRepo(
-            context, db_api, image)
-        store_image_repo = glance.location.ImageMemberRepoProxy(
-            image_member_repo, image, context, store_api)
+    image_member_repo = glance.db.ImageMemberRepo(context, db_api, image)
+    store_image_repo = glance.location.ImageMemberRepoProxy(
+        image_member_repo, image, context, store_api)
 
-        return store_image_repo
+    return store_image_repo
 
 
-def _check_location_uri(context, store_api, store_utils, uri):
+def _check_location_uri(context, store_api, store_utils, uri,
+                        backend=None):
     """Check if an image location is valid.
 
     :param context: Glance request context
     :param store_api: store API module
     :param store_utils: store utils module
     :param uri: location's uri string
+    :param backend: A backend name for the store
     """
 
     try:
         # NOTE(zhiyan): Some stores return zero when it catch exception
+        if CONF.enabled_backends:
+            size_from_backend = store_api.get_size_from_uri_and_backend(
+                uri, backend, context=context)
+        else:
+            size_from_backend = store_api.get_size_from_backend(
+                uri, context=context)
+
         is_ok = (store_utils.validate_external_location(uri) and
-                 store_api.get_size_from_backend(uri, context=context) > 0)
+                 size_from_backend > 0)
     except (store.UnknownScheme, store.NotFound, store.BadStoreUri):
         is_ok = False
     if not is_ok:
@@ -103,15 +119,25 @@ def _check_location_uri(context, store_api, store_utils, uri):
 
 
 def _check_image_location(context, store_api, store_utils, location):
-    _check_location_uri(context, store_api, store_utils, location['url'])
+    backend = None
+    if CONF.enabled_backends:
+        backend = location['metadata'].get('backend')
+
+    _check_location_uri(context, store_api, store_utils, location['url'],
+                        backend=backend)
     store_api.check_location_metadata(location['metadata'])
 
 
 def _set_image_size(context, image, locations):
     if not image.size:
         for location in locations:
-            size_from_backend = store.get_size_from_backend(
-                location['url'], context=context)
+            if CONF.enabled_backends:
+                size_from_backend = store.get_size_from_uri_and_backend(
+                    location['url'], location['metadata'].get('backend'),
+                    context=context)
+            else:
+                size_from_backend = store.get_size_from_backend(
+                    location['url'], context=context)
 
             if size_from_backend:
                 # NOTE(flwang): This assumes all locations have the same size
@@ -159,13 +185,14 @@ class ImageFactoryProxy(glance.domain.proxy.ImageFactory):
         return super(ImageFactoryProxy, self).new_image(**kwargs)
 
 
+@functools.total_ordering
 class StoreLocations(collections.MutableSequence):
     """
     The proxy for store location property. It takes responsibility for::
 
-    1. Location uri correctness checking when adding a new location.
-    2. Remove the image data from the store when a location is removed
-       from an image.
+        1. Location uri correctness checking when adding a new location.
+        2. Remove the image data from the store when a location is removed
+           from an image.
 
     """
     def __init__(self, image_proxy, value):
@@ -298,11 +325,11 @@ class StoreLocations(collections.MutableSequence):
         else:
             return other
 
-    def __cmp__(self, other):
-        return cmp(self.value, self.__cast(other))
-
     def __eq__(self, other):
         return self.value == self.__cast(other)
+
+    def __lt__(self, other):
+        return self.value < self.__cast(other)
 
     def __iter__(self):
         return iter(self.value)
@@ -403,31 +430,57 @@ class ImageProxy(glance.domain.proxy.Image):
                     self.image.image_id,
                     location)
 
-    def set_data(self, data, size=None):
+    def set_data(self, data, size=None, backend=None):
         if size is None:
             size = 0  # NOTE(markwash): zero -> unknown size
 
         # Create the verifier for signature verification (if correct properties
         # are present)
-        if (signature_utils.should_create_verifier(
-                self.image.extra_properties)):
+        extra_props = self.image.extra_properties
+        if (signature_utils.should_create_verifier(extra_props)):
             # NOTE(bpoulos): if creating verifier fails, exception will be
             # raised
+            img_signature = extra_props[signature_utils.SIGNATURE]
+            hash_method = extra_props[signature_utils.HASH_METHOD]
+            key_type = extra_props[signature_utils.KEY_TYPE]
+            cert_uuid = extra_props[signature_utils.CERT_UUID]
             verifier = signature_utils.get_verifier(
-                self.context, self.image.extra_properties)
+                context=self.context,
+                img_signature_certificate_uuid=cert_uuid,
+                img_signature_hash_method=hash_method,
+                img_signature=img_signature,
+                img_signature_key_type=key_type
+            )
         else:
             verifier = None
 
-        location, size, checksum, loc_meta = self.store_api.add_to_backend(
-            CONF,
-            self.image.image_id,
-            utils.LimitingReader(utils.CooperativeReader(data),
-                                 CONF.image_size_cap),
-            size,
-            context=self.context,
-            verifier=verifier)
-
-        self._verify_signature_if_needed(checksum)
+        hashing_algo = CONF['hashing_algorithm']
+        if CONF.enabled_backends:
+            (location, size, checksum,
+             multihash, loc_meta) = self.store_api.add_with_multihash(
+                CONF,
+                self.image.image_id,
+                utils.LimitingReader(utils.CooperativeReader(data),
+                                     CONF.image_size_cap),
+                size,
+                backend,
+                hashing_algo,
+                context=self.context,
+                verifier=verifier)
+        else:
+            (location,
+             size,
+             checksum,
+             multihash,
+             loc_meta) = self.store_api.add_to_backend_with_multihash(
+                CONF,
+                self.image.image_id,
+                utils.LimitingReader(utils.CooperativeReader(data),
+                                     CONF.image_size_cap),
+                size,
+                hashing_algo,
+                context=self.context,
+                verifier=verifier)
 
         # NOTE(bpoulos): if verification fails, exception will be raised
         if verifier:
@@ -436,7 +489,13 @@ class ImageProxy(glance.domain.proxy.Image):
                 LOG.info(_LI("Successfully verified signature for image %s"),
                          self.image.image_id)
             except crypto_exception.InvalidSignature:
-                raise exception.SignatureVerificationError(
+                if CONF.enabled_backends:
+                    self.store_api.delete(location, loc_meta.get('backend'),
+                                          context=self.context)
+                else:
+                    self.store_api.delete_from_backend(location,
+                                                       context=self.context)
+                raise cursive_exception.SignatureVerificationError(
                     _('Signature verification failed')
                 )
 
@@ -444,20 +503,9 @@ class ImageProxy(glance.domain.proxy.Image):
                                  'status': 'active'}]
         self.image.size = size
         self.image.checksum = checksum
+        self.image.os_hash_value = multihash
+        self.image.os_hash_algo = hashing_algo
         self.image.status = 'active'
-
-    @debtcollector.removals.remove(
-        message="This will be removed in the N cycle.")
-    def _verify_signature_if_needed(self, checksum):
-        # Verify the signature (if correct properties are present)
-        if (signature_utils.should_verify_signature(
-                self.image.extra_properties)):
-            # NOTE(bpoulos): if verification fails, exception will be raised
-            result = signature_utils.verify_signature(
-                self.context, checksum, self.image.extra_properties)
-            if result:
-                LOG.info(_LI("Successfully verified signature for image %s"),
-                         self.image.image_id)
 
     def get_data(self, offset=0, chunk_size=None):
         if not self.image.locations:
@@ -470,22 +518,30 @@ class ImageProxy(glance.domain.proxy.Image):
         err = None
         for loc in self.image.locations:
             try:
-                data, size = self.store_api.get_from_backend(
-                    loc['url'],
-                    offset=offset,
-                    chunk_size=chunk_size,
-                    context=self.context)
+                backend = loc['metadata'].get('backend')
+                if CONF.enabled_backends:
+                    data, size = self.store_api.get(
+                        loc['url'], backend, offset=offset,
+                        chunk_size=chunk_size, context=self.context
+                    )
+                else:
+                    data, size = self.store_api.get_from_backend(
+                        loc['url'],
+                        offset=offset,
+                        chunk_size=chunk_size,
+                        context=self.context)
 
                 return data
             except Exception as e:
-                LOG.warn(_('Get image %(id)s data failed: '
-                           '%(err)s.')
+                LOG.warn(_LW('Get image %(id)s data failed: '
+                             '%(err)s.')
                          % {'id': self.image.image_id,
                             'err': encodeutils.exception_to_unicode(e)})
                 err = e
         # tried all locations
-        LOG.error(_LE('Glance tried all active locations to get data for '
-                      'image %s but all have failed.') % self.image.image_id)
+        LOG.error(_LE(
+            'Glance tried all active locations/stores to get data '
+            'for image %s but all have failed.') % self.image.image_id)
         raise err
 
 

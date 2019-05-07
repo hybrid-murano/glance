@@ -14,6 +14,7 @@
 #    under the License.
 
 from oslo_config import cfg
+from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from six.moves import http_client
 import webob.dec
@@ -24,15 +25,31 @@ from glance.i18n import _
 
 versions_opts = [
     cfg.StrOpt('public_endpoint',
-               help=_('Public url to use for versions endpoint. The default '
-                      'is None, which will use the request\'s host_url '
-                      'attribute to populate the URL base. If Glance is '
-                      'operating behind a proxy, you will want to change '
-                      'this to represent the proxy\'s URL.')),
+               help=_("""
+Public url endpoint to use for Glance versions response.
+
+This is the public url endpoint that will appear in the Glance
+"versions" response. If no value is specified, the endpoint that is
+displayed in the version's response is that of the host running the
+API service. Change the endpoint to represent the proxy URL if the
+API service is running behind a proxy. If the service is running
+behind a load balancer, add the load balancer's URL for this value.
+
+Possible values:
+    * None
+    * Proxy URL
+    * Load balancer URL
+
+Related options:
+    * None
+
+""")),
 ]
 
 CONF = cfg.CONF
 CONF.register_opts(versions_opts)
+
+LOG = logging.getLogger(__name__)
 
 
 class Controller(object):
@@ -56,16 +73,19 @@ class Controller(object):
 
         version_objs = []
         if CONF.enable_v2_api:
+            if CONF.enabled_backends:
+                version_objs.extend([
+                    build_version_object(2.8, 'v2', 'EXPERIMENTAL')
+                ])
             version_objs.extend([
-                build_version_object(2.3, 'v2', 'CURRENT'),
+                build_version_object(2.7, 'v2', 'CURRENT'),
+                build_version_object(2.6, 'v2', 'SUPPORTED'),
+                build_version_object(2.5, 'v2', 'SUPPORTED'),
+                build_version_object(2.4, 'v2', 'SUPPORTED'),
+                build_version_object(2.3, 'v2', 'SUPPORTED'),
                 build_version_object(2.2, 'v2', 'SUPPORTED'),
                 build_version_object(2.1, 'v2', 'SUPPORTED'),
                 build_version_object(2.0, 'v2', 'SUPPORTED'),
-            ])
-        if CONF.enable_v1_api:
-            version_objs.extend([
-                build_version_object(1.1, 'v1', 'SUPPORTED'),
-                build_version_object(1.0, 'v1', 'SUPPORTED'),
             ])
 
         status = explicit and http_client.OK or http_client.MULTIPLE_CHOICES

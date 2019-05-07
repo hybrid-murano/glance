@@ -113,7 +113,7 @@ class UploadException(GlanceException):
 
 
 class Forbidden(GlanceException):
-    message = _("You are not authorized to complete this action.")
+    message = _("You are not authorized to complete %(action)s action.")
 
 
 class ForbiddenPublicImage(Forbidden):
@@ -292,6 +292,11 @@ class ImageSizeLimitExceeded(GlanceException):
     message = _("The provided image is too large.")
 
 
+class FailedToGetScrubberJobs(GlanceException):
+    message = _("Scrubber encountered an error while trying to fetch "
+                "scrub jobs.")
+
+
 class ImageMemberLimitExceeded(LimitExceeded):
     message = _("The limit has been exceeded on the number of allowed image "
                 "members for this image. Attempted: %(attempted)s, "
@@ -397,7 +402,9 @@ class MetadefDuplicateResourceTypeAssociation(Duplicate):
 
 class MetadefDuplicateTag(Duplicate):
     message = _("A metadata tag with name=%(name)s"
-                " already exists in namespace=%(namespace_name)s.")
+                " already exists in namespace=%(namespace_name)s."
+                " (Please note that metadata tag names are"
+                " case insensitive).")
 
 
 class MetadefForbidden(Forbidden):
@@ -412,7 +419,7 @@ class MetadefIntegrityError(Forbidden):
 
 class MetadefNamespaceNotFound(NotFound):
     message = _("Metadata definition namespace=%(namespace_name)s"
-                "was not found.")
+                " was not found.")
 
 
 class MetadefObjectNotFound(NotFound):
@@ -445,117 +452,7 @@ class MetadefTagNotFound(NotFound):
                 " namespace=%(namespace_name)s.")
 
 
-class SignatureVerificationError(GlanceException):
-    message = _("Unable to verify signature: %(reason)s")
-
-
-class InvalidVersion(Invalid):
-    message = _("Version is invalid: %(reason)s")
-
-
-class InvalidArtifactTypePropertyDefinition(Invalid):
-    message = _("Invalid property definition")
-
-
-class InvalidArtifactTypeDefinition(Invalid):
-    message = _("Invalid type definition")
-
-
-class InvalidArtifactPropertyValue(Invalid):
-    message = _("Property '%(name)s' may not have value '%(val)s': %(msg)s")
-
-    def __init__(self, message=None, *args, **kwargs):
-        super(InvalidArtifactPropertyValue, self).__init__(message, *args,
-                                                           **kwargs)
-        self.name = kwargs.get('name')
-        self.value = kwargs.get('val')
-
-
-class ArtifactNotFound(NotFound):
-    message = _("Artifact with id=%(id)s was not found")
-
-
-class ArtifactForbidden(Forbidden):
-    message = _("Artifact with id=%(id)s is not accessible")
-
-
-class ArtifactDuplicateNameTypeVersion(Duplicate):
-    message = _("Artifact with the specified type, name and version"
-                " already exists")
-
-
-class InvalidArtifactStateTransition(Invalid):
-    message = _("Artifact cannot change state from %(source)s to %(target)s")
-
-
-class ArtifactDuplicateDirectDependency(Duplicate):
-    message = _("Artifact with the specified type, name and version"
-                " already has the direct dependency=%(dep)s")
-
-
-class ArtifactDuplicateTransitiveDependency(Duplicate):
-    message = _("Artifact with the specified type, name and version"
-                " already has the transitive dependency=%(dep)s")
-
-
-class ArtifactCircularDependency(Invalid):
-    message = _("Artifact with a circular dependency can not be created")
-
-
-class ArtifactUnsupportedPropertyOperator(Invalid):
-    message = _("Operator %(op)s is not supported")
-
-
-class ArtifactUnsupportedShowLevel(Invalid):
-    message = _("Show level %(shl)s is not supported in this operation")
-
-
-class ArtifactPropertyValueNotFound(NotFound):
-    message = _("Property's %(prop)s value has not been found")
-
-
-class ArtifactInvalidProperty(Invalid):
-    message = _("Artifact has no property %(prop)s")
-
-
-class ArtifactInvalidPropertyParameter(Invalid):
-    message = _("Cannot use this parameter with the operator %(op)s")
-
-
-class ArtifactLoadError(GlanceException):
-    message = _("Cannot load artifact '%(name)s'")
-
-
-class ArtifactNonMatchingTypeName(ArtifactLoadError):
-    message = _(
-        "Plugin name '%(plugin)s' should match artifact typename '%(name)s'")
-
-
-class ArtifactPluginNotFound(NotFound):
-    message = _("No plugin for '%(name)s' has been loaded")
-
-
-class UnknownArtifactType(NotFound):
-    message = _("Artifact type with name '%(name)s' and version '%(version)s' "
-                "is not known")
-
-
-class ArtifactInvalidStateTransition(Invalid):
-    message = _("Artifact state cannot be changed from %(curr)s to %(to)s")
-
-
-class JsonPatchException(GlanceException):
-    message = _("Invalid jsonpatch request")
-
-
-class InvalidJsonPatchBody(JsonPatchException):
-    message = _("The provided body %(body)s is invalid "
-                "under given schema: %(schema)s")
-
-
-class InvalidJsonPatchPath(JsonPatchException):
-    message = _("The provided path '%(path)s' is invalid: %(explanation)s")
-
-    def __init__(self, message=None, *args, **kwargs):
-        self.explanation = kwargs.get("explanation")
-        super(InvalidJsonPatchPath, self).__init__(message, *args, **kwargs)
+class InvalidDataMigrationScript(GlanceException):
+    message = _("Invalid data migration script '%(script)s'. A valid data "
+                "migration script must implement functions 'has_migrations' "
+                "and 'migrate'.")

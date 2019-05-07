@@ -48,7 +48,8 @@ def _import_delayed_delete():
 
 class ImageFactory(object):
     _readonly_properties = ['created_at', 'updated_at', 'status', 'checksum',
-                            'size', 'virtual_size']
+                            'os_hash_algo', 'os_hash_value', 'size',
+                            'virtual_size']
     _reserved_properties = ['owner', 'locations', 'deleted', 'deleted_at',
                             'direct_url', 'self', 'file', 'schema']
 
@@ -68,10 +69,11 @@ class ImageFactory(object):
                 if key in properties:
                     raise exception.ReservedProperty(property=key)
 
-    def new_image(self, image_id=None, name=None, visibility='private',
+    def new_image(self, image_id=None, name=None, visibility='shared',
                   min_disk=0, min_ram=0, protected=False, owner=None,
                   disk_format=None, container_format=None,
-                  extra_properties=None, tags=None, **other_args):
+                  extra_properties=None, tags=None, os_hidden=False,
+                  **other_args):
         extra_properties = extra_properties or {}
         self._check_readonly(other_args)
         self._check_unexpected(other_args)
@@ -89,6 +91,7 @@ class ImageFactory(object):
                      min_ram=min_ram, protected=protected,
                      owner=owner, disk_format=disk_format,
                      container_format=container_format,
+                     os_hidden=os_hidden,
                      extra_properties=extra_properties, tags=tags or [])
 
 
@@ -101,11 +104,13 @@ class Image(object):
         # NOTE(flwang): In v2, we are deprecating the 'killed' status, so it's
         # allowed to restore image from 'saving' to 'queued' so that upload
         # can be retried.
-        'queued': ('saving', 'active', 'deleted'),
+        'queued': ('saving', 'uploading', 'importing', 'active', 'deleted'),
         'saving': ('active', 'killed', 'deleted', 'queued'),
+        'uploading': ('importing', 'queued', 'deleted'),
+        'importing': ('active', 'deleted', 'queued'),
         'active': ('pending_delete', 'deleted', 'deactivated'),
         'killed': ('deleted',),
-        'pending_delete': ('deleted',),
+        'pending_delete': ('deleted', 'active'),
         'deleted': (),
         'deactivated': ('active', 'deleted'),
     }
@@ -116,12 +121,15 @@ class Image(object):
         self.created_at = created_at
         self.updated_at = updated_at
         self.name = kwargs.pop('name', None)
-        self.visibility = kwargs.pop('visibility', 'private')
+        self.visibility = kwargs.pop('visibility', 'shared')
+        self.os_hidden = kwargs.pop('os_hidden', False)
         self.min_disk = kwargs.pop('min_disk', 0)
         self.min_ram = kwargs.pop('min_ram', 0)
         self.protected = kwargs.pop('protected', False)
         self.locations = kwargs.pop('locations', [])
         self.checksum = kwargs.pop('checksum', None)
+        self.os_hash_algo = kwargs.pop('os_hash_algo', None)
+        self.os_hash_value = kwargs.pop('os_hash_value', None)
         self.owner = kwargs.pop('owner', None)
         self._disk_format = kwargs.pop('disk_format', None)
         self._container_format = kwargs.pop('container_format', None)
@@ -148,7 +156,8 @@ class Image(object):
                 LOG.debug(e)
                 raise e
 
-            if self._status == 'queued' and status in ('saving', 'active'):
+            if self._status in ('queued', 'uploading') and status in (
+                    'saving', 'active', 'importing'):
                 missing = [k for k in ['disk_format', 'container_format']
                            if not getattr(self, k)]
                 if len(missing) > 0:
@@ -172,9 +181,9 @@ class Image(object):
 
     @visibility.setter
     def visibility(self, visibility):
-        if visibility not in ('public', 'private'):
-            raise ValueError(_('Visibility must be either "public" '
-                               'or "private"'))
+        if visibility not in ('community', 'public', 'private', 'shared'):
+            raise ValueError(_('Visibility must be one of "community", '
+                               '"public", "private", or "shared"'))
         self._visibility = visibility
 
     @property
@@ -191,7 +200,8 @@ class Image(object):
 
     @container_format.setter
     def container_format(self, value):
-        if hasattr(self, '_container_format') and self.status != 'queued':
+        if (hasattr(self, '_container_format') and
+                self.status not in ('queued', 'importing')):
             msg = _("Attribute container_format can be only replaced "
                     "for a queued image.")
             raise exception.Forbidden(message=msg)
@@ -203,7 +213,8 @@ class Image(object):
 
     @disk_format.setter
     def disk_format(self, value):
-        if hasattr(self, '_disk_format') and self.status != 'queued':
+        if (hasattr(self, '_disk_format') and
+                self.status not in ('queued', 'importing')):
             msg = _("Attribute disk_format can be only replaced "
                     "for a queued image.")
             raise exception.Forbidden(message=msg)
@@ -272,7 +283,7 @@ class Image(object):
     def get_data(self, *args, **kwargs):
         raise NotImplementedError()
 
-    def set_data(self, data, size=None):
+    def set_data(self, data, size=None, backend=None):
         raise NotImplementedError()
 
 
@@ -289,17 +300,20 @@ class ExtraProperties(collections.MutableMapping, dict):
 
     def __eq__(self, other):
         if isinstance(other, ExtraProperties):
-            return dict(self).__eq__(dict(other))
+            return dict.__eq__(self, dict(other))
         elif isinstance(other, dict):
-            return dict(self).__eq__(other)
+            return dict.__eq__(self, other)
         else:
             return False
 
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
     def __len__(self):
-        return dict(self).__len__()
+        return dict.__len__(self)
 
     def keys(self):
-        return dict(self).keys()
+        return dict.keys(self)
 
 
 class ImageMembership(object):
@@ -337,7 +351,7 @@ class ImageMemberFactory(object):
 
 
 class Task(object):
-    _supported_task_type = ('import',)
+    _supported_task_type = ('import', 'api_image_import')
 
     _supported_task_status = ('pending', 'processing', 'success', 'failure')
 
@@ -396,12 +410,12 @@ class Task(object):
 
     def _set_task_status(self, new_status):
         if self._validate_task_status_transition(self.status, new_status):
+            old_status = self.status
             self._status = new_status
             LOG.info(_LI("Task [%(task_id)s] status changing from "
                          "%(cur_status)s to %(new_status)s"),
-                     {'task_id': self.task_id, 'cur_status': self.status,
+                     {'task_id': self.task_id, 'cur_status': old_status,
                       'new_status': new_status})
-            self._status = new_status
         else:
             LOG.error(_LE("Task [%(task_id)s] status failed to change from "
                           "%(cur_status)s to %(new_status)s"),

@@ -14,12 +14,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
 import uuid
 
 import mock
 from oslo_config import cfg
 from oslo_db import exception as db_exc
 from oslo_utils import encodeutils
+from oslo_utils import timeutils
 
 from glance.common import crypt
 from glance.common import exception
@@ -53,6 +55,11 @@ class TestDbUtilities(test_utils.BaseTestCase):
         import_module.assert_called_once_with('silly pants')
         self.assertFalse(hasattr(self.api, 'configure'))
 
+    def test_get_api_calls_for_v1_api(self, import_module):
+        api = glance.db.get_api(v1_mode=True)
+        self.assertNotEqual(api, self.api)
+        import_module.assert_called_once_with('glance.db.sqlalchemy.api')
+        api.configure.assert_called_once_with()
 
 UUID1 = 'c80a1a6c-bd1f-41c5-90ee-81afedb1d58d'
 UUID2 = 'a85abd86-55b3-4d5b-b0b4-5d0a6e6042fc'
@@ -93,6 +100,8 @@ def _db_fixture(id, **kwargs):
         'min_ram': None,
         'min_disk': None,
     }
+    if 'visibility' in kwargs:
+        obj.pop('is_public')
     obj.update(kwargs)
     return obj
 
@@ -116,6 +125,7 @@ def _db_task_fixture(task_id, type, status, **kwargs):
         'owner': None,
         'message': None,
         'deleted': False,
+        'expires_at': timeutils.utcnow() + datetime.timedelta(days=365)
     }
     obj.update(kwargs)
     return obj
@@ -245,6 +255,11 @@ class TestImageRepo(test_utils.BaseTestCase):
     def test_list_private_images(self):
         filters = {'visibility': 'private'}
         images = self.image_repo.list(filters=filters)
+        self.assertEqual(0, len(images))
+
+    def test_list_shared_images(self):
+        filters = {'visibility': 'shared'}
+        images = self.image_repo.list(filters=filters)
         image_ids = set([i.image_id for i in images])
         self.assertEqual(set([UUID2]), image_ids)
 
@@ -358,7 +373,7 @@ class TestImageRepo(test_utils.BaseTestCase):
         image.tags = ['king', 'kong']
         self.image_repo.save(image)
         current_update_time = image.updated_at
-        self.assertTrue(current_update_time > original_update_time)
+        self.assertGreater(current_update_time, original_update_time)
         image = self.image_repo.get(UUID1)
         self.assertEqual('foo', image.name)
         self.assertEqual(set(['king', 'kong']), image.tags)
@@ -376,7 +391,7 @@ class TestImageRepo(test_utils.BaseTestCase):
         image = self.image_repo.get(UUID1)
         previous_update_time = image.updated_at
         self.image_repo.remove(image)
-        self.assertTrue(image.updated_at > previous_update_time)
+        self.assertGreater(image.updated_at, previous_update_time)
         self.assertRaises(exception.ImageNotFound, self.image_repo.get, UUID1)
 
     def test_remove_image_not_found(self):
@@ -386,6 +401,32 @@ class TestImageRepo(test_utils.BaseTestCase):
         exc = self.assertRaises(
             exception.ImageNotFound, self.image_repo.remove, image)
         self.assertIn(fake_uuid, encodeutils.exception_to_unicode(exc))
+
+    def test_restore_image_status(self):
+        image_id = uuid.uuid4()
+        image = _db_fixture(image_id, name='restore_test', size=256,
+                            is_public=True, status='pending_delete')
+        self.db.image_create(self.context, image)
+        self.db.image_restore(self.context, image_id)
+        image = self.db.image_get(self.context, image_id)
+        self.assertEqual(image['status'], 'active')
+
+    def test_restore_image_status_not_found(self):
+        image_id = uuid.uuid4()
+        self.assertRaises(exception.ImageNotFound,
+                          self.db.image_restore,
+                          self.context,
+                          image_id)
+
+    def test_restore_image_status_not_pending_delete(self):
+        image_id = uuid.uuid4()
+        image = _db_fixture(image_id, name='restore_test', size=256,
+                            is_public=True, status='deleted')
+        self.db.image_create(self.context, image)
+        self.assertRaises(exception.Conflict,
+                          self.db.image_restore,
+                          self.context,
+                          image_id)
 
 
 class TestEncryptedLocations(test_utils.BaseTestCase):
@@ -485,7 +526,7 @@ class TestImageMemberRepo(test_utils.BaseTestCase):
             _db_fixture(UUID1, owner=TENANT1, name='1', size=256,
                         status='active'),
             _db_fixture(UUID2, owner=TENANT1, name='2',
-                        size=512, is_public=False),
+                        size=512, visibility='shared'),
         ]
         [self.db.image_create(None, image) for image in self.images]
 
@@ -711,7 +752,7 @@ class TestTaskRepo(test_utils.BaseTestCase):
         original_update_time = task.updated_at
         self.task_repo.save(task)
         current_update_time = task.updated_at
-        self.assertTrue(current_update_time > original_update_time)
+        self.assertGreater(current_update_time, original_update_time)
         task = self.task_repo.get(UUID1)
         self.assertEqual(current_update_time, task.updated_at)
 

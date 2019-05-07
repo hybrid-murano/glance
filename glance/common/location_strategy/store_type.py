@@ -21,16 +21,38 @@ import six.moves.urllib.parse as urlparse
 
 from glance.i18n import _
 
-
 store_type_opts = [
-    cfg.ListOpt("store_type_preference",
+    cfg.ListOpt('store_type_preference',
                 default=[],
-                help=_("The store names to use to get store preference order. "
-                       "The name must be registered by one of the stores "
-                       "defined by the 'stores' config option. "
-                       "This option will be applied when you using "
-                       "'store_type' option as image location strategy "
-                       "defined by the 'location_strategy' config option."))
+                help=_("""
+Preference order of storage backends.
+
+Provide a comma separated list of store names in the order in
+which images should be retrieved from storage backends.
+These store names must be registered with the ``stores``
+configuration option.
+
+NOTE: The ``store_type_preference`` configuration option is applied
+only if ``store_type`` is chosen as a value for the
+``location_strategy`` configuration option. An empty list will not
+change the location order.
+
+Possible values:
+    * Empty list
+    * Comma separated list of registered store names. Legal values are:
+        * file
+        * http
+        * rbd
+        * swift
+        * sheepdog
+        * cinder
+        * vmware
+
+Related options:
+    * location_strategy
+    * stores
+
+"""))
 ]
 
 CONF = cfg.CONF
@@ -54,14 +76,13 @@ def init():
     # possible to prevent make relationships with Glance(server)-specific code,
     # for example: using functions within store module to validate
     # 'store_type_preference' option.
-    mapping = {'filesystem': ['file', 'filesystem'],
+    mapping = {'file': ['file', 'filesystem'],
                'http': ['http', 'https'],
                'rbd': ['rbd'],
-               's3': ['s3', 's3+http', 's3+https'],
                'swift': ['swift', 'swift+https', 'swift+http'],
                'sheepdog': ['sheepdog'],
                'cinder': ['cinder'],
-               'vmware_datastore': ['vsphere']}
+               'vmware': ['vsphere']}
     _STORE_TO_SCHEME_MAP.clear()
     _STORE_TO_SCHEME_MAP.update(mapping)
 

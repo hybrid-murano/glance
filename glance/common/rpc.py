@@ -36,15 +36,30 @@ LOG = logging.getLogger(__name__)
 
 
 rpc_opts = [
-    # NOTE(flaper87): Shamelessly copied
-    # from oslo rpc.
     cfg.ListOpt('allowed_rpc_exception_modules',
                 default=['glance.common.exception',
                          'builtins',
                          'exceptions',
                          ],
-                help='Modules of exceptions that are permitted to be recreated'
-                     ' upon receiving exception data from an rpc call.'),
+                help=_("""
+List of allowed exception modules to handle RPC exceptions.
+
+Provide a comma separated list of modules whose exceptions are
+permitted to be recreated upon receiving exception data via an RPC
+call made to Glance. The default list includes
+``glance.common.exception``, ``builtins``, and ``exceptions``.
+
+The RPC protocol permits interaction with Glance via calls across a
+network or within the same system. Including a list of exception
+namespaces with this option enables RPC to propagate the exceptions
+back to the users.
+
+Possible values:
+    * A comma separated list of valid exception modules
+
+Related options:
+    * None
+""")),
 ]
 
 CONF = cfg.CONF
@@ -86,7 +101,7 @@ class Controller(object):
     This is the base controller for RPC based APIs. Commands
     handled by this controller respect the following form:
 
-    .. code-block:: json
+    ::
 
         [{
             'command': 'method_name',
@@ -119,7 +134,7 @@ class Controller(object):
 
         """
 
-        funcs = filter(lambda x: not x.startswith("_"), dir(resource))
+        funcs = [x for x in dir(resource) if not x.startswith("_")]
 
         if filtered:
             funcs = [f for f in funcs if f in filtered]
@@ -223,7 +238,7 @@ class RPCClient(client.BaseClient):
         :param commands: List of commands to send. Commands
             must respect the following form
 
-        .. code-block:: json
+        ::
 
             {
                 'command': 'method_name',

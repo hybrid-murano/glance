@@ -14,6 +14,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import collections
+import hashlib
 import os.path
 
 import mock
@@ -27,6 +29,12 @@ import glance.tests.unit.utils as unit_test_utils
 from glance.tests import utils as test_utils
 
 UUID1 = 'c80a1a6c-bd1f-41c5-90ee-81afedb1d58d'
+
+
+class IterableMock(mock.Mock, collections.Iterable):
+    def __iter__(self):
+        while False:
+            yield None
 
 
 class ImageRepoStub(object):
@@ -46,7 +54,8 @@ class ImageRepoStub(object):
 class ImageStub(object):
     def __init__(self, image_id=None, visibility='private',
                  container_format='bear', disk_format='raw',
-                 status='active', extra_properties=None):
+                 status='active', extra_properties=None,
+                 os_hidden=False):
 
         if extra_properties is None:
             extra_properties = {}
@@ -57,6 +66,21 @@ class ImageStub(object):
         self.disk_format = disk_format
         self.status = status
         self.extra_properties = extra_properties
+        self.checksum = 'c2e5db72bd7fd153f53ede5da5a06de3'
+        self.os_hash_algo = 'sha512'
+        self.os_hash_value = hashlib.sha512(b'glance').hexdigest()
+        self.created_at = '2013-09-28T15:27:36Z'
+        self.updated_at = '2013-09-28T15:27:37Z'
+        self.locations = []
+        self.min_disk = 0
+        self.min_ram = 0
+        self.name = 'image_name'
+        self.owner = 'tenant1'
+        self.protected = False
+        self.size = 0
+        self.virtual_size = 0
+        self.tags = []
+        self.os_hidden = os_hidden
 
     def delete(self):
         self.status = 'deleted'
@@ -66,8 +90,10 @@ class ImageFactoryStub(object):
     def new_image(self, image_id=None, name=None, visibility='private',
                   min_disk=0, min_ram=0, protected=False, owner=None,
                   disk_format=None, container_format=None,
-                  extra_properties=None, tags=None, **other_args):
+                  extra_properties=None, hidden=False, tags=None,
+                  **other_args):
         self.visibility = visibility
+        self.hidden = hidden
         return 'new_image'
 
 
@@ -162,6 +188,25 @@ class TestPolicyEnforcer(base.IsolatedUnitTest):
         context = glance.context.RequestContext(roles=[])
         self.assertEqual(False, enforcer.check(context, 'get_image', {}))
 
+    def test_policy_file_get_image_default_everybody(self):
+        rules = {"default": ''}
+        self.set_policy_rules(rules)
+
+        enforcer = glance.api.policy.Enforcer()
+
+        context = glance.context.RequestContext(roles=[])
+        self.assertEqual(True, enforcer.check(context, 'get_image', {}))
+
+    def test_policy_file_get_image_default_nobody(self):
+        rules = {"default": '!'}
+        self.set_policy_rules(rules)
+
+        enforcer = glance.api.policy.Enforcer()
+
+        context = glance.context.RequestContext(roles=[])
+        self.assertRaises(exception.Forbidden,
+                          enforcer.enforce, context, 'get_image', {})
+
 
 class TestPolicyEnforcerNoFile(base.IsolatedUnitTest):
     def test_policy_file_specified_but_not_found(self):
@@ -170,7 +215,6 @@ class TestPolicyEnforcerNoFile(base.IsolatedUnitTest):
         enforcer = glance.api.policy.Enforcer()
 
         context = glance.context.RequestContext(roles=[])
-        enforcer.enforce(context, 'get_image', {})
         self.assertRaises(exception.Forbidden,
                           enforcer.enforce, context, 'manage_image_cache', {})
 
@@ -188,7 +232,6 @@ class TestPolicyEnforcerNoFile(base.IsolatedUnitTest):
         enforcer = glance.api.policy.Enforcer()
 
         context = glance.context.RequestContext(roles=[])
-        enforcer.enforce(context, 'get_image', {})
         self.assertRaises(exception.Forbidden,
                           enforcer.enforce, context, 'manage_image_cache', {})
 
@@ -221,6 +264,22 @@ class TestImagePolicy(test_utils.BaseTestCase):
         self.policy.enforce.assert_called_once_with({}, "publicize_image",
                                                     image.target)
 
+    def test_communitize_image_not_allowed(self):
+        self.policy.enforce.side_effect = exception.Forbidden
+        image = glance.api.policy.ImageProxy(self.image_stub, {}, self.policy)
+        self.assertRaises(exception.Forbidden,
+                          setattr, image, 'visibility', 'community')
+        self.assertEqual('private', image.visibility)
+        self.policy.enforce.assert_called_once_with({}, "communitize_image",
+                                                    image.target)
+
+    def test_communitize_image_allowed(self):
+        image = glance.api.policy.ImageProxy(self.image_stub, {}, self.policy)
+        image.visibility = 'community'
+        self.assertEqual('community', image.visibility)
+        self.policy.enforce.assert_called_once_with({}, "communitize_image",
+                                                    image.target)
+
     def test_delete_image_not_allowed(self):
         self.policy.enforce.side_effect = exception.Forbidden
         image = glance.api.policy.ImageProxy(self.image_stub, {}, self.policy)
@@ -231,24 +290,24 @@ class TestImagePolicy(test_utils.BaseTestCase):
 
     def test_delete_image_allowed(self):
         image = glance.api.policy.ImageProxy(self.image_stub, {}, self.policy)
+        args = dict(image.target)
         image.delete()
         self.assertEqual('deleted', image.status)
-        self.policy.enforce.assert_called_once_with({}, "delete_image",
-                                                    image.target)
+        self.policy.enforce.assert_called_once_with({}, "delete_image", args)
 
     def test_get_image_not_allowed(self):
         self.policy.enforce.side_effect = exception.Forbidden
-        image_target = mock.Mock()
+        image_target = IterableMock()
         with mock.patch.object(glance.api.policy, 'ImageTarget') as target:
             target.return_value = image_target
             image_repo = glance.api.policy.ImageRepoProxy(self.image_repo_stub,
                                                           {}, self.policy)
             self.assertRaises(exception.Forbidden, image_repo.get, UUID1)
         self.policy.enforce.assert_called_once_with({}, "get_image",
-                                                    image_target)
+                                                    dict(image_target))
 
     def test_get_image_allowed(self):
-        image_target = mock.Mock()
+        image_target = IterableMock()
         with mock.patch.object(glance.api.policy, 'ImageTarget') as target:
             target.return_value = image_target
             image_repo = glance.api.policy.ImageRepoProxy(self.image_repo_stub,
@@ -257,7 +316,7 @@ class TestImagePolicy(test_utils.BaseTestCase):
         self.assertIsInstance(output, glance.api.policy.ImageProxy)
         self.assertEqual('image_from_get', output.image)
         self.policy.enforce.assert_called_once_with({}, "get_image",
-                                                    image_target)
+                                                    dict(image_target))
 
     def test_get_images_not_allowed(self):
         self.policy.enforce.side_effect = exception.Forbidden
@@ -309,7 +368,7 @@ class TestImagePolicy(test_utils.BaseTestCase):
         self.policy.enforce.assert_called_once_with({}, "add_image",
                                                     image.target)
 
-    def test_new_image_visibility(self):
+    def test_new_image_visibility_public_not_allowed(self):
         self.policy.enforce.side_effect = exception.Forbidden
         image_factory = glance.api.policy.ImageFactoryProxy(
             self.image_factory_stub, {}, self.policy)
@@ -322,6 +381,24 @@ class TestImagePolicy(test_utils.BaseTestCase):
             self.image_factory_stub, {}, self.policy)
         image_factory.new_image(visibility='public')
         self.policy.enforce.assert_called_once_with({}, "publicize_image", {})
+
+    def test_new_image_visibility_community_not_allowed(self):
+        self.policy.enforce.side_effect = exception.Forbidden
+        image_factory = glance.api.policy.ImageFactoryProxy(
+            self.image_factory_stub, {}, self.policy)
+        self.assertRaises(exception.Forbidden, image_factory.new_image,
+                          visibility='community')
+        self.policy.enforce.assert_called_once_with({},
+                                                    "communitize_image",
+                                                    {})
+
+    def test_new_image_visibility_community_allowed(self):
+        image_factory = glance.api.policy.ImageFactoryProxy(
+            self.image_factory_stub, {}, self.policy)
+        image_factory.new_image(visibility='community')
+        self.policy.enforce.assert_called_once_with({},
+                                                    "communitize_image",
+                                                    {})
 
     def test_image_get_data_policy_enforced_with_target(self):
         extra_properties = {
@@ -336,13 +413,6 @@ class TestImagePolicy(test_utils.BaseTestCase):
         self.assertRaises(exception.Forbidden, image.get_data)
         self.policy.enforce.assert_called_once_with({}, "download_image",
                                                     target)
-
-    def test_image_set_data(self):
-        self.policy.enforce.side_effect = exception.Forbidden
-        image = glance.api.policy.ImageProxy(self.image_stub, {}, self.policy)
-        self.assertRaises(exception.Forbidden, image.set_data)
-        self.policy.enforce.assert_called_once_with({}, "upload_image",
-                                                    image.target)
 
 
 class TestMemberPolicy(test_utils.BaseTestCase):

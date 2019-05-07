@@ -5,5 +5,10 @@
 .. toctree::
    :maxdepth: 1
 
-   liberty
    unreleased
+   queens
+   pike
+   ocata
+   newton
+   mitaka
+   liberty

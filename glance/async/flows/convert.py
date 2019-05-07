@@ -13,11 +13,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import logging
 import os
 
 from oslo_concurrency import processutils as putils
 from oslo_config import cfg
+from oslo_log import log as logging
 from taskflow.patterns import linear_flow as lf
 from taskflow import task
 
@@ -26,11 +26,44 @@ from glance.i18n import _, _LW
 LOG = logging.getLogger(__name__)
 
 convert_task_opts = [
+    # NOTE: This configuration option requires the operator to explicitly set
+    # an image conversion format. There being no sane default due to the
+    # dependency on the environment in which OpenStack is running, we do not
+    # mark this configuration option as "required". Rather a warning message
+    # is given to the operator, prompting for an image conversion format to
+    # be set.
     cfg.StrOpt('conversion_format',
+               sample_default='raw',
                choices=('qcow2', 'raw', 'vmdk'),
-               help=_("The format to which images will be automatically "
-                      "converted. When using the RBD backend, this should be "
-                      "set to 'raw'")),
+               help=_("""
+Set the desired image conversion format.
+
+Provide a valid image format to which you want images to be
+converted before they are stored for consumption by Glance.
+Appropriate image format conversions are desirable for specific
+storage backends in order to facilitate efficient handling of
+bandwidth and usage of the storage infrastructure.
+
+By default, ``conversion_format`` is not set and must be set
+explicitly in the configuration file.
+
+The allowed values for this option are ``raw``, ``qcow2`` and
+``vmdk``. The  ``raw`` format is the unstructured disk format and
+should be chosen when RBD or Ceph storage backends are used for
+image storage. ``qcow2`` is supported by the QEMU emulator that
+expands dynamically and supports Copy on Write. The ``vmdk`` is
+another common disk format supported by many common virtual machine
+monitors like VMWare Workstation.
+
+Possible values:
+    * qcow2
+    * raw
+    * vmdk
+
+Related options:
+    * disk_formats
+
+""")),
 ]
 
 CONF = cfg.CONF
@@ -61,20 +94,30 @@ class _Convert(task.Task):
         conversion_format = CONF.taskflow_executor.conversion_format
         if conversion_format is None:
             if not _Convert.conversion_missing_warned:
-                msg = (_LW('The conversion format is None, please add a value '
-                           'for it in the config file for this task to '
-                           'work: %s') %
-                       self.task_id)
-                LOG.warn(msg)
+                msg = _LW('The conversion format is None, please add a value '
+                          'for it in the config file for this task to '
+                          'work: %s')
+                LOG.warn(msg, self.task_id)
                 _Convert.conversion_missing_warned = True
             return
+
+        image_obj = self.image_repo.get(image_id)
+        src_format = image_obj.disk_format
 
         # TODO(flaper87): Check whether the image is in the desired
         # format already. Probably using `qemu-img` just like the
         # `Introspection` task.
+
+        # NOTE(hemanthm): We add '-f' parameter to the convert command here so
+        # that the image format need not be inferred by qemu utils. This
+        # shields us from being vulnerable to an attack vector described here
+        # https://bugs.launchpad.net/glance/+bug/1449062
+
         dest_path = os.path.join(CONF.task.work_dir, "%s.converted" % image_id)
-        stdout, stderr = putils.trycmd('qemu-img', 'convert', '-O',
-                                       conversion_format, file_path, dest_path,
+        stdout, stderr = putils.trycmd('qemu-img', 'convert',
+                                       '-f', src_format,
+                                       '-O', conversion_format,
+                                       file_path, dest_path,
                                        log_errors=putils.LOG_ALL_ERRORS)
 
         if stderr:

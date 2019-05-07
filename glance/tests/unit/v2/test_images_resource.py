@@ -14,13 +14,15 @@
 #    under the License.
 
 import datetime
+import eventlet
+import hashlib
 import uuid
 
 import glance_store as store
 import mock
-from oslo_config import cfg
 from oslo_serialization import jsonutils
 import six
+from six.moves import http_client as http
 # NOTE(jokke): simplified transition to py3, behaves like py2 xrange
 from six.moves import range
 import testtools
@@ -39,8 +41,6 @@ DATETIME = datetime.datetime(2012, 5, 16, 15, 27, 36, 325355)
 ISOTIME = '2012-05-16T15:27:36Z'
 
 
-CONF = cfg.CONF
-
 BASE_URI = unit_test_utils.BASE_URI
 
 
@@ -57,14 +57,20 @@ TENANT4 = 'c6c87f25-8a94-47ed-8c83-053c25f42df4'
 CHKSUM = '93264c3edf5972c9f1cb309543d38a5c'
 CHKSUM1 = '43254c3edf6972c9f1cb309543d38a8c'
 
+FAKEHASHALGO = 'fake-name-for-sha512'
+MULTIHASH1 = hashlib.sha512(b'glance').hexdigest()
+MULTIHASH2 = hashlib.sha512(b'image_service').hexdigest()
+
 
 def _db_fixture(id, **kwargs):
     obj = {
         'id': id,
         'name': None,
-        'is_public': False,
+        'visibility': 'shared',
         'properties': {},
         'checksum': None,
+        'os_hash_algo': FAKEHASHALGO,
+        'os_hash_value': None,
         'owner': None,
         'status': 'queued',
         'tags': [],
@@ -88,6 +94,8 @@ def _domain_fixture(id, **kwargs):
         'name': None,
         'visibility': 'private',
         'checksum': None,
+        'os_hash_algo': None,
+        'os_hash_value': None,
         'owner': None,
         'status': 'queued',
         'size': None,
@@ -111,6 +119,15 @@ def _db_image_member_fixture(image_id, member_id, **kwargs):
     }
     obj.update(kwargs)
     return obj
+
+
+class FakeImage(object):
+    def __init__(self, status='active', container_format='ami',
+                 disk_format='ami'):
+        self.id = UUID4
+        self.status = status
+        self.container_format = container_format
+        self.disk_format = disk_format
 
 
 class TestImagesController(base.IsolatedUnitTest):
@@ -141,16 +158,18 @@ class TestImagesController(base.IsolatedUnitTest):
     def _create_images(self):
         self.images = [
             _db_fixture(UUID1, owner=TENANT1, checksum=CHKSUM,
+                        os_hash_algo=FAKEHASHALGO, os_hash_value=MULTIHASH1,
                         name='1', size=256, virtual_size=1024,
-                        is_public=True,
+                        visibility='public',
                         locations=[{'url': '%s/%s' % (BASE_URI, UUID1),
                                     'metadata': {}, 'status': 'active'}],
                         disk_format='raw',
                         container_format='bare',
                         status='active'),
             _db_fixture(UUID2, owner=TENANT1, checksum=CHKSUM1,
+                        os_hash_algo=FAKEHASHALGO, os_hash_value=MULTIHASH2,
                         name='2', size=512, virtual_size=2048,
-                        is_public=True,
+                        visibility='public',
                         disk_format='raw',
                         container_format='bare',
                         status='active',
@@ -158,8 +177,9 @@ class TestImagesController(base.IsolatedUnitTest):
                         properties={'hypervisor_type': 'kvm', 'foo': 'bar',
                                     'bar': 'foo'}),
             _db_fixture(UUID3, owner=TENANT3, checksum=CHKSUM1,
+                        os_hash_algo=FAKEHASHALGO, os_hash_value=MULTIHASH2,
                         name='3', size=512, virtual_size=2048,
-                        is_public=True, tags=['windows', '64bit', 'x86']),
+                        visibility='public', tags=['windows', '64bit', 'x86']),
             _db_fixture(UUID4, owner=TENANT4, name='4',
                         size=1024, virtual_size=3072),
         ]
@@ -256,6 +276,12 @@ class TestImagesController(base.IsolatedUnitTest):
         expected = set([UUID1])
         self.assertEqual(expected, actual)
 
+    def test_index_with_invalid_hidden_filter(self):
+        request = unit_test_utils.get_fake_request('/images?os_hidden=abcd')
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.controller.index, request,
+                          filters={'os_hidden': 'abcd'})
+
     def test_index_with_checksum_filter_single_image(self):
         req = unit_test_utils.get_fake_request('/images?checksum=%s' % CHKSUM)
         output = self.controller.index(req, filters={'checksum': CHKSUM})
@@ -275,6 +301,34 @@ class TestImagesController(base.IsolatedUnitTest):
     def test_index_with_non_existent_checksum(self):
         req = unit_test_utils.get_fake_request('/images?checksum=236231827')
         output = self.controller.index(req, filters={'checksum': '236231827'})
+        self.assertEqual(0, len(output['images']))
+
+    def test_index_with_os_hash_value_filter_single_image(self):
+        req = unit_test_utils.get_fake_request(
+            '/images?os_hash_value=%s' % MULTIHASH1)
+        output = self.controller.index(req,
+                                       filters={'os_hash_value': MULTIHASH1})
+        self.assertEqual(1, len(output['images']))
+        actual = list([image.image_id for image in output['images']])
+        expected = [UUID1]
+        self.assertEqual(expected, actual)
+
+    def test_index_with_os_hash_value_filter_multiple_images(self):
+        req = unit_test_utils.get_fake_request(
+            '/images?os_hash_value=%s' % MULTIHASH2)
+        output = self.controller.index(req,
+                                       filters={'os_hash_value': MULTIHASH2})
+        self.assertEqual(2, len(output['images']))
+        actual = list([image.image_id for image in output['images']])
+        expected = [UUID3, UUID2]
+        self.assertEqual(expected, actual)
+
+    def test_index_with_non_existent_os_hash_value(self):
+        fake_hash_value = hashlib.sha512(b'not_used_in_fixtures').hexdigest()
+        req = unit_test_utils.get_fake_request(
+            '/images?os_hash_value=%s' % fake_hash_value)
+        output = self.controller.index(req,
+                                       filters={'checksum': fake_hash_value})
         self.assertEqual(0, len(output['images']))
 
     def test_index_size_max_filter(self):
@@ -358,15 +412,29 @@ class TestImagesController(base.IsolatedUnitTest):
         self.assertEqual(0, len(images))
 
     def test_index_with_non_default_is_public_filter(self):
-        image = _db_fixture(str(uuid.uuid4()),
-                            is_public=False,
-                            owner=TENANT3)
-        self.db.image_create(None, image)
+        private_uuid = str(uuid.uuid4())
+        new_image = _db_fixture(private_uuid,
+                                visibility='private',
+                                owner=TENANT3)
+        self.db.image_create(None, new_image)
+
         path = '/images?visibility=private'
         request = unit_test_utils.get_fake_request(path, is_admin=True)
         output = self.controller.index(request,
                                        filters={'visibility': 'private'})
-        self.assertEqual(2, len(output['images']))
+        self.assertEqual(1, len(output['images']))
+        actual = set([image.image_id for image in output['images']])
+        expected = set([private_uuid])
+        self.assertEqual(expected, actual)
+
+        path = '/images?visibility=shared'
+        request = unit_test_utils.get_fake_request(path, is_admin=True)
+        output = self.controller.index(request,
+                                       filters={'visibility': 'shared'})
+        self.assertEqual(1, len(output['images']))
+        actual = set([image.image_id for image in output['images']])
+        expected = set([UUID4])
+        self.assertEqual(expected, actual)
 
     def test_index_with_many_filters(self):
         url = '/images?status=queued&name=3'
@@ -587,6 +655,81 @@ class TestImagesController(base.IsolatedUnitTest):
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.controller.show, request, UUID4)
 
+    def test_image_import_raises_conflict_if_container_format_is_none(self):
+        request = unit_test_utils.get_fake_request()
+
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(container_format=None)
+            self.assertRaises(webob.exc.HTTPConflict,
+                              self.controller.import_image, request, UUID4,
+                              {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_raises_conflict_if_disk_format_is_none(self):
+        request = unit_test_utils.get_fake_request()
+
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(disk_format=None)
+            self.assertRaises(webob.exc.HTTPConflict,
+                              self.controller.import_image, request, UUID4,
+                              {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_raises_conflict(self):
+        request = unit_test_utils.get_fake_request()
+
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(status='queued')
+            self.assertRaises(webob.exc.HTTPConflict,
+                              self.controller.import_image, request, UUID4,
+                              {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_raises_conflict_for_web_download(self):
+        request = unit_test_utils.get_fake_request()
+
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage()
+            self.assertRaises(webob.exc.HTTPConflict,
+                              self.controller.import_image, request, UUID4,
+                              {'method': {'name': 'web-download'}})
+
+    def test_image_import_raises_conflict_for_invalid_status_change(self):
+        request = unit_test_utils.get_fake_request()
+
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage()
+            self.assertRaises(webob.exc.HTTPConflict,
+                              self.controller.import_image, request, UUID4,
+                              {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_raises_bad_request(self):
+        request = unit_test_utils.get_fake_request()
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(status='uploading')
+            # NOTE(abhishekk): Due to
+            # https://bugs.launchpad.net/glance/+bug/1712463 taskflow is not
+            # executing. Once it is fixed instead of mocking spawn_n method
+            # we should mock execute method of _ImportToStore task.
+            with mock.patch.object(eventlet.GreenPool, 'spawn_n',
+                                   side_effect=ValueError):
+                self.assertRaises(webob.exc.HTTPBadRequest,
+                                  self.controller.import_image, request, UUID4,
+                                  {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_invalid_uri_filtering(self):
+        request = unit_test_utils.get_fake_request()
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(status='queued')
+            self.assertRaises(webob.exc.HTTPBadRequest,
+                              self.controller.import_image, request, UUID4,
+                              {'method': {'name': 'web-download',
+                                          'uri': 'fake_uri'}})
+
     def test_create(self):
         request = unit_test_utils.get_fake_request()
         image = {'name': 'image-1'}
@@ -596,7 +739,7 @@ class TestImagesController(base.IsolatedUnitTest):
         self.assertEqual('image-1', output.name)
         self.assertEqual({}, output.extra_properties)
         self.assertEqual(set([]), output.tags)
-        self.assertEqual('private', output.visibility)
+        self.assertEqual('shared', output.visibility)
         output_logs = self.notifier.get_logs()
         self.assertEqual(1, len(output_logs))
         output_log = output_logs[0]
@@ -614,7 +757,7 @@ class TestImagesController(base.IsolatedUnitTest):
         self.assertEqual('image-1', output.name)
         self.assertEqual({}, output.extra_properties)
         self.assertEqual(set([]), output.tags)
-        self.assertEqual('private', output.visibility)
+        self.assertEqual('shared', output.visibility)
         output_logs = self.notifier.get_logs()
         self.assertEqual(0, len(output_logs))
 
@@ -628,7 +771,7 @@ class TestImagesController(base.IsolatedUnitTest):
         self.assertEqual('image-1', output.name)
         self.assertEqual(image_properties, output.extra_properties)
         self.assertEqual(set([]), output.tags)
-        self.assertEqual('private', output.visibility)
+        self.assertEqual('shared', output.visibility)
         output_logs = self.notifier.get_logs()
         self.assertEqual(1, len(output_logs))
         output_log = output_logs[0]
@@ -786,6 +929,12 @@ class TestImagesController(base.IsolatedUnitTest):
         output_logs = self.notifier.get_logs()
         # NOTE(markwash): don't send a notification if nothing is updated
         self.assertEqual(0, len(output_logs))
+
+    def test_update_queued_image_with_hidden(self):
+        request = unit_test_utils.get_fake_request()
+        changes = [{'op': 'replace', 'path': ['os_hidden'], 'value': 'true'}]
+        self.assertRaises(webob.exc.HTTPForbidden, self.controller.update,
+                          request, UUID3, changes=changes)
 
     def test_update_with_bad_min_disk(self):
         request = unit_test_utils.get_fake_request()
@@ -1571,6 +1720,118 @@ class TestImagesController(base.IsolatedUnitTest):
         self.assertEqual(2, len(output.locations))
         self.assertEqual(new_location, output.locations[1])
 
+    def test_replace_location_possible_on_queued(self):
+        self.skipTest('This test is intermittently failing at the gate. '
+                      'See bug #1649300')
+        self.config(show_multiple_locations=True)
+        self.images = [
+            _db_fixture('1', owner=TENANT1, checksum=CHKSUM,
+                        name='1',
+                        is_public=True,
+                        disk_format='raw',
+                        container_format='bare',
+                        status='queued'),
+        ]
+        self.db.image_create(None, self.images[0])
+        request = unit_test_utils.get_fake_request()
+        new_location = {'url': '%s/fake_location_1' % BASE_URI, 'metadata': {}}
+        changes = [{'op': 'replace', 'path': ['locations'],
+                    'value': [new_location]}]
+        output = self.controller.update(request, '1', changes)
+        self.assertEqual('1', output.image_id)
+        self.assertEqual(1, len(output.locations))
+        self.assertEqual(new_location, output.locations[0])
+
+    def test_add_location_possible_on_queued(self):
+        self.skipTest('This test is intermittently failing at the gate. '
+                      'See bug #1649300')
+        self.config(show_multiple_locations=True)
+        self.images = [
+            _db_fixture('1', owner=TENANT1, checksum=CHKSUM,
+                        name='1',
+                        is_public=True,
+                        disk_format='raw',
+                        container_format='bare',
+                        status='queued'),
+        ]
+        self.db.image_create(None, self.images[0])
+        request = unit_test_utils.get_fake_request()
+        new_location = {'url': '%s/fake_location_1' % BASE_URI, 'metadata': {}}
+        changes = [{'op': 'add', 'path': ['locations', '-'],
+                    'value': new_location}]
+        output = self.controller.update(request, '1', changes)
+        self.assertEqual('1', output.image_id)
+        self.assertEqual(1, len(output.locations))
+        self.assertEqual(new_location, output.locations[0])
+
+    def _test_update_locations_status(self, image_status, update):
+        self.config(show_multiple_locations=True)
+        self.images = [
+            _db_fixture('1', owner=TENANT1, checksum=CHKSUM,
+                        name='1',
+                        disk_format='raw',
+                        container_format='bare',
+                        status=image_status),
+        ]
+        request = unit_test_utils.get_fake_request()
+        if image_status == 'deactivated':
+            self.db.image_create(request.context, self.images[0])
+        else:
+            self.db.image_create(None, self.images[0])
+        new_location = {'url': '%s/fake_location' % BASE_URI, 'metadata': {}}
+        changes = [{'op': update, 'path': ['locations', '-'],
+                    'value': new_location}]
+        self.assertRaises(webob.exc.HTTPConflict,
+                          self.controller.update, request, '1', changes)
+
+    def test_location_add_not_permitted_status_saving(self):
+        self._test_update_locations_status('saving', 'add')
+
+    def test_location_add_not_permitted_status_deactivated(self):
+        self._test_update_locations_status('deactivated', 'add')
+
+    def test_location_add_not_permitted_status_deleted(self):
+        self._test_update_locations_status('deleted', 'add')
+
+    def test_location_add_not_permitted_status_pending_delete(self):
+        self._test_update_locations_status('pending_delete', 'add')
+
+    def test_location_add_not_permitted_status_killed(self):
+        self._test_update_locations_status('killed', 'add')
+
+    def test_location_remove_not_permitted_status_saving(self):
+        self._test_update_locations_status('saving', 'remove')
+
+    def test_location_remove_not_permitted_status_deactivated(self):
+        self._test_update_locations_status('deactivated', 'remove')
+
+    def test_location_remove_not_permitted_status_deleted(self):
+        self._test_update_locations_status('deleted', 'remove')
+
+    def test_location_remove_not_permitted_status_pending_delete(self):
+        self._test_update_locations_status('pending_delete', 'remove')
+
+    def test_location_remove_not_permitted_status_killed(self):
+        self._test_update_locations_status('killed', 'remove')
+
+    def test_location_remove_not_permitted_status_queued(self):
+        self._test_update_locations_status('queued', 'remove')
+
+    def test_location_replace_not_permitted_status_saving(self):
+        self._test_update_locations_status('saving', 'replace')
+
+    def test_location_replace_not_permitted_status_deactivated(self):
+        self._test_update_locations_status('deactivated', 'replace')
+
+    def test_location_replace_not_permitted_status_deleted(self):
+        self._test_update_locations_status('deleted', 'replace')
+
+    def test_location_replace_not_permitted_status_pending_delete(self):
+        self._test_update_locations_status('pending_delete', 'replace')
+
+    def test_location_replace_not_permitted_status_killed(self):
+        self._test_update_locations_status('killed', 'replace')
+
     def test_update_add_locations_insertion(self):
         self.config(show_multiple_locations=True)
         new_location = {'url': '%s/fake_location' % BASE_URI, 'metadata': {}}
@@ -1909,6 +2170,32 @@ class TestImagesController(base.IsolatedUnitTest):
         self.assertEqual('deleted', deleted_img['status'])
         self.assertNotIn('%s/%s' % (BASE_URI, UUID1), self.store.data)
 
+    def test_delete_with_tags(self):
+        request = unit_test_utils.get_fake_request()
+        changes = [
+            {'op': 'replace', 'path': ['tags'],
+             'value': ['many', 'cool', 'new', 'tags']},
+        ]
+        self.controller.update(request, UUID1, changes)
+        self.assertIn('%s/%s' % (BASE_URI, UUID1), self.store.data)
+        self.controller.delete(request, UUID1)
+        output_logs = self.notifier.get_logs()
+
+        # Get `delete` event from logs
+        output_delete_logs = [output_log for output_log in output_logs
+                              if output_log['event_type'] == 'image.delete']
+
+        self.assertEqual(1, len(output_delete_logs))
+        output_log = output_delete_logs[0]
+
+        self.assertEqual('INFO', output_log['notification_type'])
+
+        deleted_img = self.db.image_get(request.context, UUID1,
+                                        force_show_deleted=True)
+        self.assertTrue(deleted_img['deleted'])
+        self.assertEqual('deleted', deleted_img['status'])
+        self.assertNotIn('%s/%s' % (BASE_URI, UUID1), self.store.data)
+
     def test_delete_disabled_notification(self):
         self.config(disabled_notifications=["image.delete"])
         request = unit_test_utils.get_fake_request()
@@ -2025,6 +2312,23 @@ class TestImagesController(base.IsolatedUnitTest):
         self.assertRaises(webob.exc.HTTPBadRequest, self.controller.delete,
                           request, UUID1)
 
+    def test_delete_uploading_status_image(self):
+        """Ensure status of uploading image is updated (LP bug #1733289)"""
+        request = unit_test_utils.get_fake_request(is_admin=True)
+        image = self.db.image_create(request.context, {'status': 'uploading'})
+        image_id = image['id']
+        with mock.patch.object(self.store,
+                               'delete_from_backend') as mock_store:
+            self.controller.delete(request, image_id)
+
+        # Ensure delete_from_backend is called
+        self.assertEqual(1, mock_store.call_count)
+
+        image = self.db.image_get(request.context, image_id,
+                                  force_show_deleted=True)
+        self.assertTrue(image['deleted'])
+        self.assertEqual('deleted', image['status'])
+
     def test_index_with_invalid_marker(self):
         fake_uuid = str(uuid.uuid4())
         request = unit_test_utils.get_fake_request()
@@ -2036,6 +2340,29 @@ class TestImagesController(base.IsolatedUnitTest):
         self.assertIsNone(pos)
         pos = self.controller._get_locations_op_pos('1', None, True)
         self.assertIsNone(pos)
+
+    def test_image_import(self):
+        request = unit_test_utils.get_fake_request()
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(status='uploading')
+            output = self.controller.import_image(
+                request, UUID4, {'method': {'name': 'glance-direct'}})
+
+        self.assertEqual(UUID4, output)
+
+    def test_image_import_not_allowed(self):
+        request = unit_test_utils.get_fake_request()
+        # NOTE(abhishekk): For coverage purpose setting tenant to
+        # None. It is not expected to do in normal scenarios.
+        request.context.tenant = None
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(status='uploading')
+            self.assertRaises(webob.exc.HTTPForbidden,
+                              self.controller.import_image,
+                              request, UUID4, {'method': {'name':
+                                                          'glance-direct'}})
 
 
 class TestImagesControllerPolicies(base.IsolatedUnitTest):
@@ -2083,6 +2410,16 @@ class TestImagesControllerPolicies(base.IsolatedUnitTest):
         self.assertRaises(webob.exc.HTTPForbidden, self.controller.create,
                           request, image, extra_properties, tags)
 
+    def test_create_community_image_unauthorized(self):
+        rules = {"communitize_image": False}
+        self.policy.set_rules(rules)
+        request = unit_test_utils.get_fake_request()
+        image = {'name': 'image-c1', 'visibility': 'community'}
+        extra_properties = {}
+        tags = []
+        self.assertRaises(webob.exc.HTTPForbidden, self.controller.create,
+                          request, image, extra_properties, tags)
+
     def test_update_unauthorized(self):
         rules = {"modify_image": False}
         self.policy.set_rules(rules)
@@ -2100,8 +2437,26 @@ class TestImagesControllerPolicies(base.IsolatedUnitTest):
         self.assertRaises(webob.exc.HTTPForbidden, self.controller.update,
                           request, UUID1, changes)
 
+    def test_update_communitize_image_unauthorized(self):
+        rules = {"communitize_image": False}
+        self.policy.set_rules(rules)
+        request = unit_test_utils.get_fake_request()
+        changes = [{'op': 'replace', 'path': ['visibility'],
+                    'value': 'community'}]
+        self.assertRaises(webob.exc.HTTPForbidden, self.controller.update,
+                          request, UUID1, changes)
+
     def test_update_depublicize_image_unauthorized(self):
         rules = {"publicize_image": False}
+        self.policy.set_rules(rules)
+        request = unit_test_utils.get_fake_request()
+        changes = [{'op': 'replace', 'path': ['visibility'],
+                    'value': 'private'}]
+        output = self.controller.update(request, UUID1, changes)
+        self.assertEqual('private', output.visibility)
+
+    def test_update_decommunitize_image_unauthorized(self):
+        rules = {"communitize_image": False}
         self.policy.set_rules(rules)
         request = unit_test_utils.get_fake_request()
         changes = [{'op': 'replace', 'path': ['visibility'],
@@ -2209,6 +2564,23 @@ class TestImagesDeserializer(test_utils.BaseTestCase):
                     'extra_properties': {'foo': 'bar'},
                     'tags': ['one', 'two']}
         self.assertEqual(expected, output)
+
+    def test_create_invalid_property_key(self):
+        request = unit_test_utils.get_fake_request()
+        request.body = jsonutils.dump_as_bytes({
+            'id': UUID3,
+            'name': 'image-1',
+            'visibility': 'public',
+            'tags': ['one', 'two'],
+            'container_format': 'ami',
+            'disk_format': 'ami',
+            'min_ram': 128,
+            'min_disk': 10,
+            'f' * 256: 'bar',
+            'protected': True,
+        })
+        self.assertRaises(webob.exc.HTTPBadRequest, self.deserializer.create,
+                          request)
 
     def test_create_readonly_attributes_forbidden(self):
         bodies = [
@@ -2444,6 +2816,8 @@ class TestImagesDeserializer(test_utils.BaseTestCase):
             'id': '00000000-0000-0000-0000-000000000000',
             'status': 'active',
             'checksum': 'abcdefghijklmnopqrstuvwxyz012345',
+            'os_hash_algo': 'supersecure',
+            'os_hash_value': 'a' * 32 + 'b' * 32 + 'c' * 32 + 'd' * 32,
             'size': 9001,
             'virtual_size': 9001,
             'created_at': ISOTIME,
@@ -2888,6 +3262,68 @@ class TestImagesDeserializer(test_utils.BaseTestCase):
         self.assertEqual(sorted(['x86', '64bit']),
                          sorted(output['filters']['tags']))
 
+    def test_image_import(self):
+        # Bug 1754634: make sure that what's considered valid
+        # is determined by the config option
+        self.config(enabled_import_methods=['party-time'])
+        request = unit_test_utils.get_fake_request()
+        import_body = {
+            "method": {
+                "name": "party-time"
+            }
+        }
+        request.body = jsonutils.dump_as_bytes(import_body)
+        output = self.deserializer.import_image(request)
+        expected = {"body": import_body}
+        self.assertEqual(expected, output)
+
+    def test_import_image_invalid_body(self):
+        request = unit_test_utils.get_fake_request()
+        import_body = {
+            "method1": {
+                "name": "glance-direct"
+            }
+        }
+        request.body = jsonutils.dump_as_bytes(import_body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.deserializer.import_image,
+                          request)
+
+    def test_import_image_invalid_input(self):
+        request = unit_test_utils.get_fake_request()
+        import_body = {
+            "method": {
+                "abcd": "glance-direct"
+            }
+        }
+        request.body = jsonutils.dump_as_bytes(import_body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.deserializer.import_image,
+                          request)
+
+    def _get_request_for_method(self, method_name):
+        request = unit_test_utils.get_fake_request()
+        import_body = {
+            "method": {
+                "name": method_name
+            }
+        }
+        request.body = jsonutils.dump_as_bytes(import_body)
+        return request
+
+    KNOWN_IMPORT_METHODS = ['glance-direct', 'web-download']
+
+    def test_import_image_invalid_import_method(self):
+        # Bug 1754634: make sure that what's considered valid
+        # is determined by the config option.  So put known bad
+        # name in config, and known good name in request
+        self.config(enabled_import_methods=['bad-method-name'])
+        for m in self.KNOWN_IMPORT_METHODS:
+            request = self._get_request_for_method(m)
+            self.assertRaises(webob.exc.HTTPBadRequest,
+                              self.deserializer.import_image,
+                              request)
+
 
 class TestImagesDeserializerWithExtendedSchema(test_utils.BaseTestCase):
 
@@ -3041,7 +3477,9 @@ class TestImagesSerializer(test_utils.BaseTestCase):
                             visibility='public', container_format='ami',
                             tags=['one', 'two'], disk_format='ami',
                             min_ram=128, min_disk=10,
-                            checksum='ca425b88f047ce8ec45ee90e813ada91'),
+                            checksum='ca425b88f047ce8ec45ee90e813ada91',
+                            os_hash_algo=FAKEHASHALGO,
+                            os_hash_value=MULTIHASH1),
 
             # NOTE(bcwaldon): This second fixture depends on default behavior
             # and sets most values to None
@@ -3057,10 +3495,13 @@ class TestImagesSerializer(test_utils.BaseTestCase):
                     'status': 'queued',
                     'visibility': 'public',
                     'protected': False,
+                    'os_hidden': False,
                     'tags': set(['one', 'two']),
                     'size': 1024,
                     'virtual_size': 3072,
                     'checksum': 'ca425b88f047ce8ec45ee90e813ada91',
+                    'os_hash_algo': FAKEHASHALGO,
+                    'os_hash_value': MULTIHASH1,
                     'container_format': 'ami',
                     'disk_format': 'ami',
                     'min_ram': 128,
@@ -3077,6 +3518,7 @@ class TestImagesSerializer(test_utils.BaseTestCase):
                     'status': 'queued',
                     'visibility': 'private',
                     'protected': False,
+                    'os_hidden': False,
                     'tags': set([]),
                     'created_at': ISOTIME,
                     'updated_at': ISOTIME,
@@ -3089,6 +3531,8 @@ class TestImagesSerializer(test_utils.BaseTestCase):
                     'min_ram': None,
                     'min_disk': None,
                     'checksum': None,
+                    'os_hash_algo': None,
+                    'os_hash_value': None,
                     'disk_format': None,
                     'virtual_size': None,
                     'container_format': None,
@@ -3149,12 +3593,12 @@ class TestImagesSerializer(test_utils.BaseTestCase):
         request = webob.Request.blank(url)
         response = webob.Response(request=request)
         result = {'images': self.fixtures}
-        self.assertEqual(200, response.status_int)
+        self.assertEqual(http.OK, response.status_int)
 
         # The image index should work though the user is forbidden
         result['images'][0].locations = ImageLocations()
         self.serializer.index(response, result)
-        self.assertEqual(200, response.status_int)
+        self.assertEqual(http.OK, response.status_int)
 
     def test_show_full_fixture(self):
         expected = {
@@ -3163,10 +3607,13 @@ class TestImagesSerializer(test_utils.BaseTestCase):
             'status': 'queued',
             'visibility': 'public',
             'protected': False,
+            'os_hidden': False,
             'tags': set(['one', 'two']),
             'size': 1024,
             'virtual_size': 3072,
             'checksum': 'ca425b88f047ce8ec45ee90e813ada91',
+            'os_hash_algo': FAKEHASHALGO,
+            'os_hash_value': MULTIHASH1,
             'container_format': 'ami',
             'disk_format': 'ami',
             'min_ram': 128,
@@ -3191,6 +3638,7 @@ class TestImagesSerializer(test_utils.BaseTestCase):
             'status': 'queued',
             'visibility': 'private',
             'protected': False,
+            'os_hidden': False,
             'tags': [],
             'created_at': ISOTIME,
             'updated_at': ISOTIME,
@@ -3203,6 +3651,8 @@ class TestImagesSerializer(test_utils.BaseTestCase):
             'min_ram': None,
             'min_disk': None,
             'checksum': None,
+            'os_hash_algo': None,
+            'os_hash_value': None,
             'disk_format': None,
             'virtual_size': None,
             'container_format': None,
@@ -3218,10 +3668,13 @@ class TestImagesSerializer(test_utils.BaseTestCase):
             'status': 'queued',
             'visibility': 'public',
             'protected': False,
+            'os_hidden': False,
             'tags': ['one', 'two'],
             'size': 1024,
             'virtual_size': 3072,
             'checksum': 'ca425b88f047ce8ec45ee90e813ada91',
+            'os_hash_algo': FAKEHASHALGO,
+            'os_hash_value': MULTIHASH1,
             'container_format': 'ami',
             'disk_format': 'ami',
             'min_ram': 128,
@@ -3235,12 +3688,46 @@ class TestImagesSerializer(test_utils.BaseTestCase):
         }
         response = webob.Response()
         self.serializer.create(response, self.fixtures[0])
-        self.assertEqual(201, response.status_int)
+        self.assertEqual(http.CREATED, response.status_int)
         actual = jsonutils.loads(response.body)
         actual['tags'] = sorted(actual['tags'])
         self.assertEqual(expected, actual)
         self.assertEqual('application/json', response.content_type)
         self.assertEqual('/v2/images/%s' % UUID1, response.location)
+
+    def test_create_has_import_methods_header(self):
+        # NOTE(rosmaita): enabled_import_methods is defined as type
+        # oslo.config.cfg.ListOpt, so it is stored internally as a list
+        # but is converted to a string for output in the HTTP header
+
+        header_name = 'OpenStack-image-import-methods'
+
+        # check multiple methods
+        enabled_methods = ['one', 'two', 'three']
+        self.config(enabled_import_methods=enabled_methods)
+        response = webob.Response()
+        self.serializer.create(response, self.fixtures[0])
+        self.assertEqual(http.CREATED, response.status_int)
+        header_value = response.headers.get(header_name)
+        self.assertIsNotNone(header_value)
+        self.assertItemsEqual(enabled_methods, header_value.split(','))
+
+        # check single method
+        self.config(enabled_import_methods=['swift-party-time'])
+        response = webob.Response()
+        self.serializer.create(response, self.fixtures[0])
+        self.assertEqual(http.CREATED, response.status_int)
+        header_value = response.headers.get(header_name)
+        self.assertIsNotNone(header_value)
+        self.assertEqual('swift-party-time', header_value)
+
+        # no header for empty config value
+        self.config(enabled_import_methods=[])
+        response = webob.Response()
+        self.serializer.create(response, self.fixtures[0])
+        self.assertEqual(http.CREATED, response.status_int)
+        headers = response.headers.keys()
+        self.assertNotIn(header_name, headers)
 
     def test_update(self):
         expected = {
@@ -3249,10 +3736,13 @@ class TestImagesSerializer(test_utils.BaseTestCase):
             'status': 'queued',
             'visibility': 'public',
             'protected': False,
+            'os_hidden': False,
             'tags': set(['one', 'two']),
             'size': 1024,
             'virtual_size': 3072,
             'checksum': 'ca425b88f047ce8ec45ee90e813ada91',
+            'os_hash_algo': FAKEHASHALGO,
+            'os_hash_value': MULTIHASH1,
             'container_format': 'ami',
             'disk_format': 'ami',
             'min_ram': 128,
@@ -3270,6 +3760,12 @@ class TestImagesSerializer(test_utils.BaseTestCase):
         actual['tags'] = set(actual['tags'])
         self.assertEqual(expected, actual)
         self.assertEqual('application/json', response.content_type)
+
+    def test_import_image(self):
+        response = webob.Response()
+        self.serializer.import_image(response, {})
+        self.assertEqual(http.ACCEPTED, response.status_int)
+        self.assertEqual('0', response.headers['Content-Length'])
 
 
 class TestImagesSerializerWithUnicode(test_utils.BaseTestCase):
@@ -3293,6 +3789,8 @@ class TestImagesSerializerWithUnicode(test_utils.BaseTestCase):
                 'min_ram': 128,
                 'min_disk': 10,
                 'checksum': u'ca425b88f047ce8ec45ee90e813ada91',
+                'os_hash_algo': FAKEHASHALGO,
+                'os_hash_value': MULTIHASH1,
                 'extra_properties': {'lang': u'Fran\u00E7ais',
                                      u'dispos\u00E9': u'f\u00E2ch\u00E9'},
             }),
@@ -3307,10 +3805,13 @@ class TestImagesSerializerWithUnicode(test_utils.BaseTestCase):
                     u'status': u'queued',
                     u'visibility': u'public',
                     u'protected': False,
+                    u'os_hidden': False,
                     u'tags': [u'\u2160', u'\u2161'],
                     u'size': 1024,
                     u'virtual_size': 3072,
                     u'checksum': u'ca425b88f047ce8ec45ee90e813ada91',
+                    u'os_hash_algo': six.text_type(FAKEHASHALGO),
+                    u'os_hash_value': six.text_type(MULTIHASH1),
                     u'container_format': u'ami',
                     u'disk_format': u'ami',
                     u'min_ram': 128,
@@ -3344,10 +3845,13 @@ class TestImagesSerializerWithUnicode(test_utils.BaseTestCase):
             u'status': u'queued',
             u'visibility': u'public',
             u'protected': False,
+            u'os_hidden': False,
             u'tags': set([u'\u2160', u'\u2161']),
             u'size': 1024,
             u'virtual_size': 3072,
             u'checksum': u'ca425b88f047ce8ec45ee90e813ada91',
+            u'os_hash_algo': six.text_type(FAKEHASHALGO),
+            u'os_hash_value': six.text_type(MULTIHASH1),
             u'container_format': u'ami',
             u'disk_format': u'ami',
             u'min_ram': 128,
@@ -3375,10 +3879,13 @@ class TestImagesSerializerWithUnicode(test_utils.BaseTestCase):
             u'status': u'queued',
             u'visibility': u'public',
             u'protected': False,
+            u'os_hidden': False,
             u'tags': [u'\u2160', u'\u2161'],
             u'size': 1024,
             u'virtual_size': 3072,
             u'checksum': u'ca425b88f047ce8ec45ee90e813ada91',
+            u'os_hash_algo': six.text_type(FAKEHASHALGO),
+            u'os_hash_value': six.text_type(MULTIHASH1),
             u'container_format': u'ami',
             u'disk_format': u'ami',
             u'min_ram': 128,
@@ -3394,7 +3901,7 @@ class TestImagesSerializerWithUnicode(test_utils.BaseTestCase):
         }
         response = webob.Response()
         self.serializer.create(response, self.fixtures[0])
-        self.assertEqual(201, response.status_int)
+        self.assertEqual(http.CREATED, response.status_int)
         actual = jsonutils.loads(response.body)
         actual['tags'] = sorted(actual['tags'])
         self.assertEqual(expected, actual)
@@ -3408,10 +3915,13 @@ class TestImagesSerializerWithUnicode(test_utils.BaseTestCase):
             u'status': u'queued',
             u'visibility': u'public',
             u'protected': False,
+            u'os_hidden': False,
             u'tags': set([u'\u2160', u'\u2161']),
             u'size': 1024,
             u'virtual_size': 3072,
             u'checksum': u'ca425b88f047ce8ec45ee90e813ada91',
+            u'os_hash_algo': six.text_type(FAKEHASHALGO),
+            u'os_hash_value': six.text_type(MULTIHASH1),
             u'container_format': u'ami',
             u'disk_format': u'ami',
             u'min_ram': 128,
@@ -3451,6 +3961,7 @@ class TestImagesSerializerWithExtendedSchema(test_utils.BaseTestCase):
         self.fixture = _domain_fixture(
             UUID2, name='image-2', owner=TENANT2,
             checksum='ca425b88f047ce8ec45ee90e813ada91',
+            os_hash_algo=FAKEHASHALGO, os_hash_value=MULTIHASH1,
             created_at=DATETIME, updated_at=DATETIME, size=1024,
             virtual_size=3072, extra_properties=props)
 
@@ -3461,7 +3972,10 @@ class TestImagesSerializerWithExtendedSchema(test_utils.BaseTestCase):
             'status': 'queued',
             'visibility': 'private',
             'protected': False,
+            'os_hidden': False,
             'checksum': 'ca425b88f047ce8ec45ee90e813ada91',
+            'os_hash_algo': FAKEHASHALGO,
+            'os_hash_value': MULTIHASH1,
             'tags': [],
             'size': 1024,
             'virtual_size': 3072,
@@ -3489,7 +4003,10 @@ class TestImagesSerializerWithExtendedSchema(test_utils.BaseTestCase):
             'status': 'queued',
             'visibility': 'private',
             'protected': False,
+            'os_hidden': False,
             'checksum': 'ca425b88f047ce8ec45ee90e813ada91',
+            'os_hash_algo': FAKEHASHALGO,
+            'os_hash_value': MULTIHASH1,
             'tags': [],
             'size': 1024,
             'virtual_size': 3072,
@@ -3518,6 +4035,7 @@ class TestImagesSerializerWithAdditionalProperties(test_utils.BaseTestCase):
         self.fixture = _domain_fixture(
             UUID2, name='image-2', owner=TENANT2,
             checksum='ca425b88f047ce8ec45ee90e813ada91',
+            os_hash_algo=FAKEHASHALGO, os_hash_value=MULTIHASH1,
             created_at=DATETIME, updated_at=DATETIME, size=1024,
             virtual_size=3072, extra_properties={'marx': 'groucho'})
 
@@ -3529,7 +4047,10 @@ class TestImagesSerializerWithAdditionalProperties(test_utils.BaseTestCase):
             'status': 'queued',
             'visibility': 'private',
             'protected': False,
+            'os_hidden': False,
             'checksum': 'ca425b88f047ce8ec45ee90e813ada91',
+            'os_hash_algo': FAKEHASHALGO,
+            'os_hash_value': MULTIHASH1,
             'marx': 'groucho',
             'tags': [],
             'size': 1024,
@@ -3563,7 +4084,10 @@ class TestImagesSerializerWithAdditionalProperties(test_utils.BaseTestCase):
             'status': 'queued',
             'visibility': 'private',
             'protected': False,
+            'os_hidden': False,
             'checksum': 'ca425b88f047ce8ec45ee90e813ada91',
+            'os_hash_algo': FAKEHASHALGO,
+            'os_hash_value': MULTIHASH1,
             'marx': 123,
             'tags': [],
             'size': 1024,
@@ -3592,7 +4116,10 @@ class TestImagesSerializerWithAdditionalProperties(test_utils.BaseTestCase):
             'status': 'queued',
             'visibility': 'private',
             'protected': False,
+            'os_hidden': False,
             'checksum': 'ca425b88f047ce8ec45ee90e813ada91',
+            'os_hash_algo': FAKEHASHALGO,
+            'os_hash_value': MULTIHASH1,
             'tags': [],
             'size': 1024,
             'virtual_size': 3072,
@@ -3700,8 +4227,8 @@ class TestImagesSerializerDirectUrl(test_utils.BaseTestCase):
 class TestImageSchemaFormatConfiguration(test_utils.BaseTestCase):
     def test_default_disk_formats(self):
         schema = glance.api.v2.images.get_schema()
-        expected = [None, 'ami', 'ari', 'aki', 'vhd', 'vmdk', 'raw', 'qcow2',
-                    'vdi', 'iso']
+        expected = [None, 'ami', 'ari', 'aki', 'vhd', 'vhdx', 'vmdk',
+                    'raw', 'qcow2', 'vdi', 'iso', 'ploop']
         actual = schema.properties['disk_format']['enum']
         self.assertEqual(expected, actual)
 
@@ -3740,3 +4267,112 @@ class TestImageSchemaDeterminePropertyBasis(test_utils.BaseTestCase):
     def test_base_property_marked_as_base(self):
         schema = glance.api.v2.images.get_schema()
         self.assertTrue(schema.properties['disk_format'].get('is_base', True))
+
+
+class TestMultiImagesController(base.MultiIsolatedUnitTest):
+
+    def setUp(self):
+        super(TestMultiImagesController, self).setUp()
+        self.db = unit_test_utils.FakeDB(initialize=False)
+        self.policy = unit_test_utils.FakePolicyEnforcer()
+        self.notifier = unit_test_utils.FakeNotifier()
+        self.store = store
+        self._create_images()
+        self._create_image_members()
+        self.controller = glance.api.v2.images.ImagesController(self.db,
+                                                                self.policy,
+                                                                self.notifier,
+                                                                self.store)
+
+    def _create_images(self):
+        self.images = [
+            _db_fixture(UUID1, owner=TENANT1, checksum=CHKSUM,
+                        name='1', size=256, virtual_size=1024,
+                        visibility='public',
+                        locations=[{'url': '%s/%s' % (BASE_URI, UUID1),
+                                    'metadata': {}, 'status': 'active'}],
+                        disk_format='raw',
+                        container_format='bare',
+                        status='active'),
+            _db_fixture(UUID2, owner=TENANT1, checksum=CHKSUM1,
+                        name='2', size=512, virtual_size=2048,
+                        visibility='public',
+                        disk_format='raw',
+                        container_format='bare',
+                        status='active',
+                        tags=['redhat', '64bit', 'power'],
+                        properties={'hypervisor_type': 'kvm', 'foo': 'bar',
+                                    'bar': 'foo'}),
+            _db_fixture(UUID3, owner=TENANT3, checksum=CHKSUM1,
+                        name='3', size=512, virtual_size=2048,
+                        visibility='public', tags=['windows', '64bit', 'x86']),
+            _db_fixture(UUID4, owner=TENANT4, name='4',
+                        size=1024, virtual_size=3072),
+        ]
+        [self.db.image_create(None, image) for image in self.images]
+
+        self.db.image_tag_set_all(None, UUID1, ['ping', 'pong'])
+
+    def _create_image_members(self):
+        self.image_members = [
+            _db_image_member_fixture(UUID4, TENANT2),
+            _db_image_member_fixture(UUID4, TENANT3,
+                                     status='accepted'),
+        ]
+        [self.db.image_member_create(None, image_member)
+            for image_member in self.image_members]
+
+    def test_image_import_image_not_exist(self):
+        request = unit_test_utils.get_fake_request()
+        self.assertRaises(webob.exc.HTTPNotFound,
+                          self.controller.import_image,
+                          request, 'invalid_image',
+                          {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_with_active_image(self):
+        request = unit_test_utils.get_fake_request()
+        self.assertRaises(webob.exc.HTTPConflict,
+                          self.controller.import_image,
+                          request, UUID1,
+                          {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_invalid_backend_in_request_header(self):
+        request = unit_test_utils.get_fake_request()
+        request.headers['x-image-meta-store'] = 'dummy'
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(status='uploading')
+            self.assertRaises(webob.exc.HTTPConflict,
+                              self.controller.import_image,
+                              request, UUID4,
+                              {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_raises_conflict_if_disk_format_is_none(self):
+        request = unit_test_utils.get_fake_request()
+
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(disk_format=None)
+            self.assertRaises(webob.exc.HTTPConflict,
+                              self.controller.import_image, request, UUID4,
+                              {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_raises_conflict(self):
+        request = unit_test_utils.get_fake_request()
+
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage(status='queued')
+            self.assertRaises(webob.exc.HTTPConflict,
+                              self.controller.import_image, request, UUID4,
+                              {'method': {'name': 'glance-direct'}})
+
+    def test_image_import_raises_conflict_for_web_download(self):
+        request = unit_test_utils.get_fake_request()
+
+        with mock.patch.object(
+                glance.api.authorization.ImageRepoProxy, 'get') as mock_get:
+            mock_get.return_value = FakeImage()
+            self.assertRaises(webob.exc.HTTPConflict,
+                              self.controller.import_image, request, UUID4,
+                              {'method': {'name': 'web-download'}})

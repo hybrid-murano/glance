@@ -18,6 +18,7 @@ from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 import six
+from six.moves import http_client as http
 import six.moves.urllib.parse as urlparse
 import webob.exc
 from wsme.rest import json
@@ -162,7 +163,10 @@ class NamespaceController(object):
                             **self._to_property_dict(name, value)
                         ))
                     prop_repo.add(new_property_type)
-
+        except exception.Invalid as e:
+            msg = (_("Couldn't create metadata namespace: %s")
+                   % encodeutils.exception_to_unicode(e))
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.Forbidden as e:
             self._cleanup_namespace(ns_repo, namespace, namespace_created)
             LOG.debug("User not permitted to create metadata namespace")
@@ -202,9 +206,11 @@ class NamespaceController(object):
                 namespace_repo.remove(namespace_obj)
                 LOG.debug("Cleaned up namespace %(namespace)s ",
                           {'namespace': namespace.namespace})
-            except exception:
-                msg = (_LE("Failed to delete namespace %(namespace)s ") %
-                       {'namespace': namespace.namespace})
+            except Exception as e:
+                msg = (_LE("Failed to delete namespace %(namespace)s."
+                           "Exception: %(exception)s"),
+                       {'namespace': namespace.namespace,
+                        'exception': encodeutils.exception_to_unicode(e)})
                 LOG.error(msg)
 
     def show(self, req, namespace, filters=None):
@@ -285,6 +291,10 @@ class NamespaceController(object):
             ns_obj.owner = (
                 wsme_utils._get_value(user_ns.owner) or req.context.owner)
             updated_namespace = namespace_repo.save(ns_obj)
+        except exception.Invalid as e:
+            msg = (_("Couldn't update metadata namespace: %s")
+                   % encodeutils.exception_to_unicode(e))
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.Forbidden as e:
             LOG.debug("User not permitted to update metadata namespace "
                       "'%s'", namespace)
@@ -503,7 +513,7 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
 
     def create(self, response, namespace):
         ns_json = json.tojson(Namespace, namespace)
-        response = self.__render(ns_json, response, 201)
+        response = self.__render(ns_json, response, http.CREATED)
         response.location = get_namespace_href(namespace)
 
     def show(self, response, namespace):
@@ -528,16 +538,19 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
 
     def update(self, response, namespace):
         ns_json = json.tojson(Namespace, namespace)
-        response = self.__render(ns_json, response, 200)
+        response = self.__render(ns_json, response, http.OK)
 
     def delete(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
     def delete_objects(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
     def delete_properties(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
+
+    def delete_tags(self, response, result):
+        response.status_int = http.NO_CONTENT
 
     def __render(self, json_data, response, response_status=None):
         body = jsonutils.dumps(json_data, ensure_ascii=False)
@@ -577,7 +590,8 @@ def get_schema_definitions():
                 "required": ["title", "type"],
                 "properties": {
                     "name": {
-                        "type": "string"
+                        "type": "string",
+                        "maxLength": 80
                     },
                     "title": {
                         "type": "string"

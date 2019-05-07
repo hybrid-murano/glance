@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # Copyright 2010-2011 OpenStack Foundation
 # Copyright 2014 IBM Corp.
 # All Rights Reserved.
@@ -27,9 +28,9 @@ from oslo_concurrency import processutils
 from oslo_serialization import jsonutils
 import routes
 import six
+from six.moves import http_client as http
 import webob
 
-from glance.api.v1 import router as router_v1
 from glance.api.v2 import router as router_v2
 from glance.common import exception
 from glance.common import utils
@@ -66,7 +67,7 @@ class RequestTest(test_utils.BaseTestCase):
     def test_content_range(self):
         request = wsgi.Request.blank('/tests/123')
         request.headers["Content-Range"] = 'bytes 10-99/*'
-        range_ = request.get_content_range()
+        range_ = request.get_range_from_request(120)
         self.assertEqual(10, range_.start)
         self.assertEqual(100, range_.stop)  # non-inclusive
         self.assertIsNone(range_.length)
@@ -74,8 +75,21 @@ class RequestTest(test_utils.BaseTestCase):
     def test_content_range_invalid(self):
         request = wsgi.Request.blank('/tests/123')
         request.headers["Content-Range"] = 'bytes=0-99'
-        self.assertRaises(webob.exc.HTTPBadRequest,
-                          request.get_content_range)
+        self.assertRaises(webob.exc.HTTPRequestRangeNotSatisfiable,
+                          request.get_range_from_request, 120)
+
+    def test_range(self):
+        request = wsgi.Request.blank('/tests/123')
+        request.headers["Range"] = 'bytes=10-99'
+        range_ = request.get_range_from_request(120)
+        self.assertEqual(10, range_.start)
+        self.assertEqual(100, range_.end)  # non-inclusive
+
+    def test_range_invalid(self):
+        request = wsgi.Request.blank('/tests/123')
+        request.headers["Range"] = 'bytes=150-'
+        self.assertRaises(webob.exc.HTTPRequestRangeNotSatisfiable,
+                          request.get_range_from_request, 120)
 
     def test_content_type_missing(self):
         request = wsgi.Request.blank('/tests/123')
@@ -93,6 +107,23 @@ class RequestTest(test_utils.BaseTestCase):
         request.headers["Content-Type"] = "application/json; charset=UTF-8"
         result = request.get_content_type(('application/json',))
         self.assertEqual("application/json", result)
+
+    def test_params(self):
+        if six.PY2:
+            expected = webob.multidict.NestedMultiDict({
+                'limit': '20', 'name':
+                    '\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82',
+                'sort_key': 'name', 'sort_dir': 'asc'})
+        else:
+            expected = webob.multidict.NestedMultiDict({
+                'limit': '20', 'name': 'Привет', 'sort_key': 'name',
+                'sort_dir': 'asc'})
+
+        request = wsgi.Request.blank("/?limit=20&name=%D0%9F%D1%80%D0%B8"
+                                     "%D0%B2%D0%B5%D1%82&sort_key=name"
+                                     "&sort_dir=asc")
+        actual = request.params
+        self.assertEqual(expected, actual)
 
     def test_content_type_from_accept_xml(self):
         request = wsgi.Request.blank('/tests/123')
@@ -149,19 +180,34 @@ class RequestTest(test_utils.BaseTestCase):
         # best_match_language() returns None.
         self._set_expected_languages(all_locales=['it'])
 
-        req = wsgi.Request.blank('/', headers={'Accept-Language': 'zh'})
+        req = wsgi.Request.blank('/', headers={'Accept-Language': 'unknown'})
         self.assertIsNone(req.best_match_language())
 
-    @mock.patch.object(webob.acceptparse.AcceptLanguage, 'best_match')
-    def test_best_match_language_unknown(self, mock_best_match):
+    def test_best_match_language_unknown(self):
         # Test that we are actually invoking language negotiation by webop
         request = wsgi.Request.blank('/')
         accepted = 'unknown-lang'
         request.headers = {'Accept-Language': accepted}
 
-        mock_best_match.return_value = None
+        # TODO(rosmaita): simplify when lower_constraints has webob >= 1.8.1
+        try:
+            from webob.acceptparse import AcceptLanguageValidHeader  # noqa
+            cls = webob.acceptparse.AcceptLanguageValidHeader
+            funcname = 'lookup'
+            # Bug #1765748: see comment in code in the function under test
+            # to understand why this is the correct return value for the
+            # webob 1.8.x mock
+            retval = 'fake_LANG'
+        except ImportError:
+            cls = webob.acceptparse.AcceptLanguage
+            funcname = 'best_match'
+            retval = None
 
-        self.assertIsNone(request.best_match_language())
+        with mock.patch.object(cls, funcname) as mocked_function:
+            mocked_function.return_value = retval
+
+            self.assertIsNone(request.best_match_language())
+            mocked_function.assert_called_once()
 
         # If Accept-Language is missing or empty, match should be None
         request.headers = {'Accept-Language': ''}
@@ -171,24 +217,6 @@ class RequestTest(test_utils.BaseTestCase):
 
     def test_http_error_response_codes(self):
         sample_id, member_id, tag_val, task_id = 'abc', '123', '1', '2'
-
-        """Makes sure v1 unallowed methods return 405"""
-        unallowed_methods = [
-            ('/images', ['PUT', 'DELETE', 'HEAD', 'PATCH']),
-            ('/images/detail', ['POST', 'PUT', 'DELETE', 'PATCH']),
-            ('/images/%s' % sample_id, ['POST', 'PATCH']),
-            ('/images/%s/members' % sample_id,
-                ['POST', 'DELETE', 'HEAD', 'PATCH']),
-            ('/images/%s/members/%s' % (sample_id, member_id),
-                ['POST', 'HEAD', 'PATCH']),
-        ]
-        api = test_utils.FakeAuthMiddleware(router_v1.API(routes.Mapper()))
-        for uri, methods in unallowed_methods:
-            for method in methods:
-                req = webob.Request.blank(uri)
-                req.method = method
-                res = req.get_response(api)
-                self.assertEqual(405, res.status_int)
 
         """Makes sure v2 unallowed methods return 405"""
         unallowed_methods = [
@@ -217,13 +245,13 @@ class RequestTest(test_utils.BaseTestCase):
                 req = webob.Request.blank(uri)
                 req.method = method
                 res = req.get_response(api)
-                self.assertEqual(405, res.status_int)
+                self.assertEqual(http.METHOD_NOT_ALLOWED, res.status_int)
 
         # Makes sure not implemented methods return 405
         req = webob.Request.blank('/schemas/image')
         req.method = 'NonexistentMethod'
         res = req.get_response(api)
-        self.assertEqual(405, res.status_int)
+        self.assertEqual(http.METHOD_NOT_ALLOWED, res.status_int)
 
 
 class ResourceTest(test_utils.BaseTestCase):
@@ -317,7 +345,7 @@ class ResourceTest(test_utils.BaseTestCase):
         response = resource.__call__(request)
 
         self.assertIsInstance(response, webob.exc.HTTPForbidden)
-        self.assertEqual(403, response.status_code)
+        self.assertEqual(http.FORBIDDEN, response.status_code)
 
     def test_call_raises_exception(self):
         class FakeController(object):
@@ -336,7 +364,7 @@ class ResourceTest(test_utils.BaseTestCase):
         response = resource.__call__(request)
 
         self.assertIsInstance(response, webob.exc.HTTPInternalServerError)
-        self.assertEqual(500, response.status_code)
+        self.assertEqual(http.INTERNAL_SERVER_ERROR, response.status_code)
 
     @mock.patch.object(wsgi, 'translate_exception')
     def test_resource_call_error_handle_localized(self,
@@ -360,19 +388,27 @@ class ResourceTest(test_utils.BaseTestCase):
                               resource, request)
         self.assertEqual(message_es, str(e))
 
-    @mock.patch.object(webob.acceptparse.AcceptLanguage, 'best_match')
     @mock.patch.object(i18n, 'translate')
-    def test_translate_exception(self, mock_translate, mock_best_match):
+    def test_translate_exception(self, mock_translate):
+        # TODO(rosmaita): simplify when lower_constraints has webob >= 1.8.1
+        try:
+            from webob.acceptparse import AcceptLanguageValidHeader  # noqa
+            cls = webob.acceptparse.AcceptLanguageValidHeader
+            funcname = 'lookup'
+        except ImportError:
+            cls = webob.acceptparse.AcceptLanguage
+            funcname = 'best_match'
 
-        mock_translate.return_value = 'No Encontrado'
-        mock_best_match.return_value = 'de'
+        with mock.patch.object(cls, funcname) as mocked_function:
+            mock_translate.return_value = 'No Encontrado'
+            mocked_function.return_value = 'de'
 
-        req = wsgi.Request.blank('/tests/123')
-        req.headers["Accept-Language"] = "de"
+            req = wsgi.Request.blank('/tests/123')
+            req.headers["Accept-Language"] = "de"
 
-        e = webob.exc.HTTPNotFound(explanation='Not Found')
-        e = wsgi.translate_exception(req, e)
-        self.assertEqual('No Encontrado', e.explanation)
+            e = webob.exc.HTTPNotFound(explanation='Not Found')
+            e = wsgi.translate_exception(req, e)
+            self.assertEqual('No Encontrado', e.explanation)
 
     def test_response_headers_encoded(self):
         # prepare environment
@@ -433,7 +469,7 @@ class JSONResponseSerializerTest(test_utils.BaseTestCase):
         fixture = {"key": "value"}
         response = webob.Response()
         wsgi.JSONResponseSerializer().default(response, fixture)
-        self.assertEqual(200, response.status_int)
+        self.assertEqual(http.OK, response.status_int)
         content_types = [h for h in response.headerlist
                          if h[0] == 'Content-Type']
         self.assertEqual(1, len(content_types))
@@ -505,19 +541,32 @@ class JSONRequestDeserializerTest(test_utils.BaseTestCase):
         self.assertFalse(self._check_transfer_encoding(
                          transfer_encoding='invalid', content_length=0))
 
+    def test_has_body_invalid_transfer_encoding_no_content_len_and_body(self):
+        self.assertFalse(self._check_transfer_encoding(
+                         transfer_encoding='invalid', include_body=False))
+
+    def test_has_body_invalid_transfer_encoding_no_content_len_but_body(self):
+        self.assertTrue(self._check_transfer_encoding(
+                        transfer_encoding='invalid', include_body=True))
+
     def test_has_body_invalid_transfer_encoding_with_content_length(self):
         self.assertTrue(self._check_transfer_encoding(
                         transfer_encoding='invalid', content_length=5))
 
     def test_has_body_valid_transfer_encoding_with_content_length(self):
         self.assertTrue(self._check_transfer_encoding(
-                        transfer_encoding='chunked', content_length=0))
+                        transfer_encoding='chunked', content_length=1))
+
+    def test_has_body_valid_transfer_encoding_without_content_length(self):
+        self.assertTrue(self._check_transfer_encoding(
+                        transfer_encoding='chunked'))
 
     def _check_transfer_encoding(self, transfer_encoding=None,
-                                 content_length=None):
+                                 content_length=None, include_body=True):
         request = wsgi.Request.blank('/')
         request.method = 'POST'
-        request.body = b'fake_body'
+        if include_body:
+            request.body = b'fake_body'
         request.headers['transfer-encoding'] = transfer_encoding
         if content_length is not None:
             request.headers['content-length'] = content_length
@@ -559,7 +608,7 @@ class ServerTest(test_utils.BaseTestCase):
                                                 socket_timeout=900)
 
     def test_number_of_workers(self):
-        """Ensure the default number of workers matches num cpus."""
+        """Ensure the number of workers matches num cpus limited to 8."""
         def pid():
             i = 1
             while True:
@@ -567,12 +616,30 @@ class ServerTest(test_utils.BaseTestCase):
                 yield i
 
         with mock.patch.object(os, 'fork') as mock_fork:
+            with mock.patch('oslo_concurrency.processutils.get_worker_count',
+                            return_value=4):
+                mock_fork.side_effect = pid
+                server = wsgi.Server()
+                server.configure = mock.Mock()
+                fake_application = "fake-application"
+                server.start(fake_application, None)
+                self.assertEqual(4, len(server.children))
+            with mock.patch('oslo_concurrency.processutils.get_worker_count',
+                            return_value=24):
+                mock_fork.side_effect = pid
+                server = wsgi.Server()
+                server.configure = mock.Mock()
+                fake_application = "fake-application"
+                server.start(fake_application, None)
+                self.assertEqual(8, len(server.children))
             mock_fork.side_effect = pid
             server = wsgi.Server()
             server.configure = mock.Mock()
             fake_application = "fake-application"
             server.start(fake_application, None)
-            self.assertEqual(processutils.get_worker_count(),
+            cpus = processutils.get_worker_count()
+            expected_workers = cpus if cpus < 8 else 8
+            self.assertEqual(expected_workers,
                              len(server.children))
 
 
@@ -600,8 +667,7 @@ class TestHelpers(test_utils.BaseTestCase):
         """
         Verifies that data is the same after being passed through headers
         """
-        fixture = {'name': 'fake public image',
-                   'is_public': True,
+        fixture = {'is_public': True,
                    'deleted': False,
                    'name': None,
                    'size': 19,
@@ -694,3 +760,68 @@ class GetSocketTestCase(test_utils.BaseTestCase):
             'glance.common.wsgi.ssl.wrap_socket',
             lambda *x, **y: None))
         self.assertRaises(wsgi.socket.error, wsgi.get_socket, 1234)
+
+
+def _cleanup_uwsgi():
+    wsgi.uwsgi = None
+
+
+class Test_UwsgiChunkedFile(test_utils.BaseTestCase):
+
+    def test_read_no_data(self):
+        reader = wsgi._UWSGIChunkFile()
+        wsgi.uwsgi = mock.MagicMock()
+        self.addCleanup(_cleanup_uwsgi)
+
+        def fake_read():
+            return None
+
+        wsgi.uwsgi.chunked_read = fake_read
+        out = reader.read()
+        self.assertEqual(out, b'')
+
+    def test_read_data_no_length(self):
+        reader = wsgi._UWSGIChunkFile()
+        wsgi.uwsgi = mock.MagicMock()
+        self.addCleanup(_cleanup_uwsgi)
+
+        values = iter([b'a', b'b', b'c', None])
+
+        def fake_read():
+            return next(values)
+
+        wsgi.uwsgi.chunked_read = fake_read
+        out = reader.read()
+        self.assertEqual(out, b'abc')
+
+    def test_read_zero_length(self):
+        reader = wsgi._UWSGIChunkFile()
+        self.assertEqual(b'', reader.read(length=0))
+
+    def test_read_data_length(self):
+        reader = wsgi._UWSGIChunkFile()
+        wsgi.uwsgi = mock.MagicMock()
+        self.addCleanup(_cleanup_uwsgi)
+
+        values = iter([b'a', b'b', b'c', None])
+
+        def fake_read():
+            return next(values)
+
+        wsgi.uwsgi.chunked_read = fake_read
+        out = reader.read(length=2)
+        self.assertEqual(out, b'ab')
+
+    def test_read_data_negative_length(self):
+        reader = wsgi._UWSGIChunkFile()
+        wsgi.uwsgi = mock.MagicMock()
+        self.addCleanup(_cleanup_uwsgi)
+
+        values = iter([b'a', b'b', b'c', None])
+
+        def fake_read():
+            return next(values)
+
+        wsgi.uwsgi.chunked_read = fake_read
+        out = reader.read(length=-2)
+        self.assertEqual(out, b'abc')

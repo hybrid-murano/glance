@@ -39,8 +39,10 @@ possible_topdir = os.path.normpath(os.path.join(os.path.abspath(sys.argv[0]),
 if os.path.exists(os.path.join(possible_topdir, 'glance', '__init__.py')):
     sys.path.insert(0, possible_topdir)
 
+from alembic import command as alembic_command
+
 from oslo_config import cfg
-from oslo_db.sqlalchemy import migration
+from oslo_db import exception as db_exc
 from oslo_log import log as logging
 from oslo_utils import encodeutils
 import six
@@ -49,13 +51,15 @@ from glance.common import config
 from glance.common import exception
 from glance import context
 from glance.db import migration as db_migration
+from glance.db.sqlalchemy import alembic_migrations
+from glance.db.sqlalchemy.alembic_migrations import data_migrations
 from glance.db.sqlalchemy import api as db_api
 from glance.db.sqlalchemy import metadata
 from glance.i18n import _
 
 
 CONF = cfg.CONF
-LOG = logging.getLogger(__name__)
+USE_TRIGGERS = True
 
 
 # Decorators for actions
@@ -74,50 +78,224 @@ class DbCommands(object):
 
     def version(self):
         """Print database's current migration level"""
-        print(migration.db_version(db_api.get_engine(),
-                                   db_migration.MIGRATE_REPO_PATH,
-                                   db_migration.INIT_VERSION))
+        current_heads = alembic_migrations.get_current_alembic_heads()
+        if current_heads:
+            # Migrations are managed by alembic
+            for head in current_heads:
+                print(head)
+        else:
+            # Migrations are managed by legacy versioning scheme
+            print(_('Database is either not under migration control or under '
+                    'legacy migration control, please run '
+                    '"glance-manage db sync" to place the database under '
+                    'alembic migration control.'))
+
+    def check(self):
+        """Report any pending database upgrades.
+
+        An exit code of 3 indicates db expand is needed, see stdout output.
+        An exit code of 4 indicates db migrate is needed, see stdout output.
+        An exit code of 5 indicates db contract is needed, see stdout output.
+        """
+        engine = db_api.get_engine()
+        self._validate_engine(engine)
+
+        curr_heads = alembic_migrations.get_current_alembic_heads()
+
+        expand_heads = alembic_migrations.get_alembic_branch_head(
+            db_migration.EXPAND_BRANCH)
+        contract_heads = alembic_migrations.get_alembic_branch_head(
+            db_migration.CONTRACT_BRANCH)
+
+        if (contract_heads in curr_heads):
+            print(_('Database is up to date. No upgrades needed.'))
+            sys.exit()
+        elif ((not expand_heads) or (expand_heads not in curr_heads)):
+            print(_('Your database is not up to date. '
+                    'Your first step is to run `glance-manage db expand`.'))
+            sys.exit(3)
+        elif data_migrations.has_pending_migrations(db_api.get_engine()):
+            print(_('Your database is not up to date. '
+                    'Your next step is to run `glance-manage db migrate`.'))
+            sys.exit(4)
+        elif ((not contract_heads) or (contract_heads not in curr_heads)):
+            print(_('Your database is not up to date. '
+                    'Your next step is to run `glance-manage db contract`.'))
+            sys.exit(5)
 
     @args('--version', metavar='<version>', help='Database version')
-    def upgrade(self, version=None):
+    def upgrade(self, version='heads'):
         """Upgrade the database's migration level"""
-        migration.db_sync(db_api.get_engine(),
-                          db_migration.MIGRATE_REPO_PATH,
-                          version)
+        self._sync(version)
 
     @args('--version', metavar='<version>', help='Database version')
-    def downgrade(self, version=None):
-        """Downgrade the database's migration level"""
-        print("Warning: DB downgrade is deprecated and will be removed in N "
-              "release. Users should make a full database backup of the "
-              "production data before attempting any upgrade.",
-              file=sys.stderr)
-        migration.db_sync(db_api.get_engine(),
-                          db_migration.MIGRATE_REPO_PATH,
-                          version)
-
-    @args('--version', metavar='<version>', help='Database version')
-    def version_control(self, version=None):
+    def version_control(self, version=db_migration.ALEMBIC_INIT_VERSION):
         """Place a database under migration control"""
-        migration.db_version_control(db_api.get_engine(),
-                                     db_migration.MIGRATE_REPO_PATH,
-                                     version)
+
+        if version is None:
+            version = db_migration.ALEMBIC_INIT_VERSION
+
+        a_config = alembic_migrations.get_alembic_config()
+        alembic_command.stamp(a_config, version)
+        print(_("Placed database under migration control at "
+                "revision:"), version)
 
     @args('--version', metavar='<version>', help='Database version')
-    @args('--current_version', metavar='<version>',
-          help='Current Database version')
-    def sync(self, version=None, current_version=None):
+    def sync(self, version=None):
+        """Perform a complete (offline) database migration"""
+        global USE_TRIGGERS
+
+        # This flags let's us bypass trigger setup & teardown for non-rolling
+        # upgrades. We set this as a global variable immediately before handing
+        # off to sqlalchemy-migrate, because we can't pass arguments directly
+        # to migrations that depend on it.
+        USE_TRIGGERS = False
+
+        curr_heads = alembic_migrations.get_current_alembic_heads()
+        contract = alembic_migrations.get_alembic_branch_head(
+            db_migration.CONTRACT_BRANCH)
+
+        if (contract in curr_heads):
+            print(_('Database is up to date. No migrations needed.'))
+            sys.exit()
+
+        try:
+            # NOTE(abhishekk): db_sync should not be used for online
+            # migrations.
+            self.expand(online_migration=False)
+            self.migrate(online_migration=False)
+            self.contract(online_migration=False)
+            print(_('Database is synced successfully.'))
+        except exception.GlanceException as e:
+            sys.exit(_('Failed to sync database: ERROR: %s') % e)
+
+    def _sync(self, version):
         """
-        Place a database under migration control and upgrade/downgrade it,
-        creating first if necessary.
+        Place an existing database under migration control and upgrade it.
         """
-        if current_version not in (None, 'None'):
-            migration.db_version_control(db_api.get_engine(),
-                                         db_migration.MIGRATE_REPO_PATH,
-                                         version=current_version)
-        migration.db_sync(db_api.get_engine(),
-                          db_migration.MIGRATE_REPO_PATH,
-                          version)
+
+        alembic_migrations.place_database_under_alembic_control()
+
+        a_config = alembic_migrations.get_alembic_config()
+        alembic_command.upgrade(a_config, version)
+        heads = alembic_migrations.get_current_alembic_heads()
+        if heads is None:
+            raise exception.GlanceException("Database sync failed")
+        revs = ", ".join(heads)
+        if version == 'heads':
+            print(_("Upgraded database, current revision(s):"), revs)
+        else:
+            print(_('Upgraded database to: %(v)s, current revision(s): %(r)s')
+                  % {'v': version, 'r': revs})
+
+    def _validate_engine(self, engine):
+        """Check engine is valid or not.
+
+        MySql is only supported for online upgrade.
+        Adding sqlite as engine to support existing functional test cases.
+
+        :param engine: database engine name
+        """
+        if engine.engine.name not in ['mysql', 'sqlite']:
+            sys.exit(_('Rolling upgrades are currently supported only for '
+                       'MySQL and Sqlite'))
+
+    def expand(self, online_migration=True):
+        """Run the expansion phase of a database migration."""
+        if online_migration:
+            self._validate_engine(db_api.get_engine())
+
+        curr_heads = alembic_migrations.get_current_alembic_heads()
+        expand_head = alembic_migrations.get_alembic_branch_head(
+            db_migration.EXPAND_BRANCH)
+        contract_head = alembic_migrations.get_alembic_branch_head(
+            db_migration.CONTRACT_BRANCH)
+
+        if not expand_head:
+            sys.exit(_('Database expansion failed. Couldn\'t find head '
+                       'revision of expand branch.'))
+        elif (contract_head in curr_heads):
+            print(_('Database is up to date. No migrations needed.'))
+            sys.exit()
+
+        if expand_head not in curr_heads:
+            self._sync(version=expand_head)
+
+            curr_heads = alembic_migrations.get_current_alembic_heads()
+            if expand_head not in curr_heads:
+                sys.exit(_('Database expansion failed. Database expansion '
+                           'should have brought the database version up to '
+                           '"%(e_rev)s" revision. But, current revisions are'
+                           ': %(curr_revs)s ') % {'e_rev': expand_head,
+                                                  'curr_revs': curr_heads})
+        else:
+            print(_('Database expansion is up to date. No expansion needed.'))
+
+    def contract(self, online_migration=True):
+        """Run the contraction phase of a database migration."""
+        if online_migration:
+            self._validate_engine(db_api.get_engine())
+
+        curr_heads = alembic_migrations.get_current_alembic_heads()
+        contract_head = alembic_migrations.get_alembic_branch_head(
+            db_migration.CONTRACT_BRANCH)
+
+        if not contract_head:
+            sys.exit(_('Database contraction failed. Couldn\'t find head '
+                       'revision of contract branch.'))
+        elif (contract_head in curr_heads):
+            print(_('Database is up to date. No migrations needed.'))
+            sys.exit()
+
+        expand_head = alembic_migrations.get_alembic_branch_head(
+            db_migration.EXPAND_BRANCH)
+        if expand_head not in curr_heads:
+            sys.exit(_('Database contraction did not run. Database '
+                       'contraction cannot be run before database expansion. '
+                       'Run database expansion first using '
+                       '"glance-manage db expand"'))
+
+        if data_migrations.has_pending_migrations(db_api.get_engine()):
+            sys.exit(_('Database contraction did not run. Database '
+                       'contraction cannot be run before data migration is '
+                       'complete. Run data migration using "glance-manage db '
+                       'migrate".'))
+
+        self._sync(version=contract_head)
+
+        curr_heads = alembic_migrations.get_current_alembic_heads()
+        if contract_head not in curr_heads:
+            sys.exit(_('Database contraction failed. Database contraction '
+                       'should have brought the database version up to '
+                       '"%(e_rev)s" revision. But, current revisions are: '
+                       '%(curr_revs)s ') % {'e_rev': expand_head,
+                                            'curr_revs': curr_heads})
+
+    def migrate(self, online_migration=True):
+        """Run the data migration phase of a database migration."""
+        if online_migration:
+            self._validate_engine(db_api.get_engine())
+
+        curr_heads = alembic_migrations.get_current_alembic_heads()
+        contract_head = alembic_migrations.get_alembic_branch_head(
+            db_migration.CONTRACT_BRANCH)
+
+        if (contract_head in curr_heads):
+            print(_('Database is up to date. No migrations needed.'))
+            sys.exit()
+
+        expand_head = alembic_migrations.get_alembic_branch_head(
+            db_migration.EXPAND_BRANCH)
+        if expand_head not in curr_heads:
+            sys.exit(_('Data migration did not run. Data migration cannot be '
+                       'run before database expansion. Run database '
+                       'expansion first using "glance-manage db expand"'))
+
+        if data_migrations.has_pending_migrations(db_api.get_engine()):
+            rows_migrated = data_migrations.migrate(db_api.get_engine())
+            print(_('Migrated %s rows') % rows_migrated)
+        else:
+            print(_('Database migration is up to date. No migration needed.'))
 
     @args('--path', metavar='<path>', help='Path to the directory or file '
                                            'where json metadata is stored')
@@ -151,22 +329,51 @@ class DbCommands(object):
         metadata.db_export_metadefs(db_api.get_engine(),
                                     path)
 
+    def _purge(self, age_in_days, max_rows, purge_images_only=False):
+        try:
+            age_in_days = int(age_in_days)
+        except ValueError:
+            sys.exit(_("Invalid int value for age_in_days: "
+                       "%(age_in_days)s") % {'age_in_days': age_in_days})
+        try:
+            max_rows = int(max_rows)
+        except ValueError:
+            sys.exit(_("Invalid int value for max_rows: "
+                       "%(max_rows)s") % {'max_rows': max_rows})
+        if age_in_days < 0:
+            sys.exit(_("Must supply a non-negative value for age."))
+        if age_in_days >= (int(time.time()) / 86400):
+            sys.exit(_("Maximal age is count of days since epoch."))
+        if max_rows < 1:
+            sys.exit(_("Minimal rows limit is 1."))
+        ctx = context.get_admin_context(show_deleted=True)
+        try:
+            if purge_images_only:
+                db_api.purge_deleted_rows_from_images(ctx, age_in_days,
+                                                      max_rows)
+            else:
+                db_api.purge_deleted_rows(ctx, age_in_days, max_rows)
+        except exception.Invalid as exc:
+            sys.exit(exc.msg)
+        except db_exc.DBReferenceError:
+            sys.exit(_("Purge command failed, check glance-manage"
+                       " logs for more details."))
+
     @args('--age_in_days', type=int,
           help='Purge deleted rows older than age in days')
     @args('--max_rows', type=int,
           help='Limit number of records to delete')
     def purge(self, age_in_days=30, max_rows=100):
         """Purge deleted rows older than a given age from glance tables."""
-        age_in_days = int(age_in_days)
-        max_rows = int(max_rows)
-        if age_in_days <= 0:
-            sys.exit(_("Must supply a positive, non-zero value for age."))
-        if age_in_days >= (int(time.time()) / 86400):
-            sys.exit(_("Maximal age is count of days since epoch."))
-        if max_rows < 1:
-            sys.exit(_("Minimal rows limit is 1."))
-        ctx = context.get_admin_context(show_deleted=True)
-        db_api.purge_deleted_rows(ctx, age_in_days, max_rows)
+        self._purge(age_in_days, max_rows)
+
+    @args('--age_in_days', type=int,
+          help='Purge deleted rows older than age in days')
+    @args('--max_rows', type=int,
+          help='Limit number of records to delete')
+    def purge_images_table(self, age_in_days=180, max_rows=100):
+        """Purge deleted rows older than a given age from images table."""
+        self._purge(age_in_days, max_rows, purge_images_only=True)
 
 
 class DbLegacyCommands(object):
@@ -178,22 +385,26 @@ class DbLegacyCommands(object):
     def version(self):
         self.command_object.version()
 
-    def upgrade(self, version=None):
+    def upgrade(self, version='heads'):
         self.command_object.upgrade(CONF.command.version)
 
-    def downgrade(self, version=None):
-        print("Warning: DB downgrade is deprecated and will be removed in N "
-              "release. Users should make a full database backup of the "
-              "production data before attempting any upgrade.",
-              file=sys.stderr)
-        self.command_object.downgrade(CONF.command.version)
-
-    def version_control(self, version=None):
+    def version_control(self, version=db_migration.ALEMBIC_INIT_VERSION):
         self.command_object.version_control(CONF.command.version)
 
-    def sync(self, version=None, current_version=None):
-        self.command_object.sync(CONF.command.version,
-                                 CONF.command.current_version)
+    def sync(self, version=None):
+        self.command_object.sync(CONF.command.version)
+
+    def expand(self):
+        self.command_object.expand()
+
+    def contract(self):
+        self.command_object.contract()
+
+    def migrate(self):
+        self.command_object.migrate()
+
+    def check(self):
+        self.command_object.check()
 
     def load_metadefs(self, path=None, merge=False,
                       prefer_new=False, overwrite=False):
@@ -222,11 +433,6 @@ def add_legacy_command_parsers(command_object, subparsers):
     parser.add_argument('version', nargs='?')
     parser.set_defaults(action='db_upgrade')
 
-    parser = subparsers.add_parser('db_downgrade')
-    parser.set_defaults(action_fn=legacy_command_object.downgrade)
-    parser.add_argument('version')
-    parser.set_defaults(action='db_downgrade')
-
     parser = subparsers.add_parser('db_version_control')
     parser.set_defaults(action_fn=legacy_command_object.version_control)
     parser.add_argument('version', nargs='?')
@@ -235,8 +441,23 @@ def add_legacy_command_parsers(command_object, subparsers):
     parser = subparsers.add_parser('db_sync')
     parser.set_defaults(action_fn=legacy_command_object.sync)
     parser.add_argument('version', nargs='?')
-    parser.add_argument('current_version', nargs='?')
     parser.set_defaults(action='db_sync')
+
+    parser = subparsers.add_parser('db_expand')
+    parser.set_defaults(action_fn=legacy_command_object.expand)
+    parser.set_defaults(action='db_expand')
+
+    parser = subparsers.add_parser('db_contract')
+    parser.set_defaults(action_fn=legacy_command_object.contract)
+    parser.set_defaults(action='db_contract')
+
+    parser = subparsers.add_parser('db_migrate')
+    parser.set_defaults(action_fn=legacy_command_object.migrate)
+    parser.set_defaults(action='db_migrate')
+
+    parser = subparsers.add_parser('db_check')
+    parser.set_defaults(action_fn=legacy_command_object.check)
+    parser.set_defaults(action='db_check')
 
     parser = subparsers.add_parser('db_load_metadefs')
     parser.set_defaults(action_fn=legacy_command_object.load_metadefs)
@@ -324,6 +545,7 @@ def main():
 
     try:
         logging.register_options(CONF)
+        CONF.set_default(name='use_stderr', default=True)
         cfg_files = cfg.find_config_files(project='glance',
                                           prog='glance-registry')
         cfg_files.extend(cfg.find_config_files(project='glance',

@@ -119,7 +119,7 @@ class Controller(object):
             del params['is_public']
         try:
             return self.db_api.image_get_all(context, filters=filters,
-                                             **params)
+                                             v1_mode=True, **params)
         except exception.ImageNotFound:
             LOG.warn(_LW("Invalid marker. Image %(id)s could not be "
                          "found.") % {'id': params.get('marker')})
@@ -146,7 +146,7 @@ class Controller(object):
 
         Where image_list is a sequence of mappings
 
-        .. code-block:: json
+        ::
 
             {
                 'id': <ID>,
@@ -177,7 +177,7 @@ class Controller(object):
         :param req: the Request object coming from the wsgi layer
         :returns: a mapping of the following form
 
-        .. code-block:: json
+        ::
 
             {'images':
                 [{
@@ -295,7 +295,7 @@ class Controller(object):
 
     def _get_marker(self, req):
         """Parse a marker query param into something usable."""
-        marker = req.params.get('marker', None)
+        marker = req.params.get('marker')
 
         if marker and not uuidutils.is_uuid_like(marker):
             msg = _('Invalid marker format')
@@ -332,7 +332,7 @@ class Controller(object):
 
     def _get_is_public(self, req):
         """Parse is_public into something usable."""
-        is_public = req.params.get('is_public', None)
+        is_public = req.params.get('is_public')
 
         if is_public is None:
             # NOTE(vish): This preserves the default value of showing only
@@ -358,7 +358,7 @@ class Controller(object):
     def show(self, req, id):
         """Return data about the given image id."""
         try:
-            image = self.db_api.image_get(req.context, id)
+            image = self.db_api.image_get(req.context, id, v1_mode=True)
             LOG.debug("Successfully retrieved image %(id)s", {'id': id})
         except exception.ImageNotFound:
             LOG.info(_LI("Image %(id)s not found"), {'id': id})
@@ -438,7 +438,8 @@ class Controller(object):
 
         try:
             image_data = _normalize_image_location_for_db(image_data)
-            image_data = self.db_api.image_create(req.context, image_data)
+            image_data = self.db_api.image_create(req.context, image_data,
+                                                  v1_mode=True)
             image_data = dict(image=make_image_dict(image_data))
             LOG.info(_LI("Successfully created image %(id)s"),
                      {'id': image_data['image']['id']})
@@ -467,7 +468,7 @@ class Controller(object):
         :returns: Returns the updated image information as a mapping,
         """
         image_data = body['image']
-        from_state = body.get('from_state', None)
+        from_state = body.get('from_state')
 
         # Prohibit modification of 'owner'
         if not req.context.is_admin and 'owner' in image_data:
@@ -494,7 +495,8 @@ class Controller(object):
             updated_image = self.db_api.image_update(req.context, id,
                                                      image_data,
                                                      purge_props=purge_props,
-                                                     from_state=from_state)
+                                                     from_state=from_state,
+                                                     v1_mode=True)
 
             LOG.info(_LI("Updating metadata for image %(id)s"), {'id': id})
             return dict(image=make_image_dict(updated_image))

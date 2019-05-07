@@ -16,6 +16,7 @@
 
 """Policy Engine For Glance"""
 
+import collections
 import copy
 
 from oslo_config import cfg
@@ -32,7 +33,7 @@ CONF = cfg.CONF
 
 DEFAULT_RULES = policy.Rules.from_dict({
     'context_is_admin': 'role:admin',
-    'default': '@',
+    'default': 'role:admin',
     'manage_image_cache': 'role:admin',
 })
 
@@ -60,12 +61,8 @@ class Enforcer(policy.Enforcer):
            :raises: `glance.common.exception.Forbidden`
            :returns: A non-False value if access is allowed.
         """
-        credentials = {
-            'roles': context.roles,
-            'user': context.user,
-            'tenant': context.tenant,
-        }
-        return super(Enforcer, self).enforce(action, target, credentials,
+        return super(Enforcer, self).enforce(action, target,
+                                             context.to_policy_values(),
                                              do_raise=True,
                                              exc=exception.Forbidden,
                                              action=action)
@@ -78,12 +75,9 @@ class Enforcer(policy.Enforcer):
            :param target: Dictionary representing the object of the action.
            :returns: A non-False value if access is allowed.
         """
-        credentials = {
-            'roles': context.roles,
-            'user': context.user,
-            'tenant': context.tenant,
-        }
-        return super(Enforcer, self).enforce(action, target, credentials)
+        return super(Enforcer, self).enforce(action,
+                                             target,
+                                             context.to_policy_values())
 
     def check_is_admin(self, context):
         """Check if the given context is associated with an admin role,
@@ -113,7 +107,8 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
             self.policy.enforce(self.context, 'get_image', {})
             raise
         else:
-            self.policy.enforce(self.context, 'get_image', ImageTarget(image))
+            self.policy.enforce(self.context, 'get_image',
+                                dict(ImageTarget(image)))
         return image
 
     def list(self, *args, **kwargs):
@@ -121,12 +116,19 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
         return super(ImageRepoProxy, self).list(*args, **kwargs)
 
     def save(self, image, from_state=None):
-        self.policy.enforce(self.context, 'modify_image', image.target)
+        self.policy.enforce(self.context, 'modify_image', dict(image.target))
         return super(ImageRepoProxy, self).save(image, from_state=from_state)
 
     def add(self, image):
-        self.policy.enforce(self.context, 'add_image', image.target)
+        self.policy.enforce(self.context, 'add_image', dict(image.target))
         return super(ImageRepoProxy, self).add(image)
+
+
+def _enforce_image_visibility(policy, context, visibility, target):
+    if visibility == 'public':
+        policy.enforce(context, 'publicize_image', target)
+    elif visibility == 'community':
+        policy.enforce(context, 'communitize_image', target)
 
 
 class ImageProxy(glance.domain.proxy.Image):
@@ -144,8 +146,8 @@ class ImageProxy(glance.domain.proxy.Image):
 
     @visibility.setter
     def visibility(self, value):
-        if value == 'public':
-            self.policy.enforce(self.context, 'publicize_image', self.target)
+        _enforce_image_visibility(self.policy, self.context, value,
+                                  self.target)
         self.image.visibility = value
 
     @property
@@ -166,7 +168,7 @@ class ImageProxy(glance.domain.proxy.Image):
         self.image.locations = new_locations
 
     def delete(self):
-        self.policy.enforce(self.context, 'delete_image', self.target)
+        self.policy.enforce(self.context, 'delete_image', dict(self.target))
         return self.image.delete()
 
     def deactivate(self):
@@ -188,7 +190,6 @@ class ImageProxy(glance.domain.proxy.Image):
         return self.image.get_data(*args, **kwargs)
 
     def set_data(self, *args, **kwargs):
-        self.policy.enforce(self.context, 'upload_image', self.target)
         return self.image.set_data(*args, **kwargs)
 
 
@@ -213,8 +214,8 @@ class ImageFactoryProxy(glance.domain.proxy.ImageFactory):
                                                 proxy_kwargs=proxy_kwargs)
 
     def new_image(self, **kwargs):
-        if kwargs.get('visibility') == 'public':
-            self.policy.enforce(self.context, 'publicize_image', {})
+        _enforce_image_visibility(self.policy, self.context,
+                                  kwargs.get('visibility'), {})
         return super(ImageFactoryProxy, self).new_image(**kwargs)
 
 
@@ -378,7 +379,7 @@ class TaskFactoryProxy(glance.domain.proxy.TaskFactory):
             task_proxy_kwargs=proxy_kwargs)
 
 
-class ImageTarget(object):
+class ImageTarget(collections.Mapping):
     SENTINEL = object()
 
     def __init__(self, target):
@@ -387,6 +388,9 @@ class ImageTarget(object):
         :param target: Object being targeted
         """
         self.target = target
+        self._target_keys = [k for k in dir(ImageProxy)
+                             if not k.startswith('__')
+                             if not callable(getattr(ImageProxy, k))]
 
     def __getitem__(self, key):
         """Return the value of 'key' from the target.
@@ -405,6 +409,23 @@ class ImageTarget(object):
             else:
                 value = None
         return value
+
+    def get(self, key, default=None):
+        try:
+            return self.__getitem__(key)
+        except KeyError:
+            return default
+
+    def __len__(self):
+        length = len(self._target_keys)
+        length += len(getattr(self.target, 'extra_properties', {}))
+        return length
+
+    def __iter__(self):
+        for key in self._target_keys:
+            yield key
+        for key in getattr(self.target, 'extra_properties', {}).keys():
+            yield key
 
     def key_transforms(self, key):
         if key == 'id':

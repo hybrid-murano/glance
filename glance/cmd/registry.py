@@ -20,15 +20,20 @@
 """
 Reference implementation server for Glance Registry
 """
+import eventlet
+# NOTE(jokke): As per the eventlet commit
+# b756447bab51046dfc6f1e0e299cc997ab343701 there's circular import happening
+# which can be solved making sure the hubs are properly and fully imported
+# before calling monkey_patch(). This is solved in eventlet 0.22.0 but we
+# need to address it before that is widely used around.
+eventlet.hubs.get_hub()
+eventlet.patcher.monkey_patch()
 
 import os
 import sys
 
-import eventlet
-from oslo_utils import encodeutils
 
-# Monkey patch socket and time
-eventlet.patcher.monkey_patch(all=False, socket=True, time=True, thread=True)
+from oslo_utils import encodeutils
 
 # If ../glance/__init__.py exists, add ../ to Python search path, so that
 # it will override what happens to be installed in /usr/(local/)lib/python...
@@ -40,9 +45,7 @@ if os.path.exists(os.path.join(possible_topdir, 'glance', '__init__.py')):
 
 from oslo_config import cfg
 from oslo_log import log as logging
-import oslo_messaging
-import osprofiler.notifier
-import osprofiler.web
+import osprofiler.initializer
 
 from glance.common import config
 from glance.common import wsgi
@@ -61,16 +64,14 @@ def main():
         logging.setup(CONF, 'glance')
         notifier.set_defaults()
 
-        if cfg.CONF.profiler.enabled:
-            _notifier = osprofiler.notifier.create("Messaging",
-                                                   oslo_messaging, {},
-                                                   notifier.get_transport(),
-                                                   "glance", "registry",
-                                                   cfg.CONF.bind_host)
-            osprofiler.notifier.set(_notifier)
-            osprofiler.web.enable(cfg.CONF.profiler.hmac_keys)
-        else:
-            osprofiler.web.disable()
+        if CONF.profiler.enabled:
+            osprofiler.initializer.init_from_conf(
+                conf=CONF,
+                context={},
+                project="glance",
+                service="registry",
+                host=CONF.bind_host
+            )
 
         server = wsgi.Server()
         server.start(config.load_paste_app('glance-registry'),

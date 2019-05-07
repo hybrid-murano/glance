@@ -112,6 +112,12 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
         return [proxy_image(self.context, i) for i in images]
 
 
+def _validate_image_accepts_members(visibility):
+    if visibility != 'shared':
+        message = _("Only shared images have members.")
+        raise exception.Forbidden(message)
+
+
 class ImageMemberRepoProxy(glance.domain.proxy.MemberRepo):
 
     def __init__(self, member_repo, image, context):
@@ -124,12 +130,7 @@ class ImageMemberRepoProxy(glance.domain.proxy.MemberRepo):
             member_repo,
             member_proxy_class=ImageMemberProxy,
             member_proxy_kwargs=proxy_kwargs)
-        self._check_image_visibility()
-
-    def _check_image_visibility(self):
-        if self.image.visibility == 'public':
-            message = _("Public images do not have members.")
-            raise exception.Forbidden(message)
+        _validate_image_accepts_members(self.image.visibility)
 
     def get(self, member_id):
         if (self.context.is_admin or
@@ -220,9 +221,7 @@ class ImageMemberFactoryProxy(glance.domain.proxy.ImageMembershipFactory):
                             "for the image.")
                 raise exception.Forbidden(message)
 
-        if image.visibility == 'public':
-            message = _("Public images do not have members.")
-            raise exception.Forbidden(message)
+        _validate_image_accepts_members(image.visibility)
 
         return self.image_member_factory.new_image_member(image, member_id)
 
@@ -316,6 +315,9 @@ class ImmutableImageProxy(object):
     min_disk = _immutable_attr('base', 'min_disk')
     min_ram = _immutable_attr('base', 'min_ram')
     protected = _immutable_attr('base', 'protected')
+    os_hash_algo = _immutable_attr('base', 'os_hash_algo')
+    os_hash_value = _immutable_attr('base', 'os_hash_value')
+    os_hidden = _immutable_attr('base', 'os_hidden')
     locations = _immutable_attr('base', 'locations', proxy=ImmutableLocations)
     checksum = _immutable_attr('base', 'checksum')
     owner = _immutable_attr('base', 'owner')

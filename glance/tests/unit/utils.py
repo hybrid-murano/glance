@@ -15,11 +15,9 @@
 
 
 from cryptography import exceptions as crypto_exception
-from debtcollector import removals
 import glance_store as store
 import mock
 from oslo_config import cfg
-from oslo_log import log as logging
 from six.moves import urllib
 
 from glance.common import exception
@@ -30,7 +28,6 @@ import glance.db.simple.api as simple_db
 
 
 CONF = cfg.CONF
-LOG = logging.getLogger(__name__)
 
 UUID1 = 'c80a1a6c-bd1f-41c5-90ee-81afedb1d58d'
 UUID2 = '971ec09a-8067-4bc8-a91f-ae3557f1c4c7'
@@ -88,25 +85,31 @@ def fake_get_size_from_backend(uri, context=None):
     return 1
 
 
-@removals.remove(message="This will be removed in the N cycle.")
-def fake_old_verify_signature(context, checksum_hash, image_properties):
-    if (image_properties is not None and 'signature' in image_properties and
-            image_properties['signature'] == 'VALID'):
-        return True
-    else:
-        raise exception.SignatureVerificationError(
-            'Signature verification failed.')
-
-
-def fake_get_verifier(context, image_properties):
+def fake_get_verifier(context, img_signature_certificate_uuid,
+                      img_signature_hash_method, img_signature,
+                      img_signature_key_type):
     verifier = mock.Mock()
-    if (image_properties is not None and 'img_signature' in image_properties
-            and image_properties['img_signature'] == 'VALID'):
+    if (img_signature is not None and img_signature == 'VALID'):
         verifier.verify.return_value = None
     else:
         ex = crypto_exception.InvalidSignature()
         verifier.verify.side_effect = ex
     return verifier
+
+
+def get_fake_context(user=USER1, tenant=TENANT1, roles=None, is_admin=False):
+    if roles is None:
+        roles = ['member']
+
+    kwargs = {
+        'user': user,
+        'tenant': tenant,
+        'roles': roles,
+        'is_admin': is_admin,
+    }
+
+    context = glance.context.RequestContext(**kwargs)
+    return context
 
 
 class FakeDB(object):
@@ -121,8 +124,10 @@ class FakeDB(object):
         images = [
             {'id': UUID1, 'owner': TENANT1, 'status': 'queued',
              'locations': [{'url': '%s/%s' % (BASE_URI, UUID1),
-                            'metadata': {}, 'status': 'queued'}]},
-            {'id': UUID2, 'owner': TENANT1, 'status': 'queued'},
+                            'metadata': {}, 'status': 'queued'}],
+             'disk_format': 'raw', 'container_format': 'bare'},
+            {'id': UUID2, 'owner': TENANT1, 'status': 'queued',
+             'disk_format': 'raw', 'container_format': 'bare'},
         ]
         [simple_db.image_create(None, image) for image in images]
 
@@ -233,8 +238,35 @@ class FakeStoreAPI(object):
         checksum = 'Z'
         return (image_id, size, checksum, self.store_metadata)
 
+    def add_to_backend_with_multihash(
+            self, conf, image_id, data, size, hashing_algo,
+            scheme=None, context=None, verifier=None):
+        store_max_size = 7
+        current_store_size = 2
+        for location in self.data.keys():
+            if image_id in location:
+                raise exception.Duplicate()
+        if not size:
+            # 'data' is a string wrapped in a LimitingReader|CooperativeReader
+            # pipeline, so peek under the hood of those objects to get at the
+            # string itself.
+            size = len(data.data.fd)
+        if (current_store_size + size) > store_max_size:
+            raise exception.StorageFull()
+        if context.user == USER2:
+            raise exception.Forbidden()
+        if context.user == USER3:
+            raise exception.StorageWriteDenied()
+        self.data[image_id] = (data, size)
+        checksum = 'Z'
+        multihash = 'ZZ'
+        return (image_id, size, checksum, multihash, self.store_metadata)
+
     def check_location_metadata(self, val, key=''):
         store.check_location_metadata(val)
+
+    def delete_from_backend(self, uri, context=None):
+        pass
 
 
 class FakePolicyEnforcer(object):

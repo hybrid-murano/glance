@@ -30,9 +30,9 @@ class TestWSGIServer(testtools.TestCase):
     """WSGI server tests."""
     def test_client_socket_timeout(self):
         CONF.set_default("workers", 0)
-        CONF.set_default("client_socket_timeout", 0.1)
+        CONF.set_default("client_socket_timeout", 1)
         """Verify connections are timed out as per 'client_socket_timeout'"""
-        greetings = 'Hello, World!!!'
+        greetings = b'Hello, World!!!'
 
         def hello_world(env, start_response):
             start_response('200 OK', [('Content-Type', 'text/plain')])
@@ -46,10 +46,10 @@ class TestWSGIServer(testtools.TestCase):
             sock = socket.socket()
             sock.connect(('127.0.0.1', port))
             time.sleep(delay)
-            sock.send('GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
+            sock.send(b'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n')
             return sock.recv(1024)
 
         # Should succeed - no timeout
         self.assertIn(greetings, get_request())
         # Should fail - connection timed out so we get nothing from the server
-        self.assertFalse(get_request(delay=0.2))
+        self.assertFalse(get_request(delay=1.1))

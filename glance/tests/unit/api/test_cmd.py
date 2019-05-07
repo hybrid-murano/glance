@@ -52,12 +52,19 @@ class TestGlanceApiCmd(test_utils.BaseTestCase):
 
         store.register_opts(CONF)
 
-        self.stubs.Set(glance.common.config, 'load_paste_app',
-                       self._do_nothing)
-        self.stubs.Set(glance.common.wsgi.Server, 'start',
-                       self._do_nothing)
-        self.stubs.Set(glance.common.wsgi.Server, 'wait',
-                       self._do_nothing)
+        self.config_patcher = mock.patch(
+            'glance.common.config.load_paste_app',
+            side_effect=self._do_nothing)
+        self.start_patcher = mock.patch('glance.common.wsgi.Server.start',
+                                        side_effect=self._do_nothing)
+        self.wait_patcher = mock.patch('glance.common.wsgi.Server.wait',
+                                       side_effect=self._do_nothing)
+
+        self.addCleanup(mock.patch.stopall)
+
+        self.config_patcher.start()
+        self.start_patcher.start()
+        self.wait_patcher.start()
 
     def tearDown(self):
         sys.stderr = sys.__stderr__
@@ -68,18 +75,12 @@ class TestGlanceApiCmd(test_utils.BaseTestCase):
         self.config(group='glance_store', default_store='file')
         glance.cmd.api.main()
 
-    def test_unsupported_default_store(self):
-        self.stubs.UnsetAll()
-        self.config(group='glance_store', default_store='shouldnotexist')
-        exit = self.assertRaises(SystemExit, glance.cmd.api.main)
-        self.assertEqual(1, exit.code)
-
     def test_worker_creation_failure(self):
         failure = exc.WorkerCreationFailure(reason='test')
-        self.stubs.Set(glance.common.wsgi.Server, 'start',
-                       self._raise(failure))
-        exit = self.assertRaises(SystemExit, glance.cmd.api.main)
-        self.assertEqual(2, exit.code)
+        with mock.patch('glance.common.wsgi.Server.start',
+                        side_effect=self._raise(failure)):
+            exit = self.assertRaises(SystemExit, glance.cmd.api.main)
+            self.assertEqual(2, exit.code)
 
     @mock.patch.object(glance.common.config, 'parse_cache_args')
     @mock.patch.object(logging, 'setup')
@@ -102,11 +103,12 @@ class TestGlanceApiCmd(test_utils.BaseTestCase):
                                   mock.call.mock_cache_clean()]
         self.assertEqual(expected_call_sequence, manager.mock_calls)
 
+    @mock.patch.object(glance.image_cache.cleaner.Cleaner, 'run')
     @mock.patch.object(glance.image_cache.base.CacheApp, '__init__')
-    def test_cache_cleaner_main_runtime_exception_handling(self, mock_cache):
+    def test_cache_cleaner_main_runtime_exception_handling(self, mock_cache,
+                                                           mock_run):
         mock_cache.return_value = None
-        self.stubs.Set(glance.image_cache.cleaner.Cleaner, 'run',
-                       self._raise(RuntimeError))
+        mock_run.side_effect = self._raise(RuntimeError)
         exit = self.assertRaises(SystemExit, glance.cmd.cache_cleaner.main)
         self.assertEqual('ERROR: ', exit.code)
 
@@ -131,10 +133,69 @@ class TestGlanceApiCmd(test_utils.BaseTestCase):
                                   mock.call.mock_cache_prune()]
         self.assertEqual(expected_call_sequence, manager.mock_calls)
 
+    @mock.patch.object(glance.image_cache.pruner.Pruner, 'run')
     @mock.patch.object(glance.image_cache.base.CacheApp, '__init__')
-    def test_cache_pruner_main_runtime_exception_handling(self, mock_cache):
+    def test_cache_pruner_main_runtime_exception_handling(self, mock_cache,
+                                                          mock_run):
         mock_cache.return_value = None
-        self.stubs.Set(glance.image_cache.pruner.Pruner, 'run',
-                       self._raise(RuntimeError))
+        mock_run.side_effect = self._raise(RuntimeError)
         exit = self.assertRaises(SystemExit, glance.cmd.cache_pruner.main)
         self.assertEqual('ERROR: ', exit.code)
+
+    def test_fail_with_value_error(self):
+        with mock.patch('sys.stderr.write') as mock_stderr:
+            with mock.patch('sys.exit') as mock_exit:
+                exc_msg = 'A ValueError, LOL!'
+                exc = ValueError(exc_msg)
+                glance.cmd.api.fail(exc)
+                mock_stderr.assert_called_once_with('ERROR: %s\n' % exc_msg)
+                mock_exit.assert_called_once_with(4)
+
+    def test_fail_with_config_exception(self):
+        with mock.patch('sys.stderr.write') as mock_stderr:
+            with mock.patch('sys.exit') as mock_exit:
+                exc_msg = 'A ConfigError by George!'
+                exc = cfg.ConfigFileValueError(exc_msg)
+                glance.cmd.api.fail(exc)
+                mock_stderr.assert_called_once_with('ERROR: %s\n' % exc_msg)
+                mock_exit.assert_called_once_with(5)
+
+    def test_fail_with_unknown_exception(self):
+        with mock.patch('sys.stderr.write') as mock_stderr:
+            with mock.patch('sys.exit') as mock_exit:
+                exc_msg = 'A Crazy Unkown Error.'
+                exc = CrayCray(exc_msg)
+                glance.cmd.api.fail(exc)
+                mock_stderr.assert_called_once_with('ERROR: %s\n' % exc_msg)
+                mock_exit.assert_called_once_with(99)
+
+    def test_main_with_store_config_exception(self):
+        with mock.patch.object(glance.common.config,
+                               'parse_args') as mock_config:
+            with mock.patch('sys.exit') as mock_exit:
+                exc = store.exceptions.BadStoreConfiguration()
+                mock_config.side_effect = exc
+                glance.cmd.api.main()
+                mock_exit.assert_called_once_with(3)
+
+    def test_main_with_runtime_error(self):
+        with mock.patch.object(glance.common.config,
+                               'parse_args') as mock_config:
+            with mock.patch('sys.exit') as mock_exit:
+                exc = RuntimeError()
+                mock_config.side_effect = exc
+                glance.cmd.api.main()
+                mock_exit.assert_called_once_with(1)
+
+    def test_main_with_worker_creation_failure(self):
+        with mock.patch.object(glance.common.config,
+                               'parse_args') as mock_config:
+            with mock.patch('sys.exit') as mock_exit:
+                exx = exc.WorkerCreationFailure()
+                mock_config.side_effect = exx
+                glance.cmd.api.main()
+                mock_exit.assert_called_once_with(2)
+
+
+class CrayCray(Exception):
+    pass

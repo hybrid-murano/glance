@@ -14,6 +14,7 @@
 #    under the License.
 import glance_store
 from oslo_log import log as logging
+from six.moves import http_client as http
 import webob.exc
 
 from glance.api import policy
@@ -44,8 +45,11 @@ class ImageActionsController(object):
         image_repo = self.gateway.get_repo(req.context)
         try:
             image = image_repo.get(image_id)
+            status = image.status
             image.deactivate()
-            image_repo.save(image)
+            # not necessary to change the status if it's already 'deactivated'
+            if status == 'active':
+                image_repo.save(image, from_state='active')
             LOG.info(_LI("Image %s is deactivated"), image_id)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
@@ -60,8 +64,11 @@ class ImageActionsController(object):
         image_repo = self.gateway.get_repo(req.context)
         try:
             image = image_repo.get(image_id)
+            status = image.status
             image.reactivate()
-            image_repo.save(image)
+            # not necessary to change the status if it's already 'active'
+            if status == 'deactivated':
+                image_repo.save(image, from_state='deactivated')
             LOG.info(_LI("Image %s is reactivated"), image_id)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
@@ -75,10 +82,10 @@ class ImageActionsController(object):
 class ResponseSerializer(wsgi.JSONResponseSerializer):
 
     def deactivate(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
     def reactivate(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
 
 def create_resource():

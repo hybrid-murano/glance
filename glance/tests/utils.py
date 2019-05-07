@@ -23,14 +23,17 @@ import shutil
 import socket
 import subprocess
 
+from alembic import command as alembic_command
 import fixtures
 from oslo_config import cfg
 from oslo_config import fixture as cfg_fixture
+from oslo_log.fixture import logging_error as log_fixture
 from oslo_log import log
 from oslo_serialization import jsonutils
 from oslotest import moxstubout
 import six
 from six.moves import BaseHTTPServer
+from six.moves import http_client as http
 import testtools
 import webob
 
@@ -41,8 +44,10 @@ from glance.common import timeutils
 from glance.common import utils
 from glance.common import wsgi
 from glance import context
+from glance.db.sqlalchemy import alembic_migrations
 from glance.db.sqlalchemy import api as db_api
 from glance.db.sqlalchemy import models as db_models
+from glance.tests.unit import fixtures as glance_fixtures
 
 CONF = cfg.CONF
 try:
@@ -79,6 +84,13 @@ class BaseTestCase(testtools.TestCase):
         self.conf_dir = os.path.join(self.test_dir, 'etc')
         utils.safe_mkdirs(self.conf_dir)
         self.set_policy()
+
+        # Limit the amount of DeprecationWarning messages in the unit test logs
+        self.useFixture(glance_fixtures.WarningsFixture())
+
+        # Make sure logging output is limited but still test debug formatting
+        self.useFixture(log_fixture.get_logging_handle_error_fixture())
+        self.useFixture(glance_fixtures.StandardLogging())
 
     def set_policy(self):
         conf_file = "policy.json"
@@ -196,7 +208,7 @@ def fork_exec(cmd,
     :param cmd: Command to execute as an array of arguments.
     :param exec_env: A dictionary representing the environment with
                      which to run the command.
-    :param logile: A path to a file which will hold the stdout/err of
+    :param logfile: A path to a file which will hold the stdout/err of
                    the child process.
     :param pass_fds: Sequence of file descriptors passed to the child.
     """
@@ -381,6 +393,27 @@ def get_unused_port_and_socket():
     return (port, s)
 
 
+def get_unused_port_ipv6():
+    """
+    Returns an unused port on localhost on IPv6 (uses ::1).
+    """
+    port, s = get_unused_port_and_socket_ipv6()
+    s.close()
+    return port
+
+
+def get_unused_port_and_socket_ipv6():
+    """
+    Returns an unused port on localhost and the open socket
+    from which it was created, but uses IPv6 (::1).
+    """
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.bind(('::1', 0))
+    # Ignoring flowinfo and scopeid...
+    addr, port, flowinfo, scopeid = s.getsockname()
+    return (port, s)
+
+
 def xattr_writes_supported(path):
     """
     Returns True if the we can write a file to the supplied
@@ -437,7 +470,7 @@ def start_http_server(image_id, image_data):
     def _get_http_handler_class(fixture):
         class StaticHTTPRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             def do_GET(self):
-                self.send_response(200)
+                self.send_response(http.OK)
                 self.send_header('Content-Length', str(len(fixture)))
                 self.end_headers()
                 self.wfile.write(fixture)
@@ -447,9 +480,9 @@ def start_http_server(image_id, image_data):
                 # reserve non_existing_image_path for the cases where we expect
                 # 404 from the server
                 if 'non_existing_image_path' in self.path:
-                    self.send_response(404)
+                    self.send_response(http.NOT_FOUND)
                 else:
-                    self.send_response(200)
+                    self.send_response(http.OK)
                 self.send_header('Content-Length', str(len(fixture)))
                 self.end_headers()
                 return
@@ -491,17 +524,21 @@ class RegistryAPIMixIn(object):
                    'status': 'active',
                    'disk_format': 'vhd',
                    'container_format': 'ovf',
-                   'is_public': True,
+                   'visibility': 'public',
                    'size': 20,
                    'checksum': None}
+        if 'is_public' in kwargs:
+            fixture.pop('visibility')
         fixture.update(kwargs)
         return fixture
 
     def get_minimal_fixture(self, **kwargs):
         fixture = {'name': 'fake public image',
-                   'is_public': True,
+                   'visibility': 'public',
                    'disk_format': 'vhd',
                    'container_format': 'ovf'}
+        if 'is_public' in kwargs:
+            fixture.pop('visibility')
         fixture.update(kwargs)
         return fixture
 
@@ -574,7 +611,8 @@ class FakeAuthMiddleware(wsgi.Middleware):
 
 
 class FakeHTTPResponse(object):
-    def __init__(self, status=200, headers=None, data=None, *args, **kwargs):
+    def __init__(self, status=http.OK, headers=None, data=None,
+                 *args, **kwargs):
         data = data or b'I am a teapot, short and stout\n'
         self.data = six.BytesIO(data)
         self.read = self.data.read
@@ -597,9 +635,12 @@ class Httplib2WsgiAdapter(object):
 
     def request(self, uri, method="GET", body=None, headers=None):
         req = webob.Request.blank(uri, method=method, headers=headers)
-        req.body = body
+        if isinstance(body, str):
+            req.body = body.encode('utf-8')
+        else:
+            req.body = body
         resp = req.get_response(self.app)
-        return Httplib2WebobResponse(resp), resp.body
+        return Httplib2WebobResponse(resp), resp.body.decode('utf-8')
 
 
 class Httplib2WebobResponse(object):
@@ -643,3 +684,18 @@ class HttplibWsgiAdapter(object):
         response = self.req.get_response(self.app)
         return FakeHTTPResponse(response.status_code, response.headers,
                                 response.body)
+
+
+def db_sync(version='heads', engine=None):
+    """Migrate the database to `version` or the most recent version."""
+    if engine is None:
+        engine = db_api.get_engine()
+
+    alembic_config = alembic_migrations.get_alembic_config(engine=engine)
+    alembic_command.upgrade(alembic_config, version)
+
+
+def is_sqlite_version_prior_to(major, minor):
+    import sqlite3
+    tup = sqlite3.sqlite_version_info
+    return tup[0] < major or (tup[0] == major and tup[1] < minor)

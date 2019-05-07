@@ -23,10 +23,45 @@ from glance.i18n import _
 
 
 registry_addr_opts = [
-    cfg.StrOpt('registry_host', default='0.0.0.0',
-               help=_('Address to find the registry server.')),
+    cfg.HostAddressOpt('registry_host',
+                       default='0.0.0.0',
+                       deprecated_for_removal=True,
+                       deprecated_since="Queens",
+                       deprecated_reason=_("""
+Glance registry service is deprecated for removal.
+
+More information can be found from the spec:
+http://specs.openstack.org/openstack/glance-specs/specs/queens/approved/glance/deprecate-registry.html
+"""),
+                       help=_("""
+Address the registry server is hosted on.
+
+Possible values:
+    * A valid IP or hostname
+
+Related options:
+    * None
+
+""")),
     cfg.PortOpt('registry_port', default=9191,
-                help=_('Port the registry server is listening on.')),
+                deprecated_for_removal=True,
+                deprecated_since="Queens",
+                deprecated_reason=_("""
+Glance registry service is deprecated for removal.
+
+More information can be found from the spec:
+http://specs.openstack.org/openstack/glance-specs/specs/queens/approved/glance/deprecate-registry.html
+"""),
+                help=_("""
+Port the registry server is listening on.
+
+Possible values:
+    * A valid port number
+
+Related options:
+    * None
+
+""")),
 ]
 
 CONF = cfg.CONF

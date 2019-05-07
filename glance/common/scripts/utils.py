@@ -52,14 +52,22 @@ def unpack_task_input(task):
 
     :param task: Task domain object
     """
+    task_type = task.type
     task_input = task.task_input
 
-    # NOTE: until we support multiple task types, we just check for
-    # input fields related to 'import task'.
-    for key in ["import_from", "import_from_format", "image_properties"]:
-        if key not in task_input:
-            msg = _("Input does not contain '%(key)s' field") % {"key": key}
+    if task_type == 'api_image_import':
+        if not task_input:
+            msg = _("Input to api_image_import task is empty.")
             raise exception.Invalid(msg)
+        if 'image_id' not in task_input:
+            msg = _("Missing required 'image_id' field")
+            raise exception.Invalid(msg)
+    else:
+        for key in ["import_from", "import_from_format", "image_properties"]:
+            if key not in task_input:
+                msg = (_("Input does not contain '%(key)s' field") %
+                       {"key": key})
+                raise exception.Invalid(msg)
 
     return task_input
 
@@ -128,6 +136,6 @@ def get_image_data_iter(uri):
         #
         # We're not using StringIO or other tools to avoid reading everything
         # into memory. Some images may be quite heavy.
-        return open(uri, "r")
+        return open(uri, "rb")
 
     return urllib.request.urlopen(uri)

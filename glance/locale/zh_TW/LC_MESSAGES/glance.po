@@ -3,49 +3,26 @@
 # This file is distributed under the same license as the glance project.
 #
 # Translators:
-# Lucas Palm <lapalm@us.ibm.com>, 2015. #zanata
-# OpenStack Infra <zanata@openstack.org>, 2015. #zanata
-# Jennifer <cristxu@tw.ibm.com>, 2016. #zanata
-# Lucas Palm <lapalm@us.ibm.com>, 2016. #zanata
+# Andreas Jaeger <jaegerandi@gmail.com>, 2016. #zanata
 msgid ""
 msgstr ""
-"Project-Id-Version: glance 12.0.0.0b4.dev41\n"
-"Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
-"POT-Creation-Date: 2016-03-12 00:22+0000\n"
+"Project-Id-Version: glance VERSION\n"
+"Report-Msgid-Bugs-To: https://bugs.launchpad.net/openstack-i18n/\n"
+"POT-Creation-Date: 2018-08-09 04:23+0000\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
-"PO-Revision-Date: 2016-03-10 03:06+0000\n"
-"Last-Translator: Jennifer <cristxu@tw.ibm.com>\n"
-"Language: zh-TW\n"
+"PO-Revision-Date: 2016-04-12 05:23+0000\n"
+"Last-Translator: Copied by Zanata <copied-by-zanata@zanata.org>\n"
+"Language: zh_TW\n"
 "Plural-Forms: nplurals=1; plural=0;\n"
 "Generated-By: Babel 2.0\n"
-"X-Generator: Zanata 3.7.3\n"
+"X-Generator: Zanata 4.3.3\n"
 "Language-Team: Chinese (Taiwan)\n"
 
 #, python-format
 msgid "\t%s"
 msgstr "\t%s"
-
-#, python-format
-msgid "%(attribute)s have to be string"
-msgstr "%(attribute)s 必須是字串"
-
-#, python-format
-msgid "%(attribute)s is required"
-msgstr "需要 %(attribute)s"
-
-#, python-format
-msgid "%(attribute)s may not be longer than %(length)i"
-msgstr "%(attribute)s 的長度不能超過 %(length)i"
-
-#, python-format
-msgid "%(attribute)s may not be shorter than %(length)i"
-msgstr "%(attribute)s 的長度不能小於 %(length)i"
-
-#, python-format
-msgid "%(attribute)s should match pattern %(pattern)s"
-msgstr "%(attribute)s 應符合型樣 %(pattern)s"
 
 #, python-format
 msgid "%(cls)s exception was raised in the last rpc call: %(val)s"
@@ -112,23 +89,8 @@ msgstr "已停止 %s"
 msgid "%s is stopped"
 msgstr "%s 已停止"
 
-#, python-format
-msgid "'%(param)s' value out of range, must not exceed %(max)d"
-msgstr "%(param)s 值已超出範圍，不得超過 %(max)d"
-
-msgid ""
-"--os_auth_url option or OS_AUTH_URL environment variable required when "
-"keystone authentication strategy is enabled\n"
-msgstr ""
-"--os_auth_url 選項或 OS_AUTH_URL 環境變數（啟用 Keystone 鑑別策略時需要）\n"
-
 msgid "A body is not expected with this request."
 msgstr "此要求預期不含內文。"
-
-msgid ""
-"A list of artifacts that are allowed in the format name or name-version. "
-"Empty list means that any artifact can be loaded."
-msgstr "格式名稱或名稱-版本中容許的構件清單。空清單表示可以載入任何構件。"
 
 #, python-format
 msgid ""
@@ -152,42 +114,8 @@ msgid ""
 "exists."
 msgstr "名稱為 %(resource_type_name)s 的 meta 資料定義資源類型已存在。"
 
-#, python-format
-msgid ""
-"A metadata tag with name=%(name)s already exists in namespace="
-"%(namespace_name)s."
-msgstr ""
-"名稱為 %(name)s 的 meta 資料標籤已存在於名稱空間 %(namespace_name)s 中。"
-
 msgid "A set of URLs to access the image file kept in external store"
 msgstr "用來存取外部儲存庫中所保留映像檔的 URL 集"
-
-msgid ""
-"AES key for encrypting store 'location' metadata. This includes, if used, "
-"Swift or S3 credentials. Should be set to a random string of length 16, 24 "
-"or 32 bytes"
-msgstr ""
-"用於加密儲存庫「位置」meta 資料的 AES 金鑰。它（如果使用的話）包含 Swift 或 "
-"S3 認證。應設定為長度為 16、24 或 32 個位元組的隨機字串"
-
-msgid ""
-"Address to bind the server.  Useful when selecting a particular network "
-"interface."
-msgstr "用來連結伺服器的位址。在選取特定網路介面時很有用。"
-
-msgid "Address to find the registry server."
-msgstr "用來尋找登錄伺服器的位址。"
-
-msgid ""
-"Allow unauthenticated users to access the API with read-only privileges. "
-"This only applies when using ContextMiddleware."
-msgstr ""
-"容許未經鑑別的使用者以唯讀專用權存取 API。這只有在使用 ContextMiddleware 時才"
-"適用。"
-
-#, python-format
-msgid "Allowed values %s are invalid under given validators"
-msgstr "容許的值 %s 在給定的驗證器下無效"
 
 msgid "Amount of disk space (in GB) required to boot image."
 msgstr "啟動映像檔所需的磁碟空間數量（以 GB 為單位）。"
@@ -216,10 +144,6 @@ msgstr "映像檔綱目 URL"
 msgid "An image self url"
 msgstr "映像檔自身 URL"
 
-#, python-format
-msgid "An image with identifier %s already exists"
-msgstr "ID 為 %s 的映像檔已存在"
-
 msgid "An import task exception occurred"
 msgstr "發生匯入作業異常狀況"
 
@@ -239,79 +163,8 @@ msgid "An unknown task exception occurred"
 msgstr "發生不明的作業異常狀況"
 
 #, python-format
-msgid "Array has no element at position %d"
-msgstr "陣列在位置 %d 處沒有元素"
-
-msgid "Array property can't have item_type=Array"
-msgstr "陣列內容的 item_type 不能為 Array"
-
-#, python-format
-msgid "Artifact %s could not be deleted because it is in use: %s"
-msgstr "無法刪除構件 %s，因為它在使用中：%s"
-
-#, python-format
-msgid "Artifact cannot change state from %(source)s to %(target)s"
-msgstr "構件無法從狀態 %(source)s 變更為狀態 %(target)s"
-
-#, python-format
-msgid "Artifact exceeds the storage quota: %s"
-msgstr "構件超出儲存體配額：%s"
-
-#, python-format
-msgid "Artifact has no property %(prop)s"
-msgstr "構件沒有內容 %(prop)s"
-
-#, python-format
-msgid "Artifact state cannot be changed from %(curr)s to %(to)s"
-msgstr "構件狀態無法從 %(curr)s 變更為 %(to)s"
-
-#, python-format
-msgid "Artifact storage media is full: %s"
-msgstr "構件儲存媒體已滿：%s"
-
-#, python-format
-msgid ""
-"Artifact type with name '%(name)s' and version '%(version)s' is not known"
-msgstr "名稱為 '%(name)s' 且版本為 '%(version)s' 的構件類型不明"
-
-msgid "Artifact with a circular dependency can not be created"
-msgstr "無法建立具有循環相依關係的構件"
-
-#, python-format
-msgid "Artifact with id=%(id)s is not accessible"
-msgstr "無法存取 ID 為 %(id)s 的構件"
-
-#, python-format
-msgid "Artifact with id=%(id)s was not found"
-msgstr "找不到 ID 為 %(id)s 的構件"
-
-msgid "Artifact with the specified type, name and version already exists"
-msgstr "已存在具有所指定類型、名稱及版本的構件"
-
-#, python-format
-msgid ""
-"Artifact with the specified type, name and version already has the direct "
-"dependency=%(dep)s"
-msgstr "具有所指定類型、名稱及版本的構件已具有直接相依關係 %(dep)s"
-
-#, python-format
-msgid ""
-"Artifact with the specified type, name and version already has the "
-"transitive dependency=%(dep)s"
-msgstr "具有所指定類型、名稱及版本的構件已具有可轉移的相依關係 %(dep)s"
-
-msgid "Attempt to set readonly property"
-msgstr "試圖設定唯讀內容"
-
-msgid "Attempt to set value of immutable property"
-msgstr "試圖設定不可變內容的值"
-
-#, python-format
 msgid "Attempt to upload duplicate image: %s"
 msgstr "嘗試上傳重複的映像檔：%s"
-
-msgid "Attempted to update Location field for an image not in queued status."
-msgstr "已嘗試更新處於未排入佇列狀態之映像檔的「位置」欄位。"
 
 #, python-format
 msgid "Attribute '%(property)s' is read-only."
@@ -334,11 +187,6 @@ msgstr "僅已排入佇列的映像檔可以取代屬性 container_format。"
 
 msgid "Attribute disk_format can be only replaced for a queued image."
 msgstr "僅已排入佇列的映像檔可以取代屬性 disk_format。"
-
-msgid ""
-"Auth key for the user authenticating against the Swift authentication "
-"service. (deprecated)"
-msgstr "針對 Swift 鑑別服務進行使用者鑑別的鑑別金鑰。（已淘汰）"
 
 #, python-format
 msgid "Auth service at URL %(url)s not found."
@@ -369,10 +217,6 @@ msgid "Bad header: %(header_name)s"
 msgstr "錯誤的標頭：%(header_name)s"
 
 #, python-format
-msgid "Bad value passed to filter %(filter)s got %(val)s"
-msgstr "傳遞給過濾器 %(filter)s 的值不正確，取得 %(val)s"
-
-#, python-format
 msgid "Badly formed S3 URI: %(uri)s"
 msgstr "S3 URI 的格式不正確：%(uri)s"
 
@@ -383,27 +227,8 @@ msgstr "Swift URI 中認證 '%(creds)s' 的格式不正確"
 msgid "Badly formed credentials in Swift URI."
 msgstr "Swift URI 中認證的格式不正確。"
 
-msgid "Base directory that the image cache uses."
-msgstr "映像檔快取所使用的基本目錄。"
-
-msgid "BinaryObject property cannot be declared mutable"
-msgstr "不能反覆宣告 BinaryObject 內容"
-
-#, python-format
-msgid "Blob %(name)s may not have multiple values"
-msgstr "二進位大型物件 %(name)s 不能具有多個值"
-
-msgid "Blob size is not set"
-msgstr "未設定二進位大型物件大小"
-
 msgid "Body expected in request."
 msgstr "要求中需要內文。"
-
-msgid "Both file and legacy_image_id may not be specified at the same time"
-msgstr "不能同時指定檔案和 legacy_image_id"
-
-msgid "CA certificate file to use to verify connecting clients."
-msgstr "要用來驗證連接用戶端的 CA 憑證檔。"
 
 msgid "Cannot be a negative value"
 msgstr "不能是負數值"
@@ -415,13 +240,6 @@ msgstr "不能是負數值。"
 msgid "Cannot convert image %(key)s '%(value)s' to an integer."
 msgstr "無法將映像檔 %(key)s '%(value)s' 轉換為整數。"
 
-msgid "Cannot declare artifact property with reserved name 'metadata'"
-msgstr "無法宣告具有保留名稱 'metadata' 的構件內容"
-
-#, python-format
-msgid "Cannot load artifact '%(name)s'"
-msgstr "無法載入構件 '%(name)s'"
-
 msgid "Cannot remove last location in the image."
 msgstr "無法移除映像檔中的最後位置。"
 
@@ -431,34 +249,6 @@ msgstr "無法儲存映像檔 %(image_id)s 的資料：%(error)s"
 
 msgid "Cannot set locations to empty list."
 msgstr "無法將位置設為空白清單。"
-
-msgid "Cannot specify 'max_size' explicitly"
-msgstr "無法明確指定 'max_size'"
-
-msgid "Cannot specify 'min_size' explicitly"
-msgstr "無法明確指定 'min_size'"
-
-msgid "Cannot upload to an unqueued image"
-msgstr "無法上傳至未排入佇列的映像檔"
-
-#, python-format
-msgid "Cannot use this parameter with the operator %(op)s"
-msgstr "無法將此參數與運算子 %(op)s 搭配使用"
-
-msgid "Certificate file to use when starting API server securely."
-msgstr "安全啟動 API 伺服器時要使用的憑證檔。"
-
-#, python-format
-msgid "Certificate format not supported: %s"
-msgstr "憑證格式不受支援：%s"
-
-#, python-format
-msgid "Certificate is not valid after: %s UTC"
-msgstr "在世界標準時間 %s 之後，憑證無效"
-
-#, python-format
-msgid "Certificate is not valid before: %s UTC"
-msgstr "在世界標準時間 %s 之前，憑證無效"
 
 #, python-format
 msgid "Checksum verification failed. Aborted caching of image '%s'."
@@ -480,12 +270,6 @@ msgstr "將錯誤/不當的要求連接至 URL %(url)s 處的鑑別服務。"
 #, python-format
 msgid "Constructed URL: %s"
 msgstr "已建構 URL：%s"
-
-msgid "Container format is not specified."
-msgstr "未指定儲存器格式。"
-
-msgid "Content-Type must be application/octet-stream"
-msgstr "內容類型必須是 application/octet-stream"
 
 #, python-format
 msgid "Corrupt image download for image %(image_id)s"
@@ -527,9 +311,6 @@ msgstr "無法更新映像檔：%s"
 
 msgid "Currently, OVA packages containing multiple disk are not supported."
 msgstr "目前，不支援包含多個磁碟的 OVA 套件。"
-
-msgid "Custom validators list should contain tuples '(function, message)'"
-msgstr "自訂驗證器清單應包含值組 '(function, message)'"
 
 #, python-format
 msgid "Data for image_id not found: %s"
@@ -583,18 +364,6 @@ msgstr "此資源的更新日期時間"
 msgid "Datetime when this resource would be subject to removal"
 msgstr "可能會移除此資源的日期時間"
 
-msgid ""
-"Default value for the number of items returned by a request if not specified "
-"explicitly in the request"
-msgstr "未在要求中明確指定項目數的情況下由要求所傳回的項目數預設值"
-
-msgid "Default value is invalid"
-msgstr "預設值無效"
-
-#, python-format
-msgid "Denying attempt to upload artifact because it exceeds the quota: %s"
-msgstr "正在拒絕嘗試上傳構件，因為它已超出配額：%s"
-
 #, python-format
 msgid "Denying attempt to upload image because it exceeds the quota: %s"
 msgstr "正在拒絕嘗試上傳映像檔，因為它已超出配額：%s"
@@ -603,60 +372,13 @@ msgstr "正在拒絕嘗試上傳映像檔，因為它已超出配額：%s"
 msgid "Denying attempt to upload image larger than %d bytes."
 msgstr "正在拒絕嘗試上傳大於 %d 個位元組的映像檔。"
 
-#, python-format
-msgid "Dependency property '%s' has to be deleted first"
-msgstr "必須先刪除相依關係內容 '%s'"
-
-msgid "Dependency relations cannot be mutable"
-msgstr "相依關係的關係必須是不可變的"
-
-msgid "Deploy the v1 OpenStack Images API."
-msgstr "部署第 1 版 OpenStack 映像檔 API。"
-
-msgid "Deploy the v1 OpenStack Registry API."
-msgstr "部署第 1 版 OpenStack 登錄 API。"
-
-msgid "Deploy the v2 OpenStack Images API."
-msgstr "部署第 2 版 OpenStack 映像檔 API。"
-
-msgid "Deploy the v2 OpenStack Registry API."
-msgstr "部署第 2 版 OpenStack 登錄 API。"
-
 msgid "Descriptive name for the image"
 msgstr "映像檔的敘述性名稱"
-
-msgid "Dictionary contains unexpected key(s)"
-msgstr "字典包含非預期的索引鍵"
-
-msgid "Dictionary size is greater than maximum"
-msgstr "字典大小大於上限"
-
-msgid "Dictionary size is less than minimum"
-msgstr "字典大小小於下限"
-
-msgid ""
-"Digest algorithm which will be used for digital signature. Use the command "
-"\"openssl list-message-digest-algorithms\" to get the available algorithms "
-"supported by the version of OpenSSL on the platform. Examples are \"sha1\", "
-"\"sha256\", \"sha512\", etc."
-msgstr ""
-"將用於數位簽章的摘要演算法。請使用指令 \"openssl list-message-digest-"
-"algorithms\" 來取得平台上 OpenSSL 版本所支援的可用算法。例如："
-"\"sha1\"、\"sha256\"、\"sha512\" 等。"
-
-msgid "Disk format is not specified."
-msgstr "未指定磁碟格式。"
-
-msgid "Does not match pattern"
-msgstr "不符合型樣"
 
 #, python-format
 msgid ""
 "Driver %(driver_name)s could not be configured correctly. Reason: %(reason)s"
 msgstr "無法正確地配置驅動程式 %(driver_name)s。原因：%(reason)s"
-
-msgid "Either a file or a legacy_image_id has to be specified"
-msgstr "必須指定檔案或 legacy_image_id"
 
 msgid ""
 "Error decoding your request. Either the URL or the request body contained "
@@ -668,17 +390,8 @@ msgstr ""
 msgid "Error fetching members of image %(image_id)s: %(inner_msg)s"
 msgstr "提取映像檔 %(image_id)s 的成員時發生錯誤：%(inner_msg)s"
 
-msgid "Error in store configuration. Adding artifacts to store is disabled."
-msgstr "儲存庫配置發生錯誤。已停用新增構件至儲存庫。"
-
 msgid "Error in store configuration. Adding images to store is disabled."
 msgstr "儲存庫配置發生錯誤。已停用新增映像檔至儲存庫。"
-
-msgid "Error occurred while creating the verifier"
-msgstr "建立驗證器時發生錯誤"
-
-msgid "Error occurred while verifying the signature"
-msgstr "驗證簽章時發生錯誤"
 
 msgid "Expected a member in the form: {\"member\": \"image_id\"}"
 msgstr "預期成員的格式為：{\"member\": \"image_id\"}"
@@ -686,36 +399,13 @@ msgstr "預期成員的格式為：{\"member\": \"image_id\"}"
 msgid "Expected a status in the form: {\"status\": \"status\"}"
 msgstr "預期狀態的格式為：{\"status\": \"status\"}"
 
-msgid "External source should not be empty"
-msgstr "外部來源不應是空的"
-
-#, python-format
-msgid "External sources are not supported: '%s'"
-msgstr "不支援外部來源：'%s'"
-
-#, python-format
-msgid "Failed to activate image. Got error: %s"
-msgstr "無法啟動映像檔。發生錯誤：%s"
-
 #, python-format
 msgid "Failed to add image metadata. Got error: %s"
 msgstr "無法新增映像檔 meta 資料。發生錯誤：%s"
 
 #, python-format
-msgid "Failed to find artifact %(artifact_id)s to delete"
-msgstr "找不到要刪除的構件 %(artifact_id)s"
-
-#, python-format
 msgid "Failed to find image %(image_id)s to delete"
 msgstr "找不到要刪除的映像檔 %(image_id)s"
-
-#, python-format
-msgid "Failed to find image to delete: %s"
-msgstr "找不到要刪除的映像檔：%s"
-
-#, python-format
-msgid "Failed to find image to update: %s"
-msgstr "找不到要更新的映像檔：%s"
 
 #, python-format
 msgid "Failed to find resource type %(resourcetype)s to delete"
@@ -728,10 +418,6 @@ msgstr "無法起始設定映像檔快取資料庫。發生錯誤：%s"
 #, python-format
 msgid "Failed to read %s from config"
 msgstr "無法從配置中讀取 %s"
-
-#, python-format
-msgid "Failed to reserve image. Got error: %s"
-msgstr "無法保留映像檔。發生錯誤：%s"
 
 #, python-format
 msgid "Failed to update image metadata. Got error: %s"
@@ -762,40 +448,8 @@ msgid ""
 "data."
 msgstr "不容許檔案型匯入。請使用映像檔資料的非本端來源。"
 
-msgid "File too large"
-msgstr "檔案太大"
-
-msgid "File too small"
-msgstr "檔案太小"
-
 msgid "Forbidden image access"
 msgstr "已禁止映像檔存取"
-
-#, python-format
-msgid "Forbidden to delete a %s image."
-msgstr "已禁止刪除 %s 映像檔。"
-
-#, python-format
-msgid "Forbidden to delete image: %s"
-msgstr "已禁止刪除映像檔：%s"
-
-#, python-format
-msgid "Forbidden to modify '%(key)s' of %(status)s image."
-msgstr "已禁止修改 %(status)s 映像檔的 '%(key)s'。"
-
-#, python-format
-msgid "Forbidden to modify '%s' of image."
-msgstr "禁止修改映像檔的 '%s'。"
-
-msgid "Forbidden to reserve image."
-msgstr "已禁止保留映像檔。"
-
-msgid "Forbidden to update deleted image."
-msgstr "已禁止更新所刪除的映像檔。"
-
-#, python-format
-msgid "Forbidden to update image: %s"
-msgstr "已禁止更新映像檔：%s"
 
 #, python-format
 msgid "Forbidden upload attempt: %s"
@@ -816,17 +470,6 @@ msgid "Format of the disk"
 msgstr "磁碟的格式"
 
 #, python-format
-msgid "Get blob %(name)s data failed: %(err)s."
-msgstr "取得二進位大型物件 %(name)s 資料失敗：%(err)s。"
-
-#, python-format
-msgid "Get image %(id)s data failed: %(err)s."
-msgstr "取得映像檔 %(id)s 資料時失敗：%(err)s。"
-
-msgid "Glance client not installed"
-msgstr "未安裝 Glance 用戶端"
-
-#, python-format
 msgid "Host \"%s\" is not valid."
 msgstr "主機 \"%s\" 無效。"
 
@@ -838,24 +481,6 @@ msgid ""
 "Human-readable informative message only included when appropriate (usually "
 "on failure)"
 msgstr "適當的時候（通常是失敗時）僅併入人類可讀的參考訊息"
-
-msgid "If False doesn't trace SQL requests."
-msgstr "如果為 False，則將不追蹤 SQL 要求。"
-
-msgid "If False fully disable profiling feature."
-msgstr "如果為 False，則將完全停用側寫功能。"
-
-msgid ""
-"If False, server will return the header \"Connection: close\", If True, "
-"server will return \"Connection: Keep-Alive\" in its responses. In order to "
-"close the client socket connection explicitly after the response is sent and "
-"read successfully by the client, you simply have to set this option to False "
-"when you create a wsgi server."
-msgstr ""
-"如果為 False，則伺服器將在其回應中傳回標頭 \"Connection: close\"，如果為 "
-"True，則伺服器將傳回 \"Connection: Keep-Alive\"。若要在傳送回應且用戶端已順利"
-"讀取回應之後明確關閉用戶端 Socket 連線，您只需在建立 wsgi 伺服器時，將此選項"
-"設定為 False。"
 
 msgid "If true, image will not be deletable."
 msgstr "如果為 true，則映像檔不可刪除。"
@@ -914,19 +539,9 @@ msgstr "映像檔超出儲存體配額：%s"
 msgid "Image id is required."
 msgstr "映像檔 ID 是必要的。"
 
-msgid "Image is protected"
-msgstr "映像檔是受保護的"
-
 #, python-format
 msgid "Image member limit exceeded for image %(id)s: %(e)s:"
 msgstr "已超出映像檔 %(id)s 的映像檔成員限制：%(e)s："
-
-#, python-format
-msgid "Image name too long: %d"
-msgstr "映像檔名稱太長：%d"
-
-msgid "Image operation conflicts"
-msgstr "映像檔作業衝突"
 
 #, python-format
 msgid ""
@@ -950,10 +565,6 @@ msgid "Image with identifier %s already exists!"
 msgstr "ID 為 %s 的映像檔已存在！"
 
 #, python-format
-msgid "Image with identifier %s has been deleted."
-msgstr "已刪除 ID 為 %s 的映像檔。"
-
-#, python-format
 msgid "Image with identifier %s not found"
 msgstr "找不到 ID 為 %s 的映像檔"
 
@@ -971,39 +582,17 @@ msgstr "不正確的鑑別策略，需要 \"%(expected)s\"，但收到 \"%(recei
 msgid "Incorrect request: %s"
 msgstr "不正確的要求：%s"
 
-msgid "Index is out of range"
-msgstr "索引超出範圍"
-
-msgid "Index is required"
-msgstr "索引是必要的"
-
 #, python-format
 msgid "Input does not contain '%(key)s' field"
 msgstr "輸入不包含 '%(key)s' 欄位"
-
-#, python-format
-msgid "Insufficient permissions on artifact storage media: %s"
-msgstr "對構件儲存媒體的許可權不足：%s"
 
 #, python-format
 msgid "Insufficient permissions on image storage media: %s"
 msgstr "對映像檔儲存媒體的許可權不足：%s"
 
 #, python-format
-msgid "Invalid Content-Type for work with %s"
-msgstr "用來與 %s 搭配使用的 Content-Type 無效"
-
-#, python-format
 msgid "Invalid JSON pointer for this resource: '/%s'"
 msgstr "此資源的 JSON 指標無效：'/%s'"
-
-#, python-format
-msgid "Invalid certificate format: %s"
-msgstr "無效的憑證格式：%s"
-
-#, python-format
-msgid "Invalid checksum '%s': can't exceed 32 characters"
-msgstr "無效的總和檢查 '%s'：不能超過 32 個字元"
 
 msgid "Invalid configuration in glance-swift conf file."
 msgstr "glance-swift 配置檔中的配置無效。"
@@ -1012,22 +601,8 @@ msgid "Invalid configuration in property protection file."
 msgstr "內容保護檔案中的配置無效。"
 
 #, python-format
-msgid "Invalid container format '%s' for image."
-msgstr "映像檔的儲存器格式 '%s' 無效。"
-
-#, python-format
 msgid "Invalid content type %(content_type)s"
 msgstr "無效的內容類型 %(content_type)s"
-
-msgid "Invalid dict property type"
-msgstr "無效的字典內容類型"
-
-msgid "Invalid dict property type specification"
-msgstr "無效的字典內容類型規格"
-
-#, python-format
-msgid "Invalid disk format '%s' for image."
-msgstr "映像檔的磁碟格式 '%s' 無效。"
 
 #, python-format
 msgid "Invalid filter value %s. The quote is not closed."
@@ -1043,29 +618,11 @@ msgid ""
 "Invalid filter value %s. There is no comma before opening quotation mark."
 msgstr "無效的過濾器值 %s。左引號前面沒有逗點。"
 
-#, python-format
-msgid "Invalid headers \"Content-Type\": %s"
-msgstr "無效的標頭 \"Content-Type\"：%s"
-
 msgid "Invalid image id format"
 msgstr "無效的映像檔 ID 格式"
 
-msgid "Invalid item type specification"
-msgstr "無效的項目類型規格"
-
-#, python-format
-msgid "Invalid json body: %s"
-msgstr "無效的 JSON 內文：%s"
-
-msgid "Invalid jsonpatch request"
-msgstr "無效的 jsonpatch 要求"
-
 msgid "Invalid location"
 msgstr "無效的位置"
-
-#, python-format
-msgid "Invalid location %s"
-msgstr "無效的位置 %s"
 
 #, python-format
 msgid "Invalid location: %s"
@@ -1092,20 +649,8 @@ msgid "Invalid marker. Image could not be found."
 msgstr "無效的標記。找不到映像檔。"
 
 #, python-format
-msgid "Invalid mask_gen_algorithm: %s"
-msgstr "無效的 mask_gen_algorithm：%s"
-
-#, python-format
 msgid "Invalid membership association: %s"
 msgstr "無效的成員資格關聯：%s"
-
-msgid ""
-"Invalid mix of disk and container formats. When setting a disk or container "
-"format to one of 'aki', 'ari', or 'ami', the container and disk formats must "
-"match."
-msgstr ""
-"磁碟格式及儲存器格式的混合無效。將磁碟格式或儲存器格式設為 'aki'、'ari' 或 "
-"'ami' 其中之一時，儲存器格式及磁碟格式必須相符。"
 
 #, python-format
 msgid ""
@@ -1118,48 +663,12 @@ msgstr "用於新增位置的位置無效。"
 msgid "Invalid position for removing a location."
 msgstr "用於移除位置的位置無效。"
 
-msgid "Invalid property definition"
-msgstr "無效的內容定義"
-
-#, python-format
-msgid "Invalid pss_salt_length: %s"
-msgstr "無效的 pss_salt_length：%s"
-
-#, python-format
-msgid "Invalid public key type for signature key type: %s"
-msgstr "簽章金鑰類型的公開金鑰類型無效：%s"
-
-msgid "Invalid reference list specification"
-msgstr "無效的參照清單規格"
-
-msgid "Invalid referenced type"
-msgstr "無效的參照類型"
-
-msgid "Invalid request PATCH for work with blob"
-msgstr "用來與 Blob 搭配使用的要求 PATCH 無效"
-
 msgid "Invalid service catalog json."
 msgstr "無效的服務型錄 JSON。"
 
 #, python-format
-msgid "Invalid signature hash method: %s"
-msgstr "無效的簽章雜湊方法：%s"
-
-#, python-format
-msgid "Invalid signature key type: %s"
-msgstr "無效的簽章金鑰類型：%s"
-
-#, python-format
 msgid "Invalid sort direction: %s"
 msgstr "無效的排序方向：%s"
-
-#, python-format
-msgid ""
-"Invalid sort key: %(sort_key)s. If type version is not set it must be one of "
-"the following: %(available)s."
-msgstr ""
-"無效的排序鍵：%(sort_key)s。如果未設定類型版本，則它必須是下列其中一項："
-"%(available)s。"
 
 #, python-format
 msgid ""
@@ -1168,23 +677,12 @@ msgid ""
 msgstr "排序鍵 %(sort_key)s 無效。它必須為下列其中一項：%(available)s。"
 
 #, python-format
-msgid "Invalid sort key: %(sort_key)s. You cannot sort by this property"
-msgstr "無效的排序鍵：%(sort_key)s。您無法依此內容進行排序"
-
-#, python-format
 msgid "Invalid status value: %s"
 msgstr "無效的狀態值：%s"
 
 #, python-format
 msgid "Invalid status: %s"
 msgstr "無效的狀態：%s"
-
-#, python-format
-msgid "Invalid time format for %s."
-msgstr "%s 的時間格式無效。"
-
-msgid "Invalid type definition"
-msgstr "無效的類型定義"
 
 #, python-format
 msgid "Invalid type value: %s"
@@ -1232,23 +730,6 @@ msgstr "選項 %(option)s 的值 %(value)s 無效"
 msgid "Invalid visibility value: %s"
 msgstr "無效的可見性值：%s"
 
-msgid "Is not allowed value"
-msgstr "不是容許的值"
-
-#, python-format
-msgid ""
-"It appears that the eventlet module has been imported prior to setting "
-"%s='yes'. It is currently necessary to disable eventlet.greendns if using "
-"ipv6 since eventlet.greendns currently breaks with ipv6 addresses. Please "
-"ensure that eventlet is not imported prior to this being set."
-msgstr ""
-"eventlet 模組似乎已在設定 %s='yes' 之前匯入。如果使用 ipv6，則目前需要停用 "
-"eventlet.greendns，因為 eventlet.greendns 目前以 ipv6 位址岔斷。請確保未在設"
-"定此項之前匯入 eventlet。"
-
-msgid "It's invalid to provide multiple image sources."
-msgstr "提供多個映像檔來源是無效的做法。"
-
 msgid "It's not allowed to add locations if locations are invisible."
 msgstr "如果位置是隱藏的，則不容許新增位置。"
 
@@ -1258,107 +739,18 @@ msgstr "如果位置是隱藏的，則不容許移除位置。"
 msgid "It's not allowed to update locations if locations are invisible."
 msgstr "如果位置是隱藏的，則不容許更新位置。"
 
-msgid "Items have to be unique"
-msgstr "項目必須是唯一的"
-
-msgid ""
-"Json path should start with a '/', end with no '/', no 2 subsequent '/' are "
-"allowed."
-msgstr "JSON 路徑應以 '/' 開頭並以 '/' 結尾，不容許兩個連續的 '/'。"
-
-msgid "Legacy image was not found"
-msgstr "找不到舊式映像檔"
-
-msgid "Length  is greater than maximum"
-msgstr "長度大於上限"
-
-msgid "Length is less than minimum"
-msgstr "長度小於下限"
-
-msgid "Limit param must be an integer"
-msgstr "限制參數必須是整數"
-
-msgid "Limit param must be positive"
-msgstr "限制參數必須是正數"
-
-#, python-format
-msgid "Limit param must not be higher than %d"
-msgstr "限制參數不得高於 %d"
-
-msgid "Limits request ID length."
-msgstr "限制要求 ID 長度。"
-
-msgid "List definitions may hot have defaults"
-msgstr "清單定義可能沒有預設值"
-
 msgid "List of strings related to the image"
 msgstr "與映像檔相關的字串清單"
-
-msgid "List size is greater than maximum"
-msgstr "清單大小大於上限"
-
-msgid "List size is less than minimum"
-msgstr "清單大小小於下限"
-
-msgid "Loop time between checking for new items to schedule for delete."
-msgstr "檢查要排程進行刪除之新項目之間的迴圈時間。"
-
-#, python-format
-msgid "Malformed Content-Range header: %s"
-msgstr "形態異常的內容範圍標頭：%s"
 
 msgid "Malformed JSON in request body."
 msgstr "要求內文中 JSON 的格式不正確。"
 
-msgid "Max string length may not exceed 255 characters"
-msgstr "字串長度上限不能超過 255 個字元"
-
 msgid "Maximal age is count of days since epoch."
 msgstr "經歷時間上限是自新紀元以來的天數。"
-
-msgid ""
-"Maximum line size of message headers to be accepted. max_header_line may "
-"need to be increased when using large tokens (typically those generated by "
-"the Keystone v3 API with big service catalogs"
-msgstr ""
-"要接受的訊息標頭行大小上限。如果使用大記號（通常是那些由 Keystone 第 3 版 "
-"API 透過大型服務型錄所產生的記號），則可能需要增加 max_header_line 值"
-
-msgid ""
-"Maximum number of image members per image. Negative values evaluate to "
-"unlimited."
-msgstr "每個映像檔的映像檔成員數目上限。負數值求值為無限制。"
-
-msgid ""
-"Maximum number of locations allowed on an image. Negative values evaluate to "
-"unlimited."
-msgstr "映像檔上所容許的位置數目上限。負數值求值為無限制值。"
-
-msgid ""
-"Maximum number of properties allowed on an image. Negative values evaluate "
-"to unlimited."
-msgstr "映像檔上所容許的內容數目上限。負數值求值為無限制值。"
-
-msgid ""
-"Maximum number of tags allowed on an image. Negative values evaluate to "
-"unlimited."
-msgstr "映像檔上所容許的標籤數目上限。負數值求值為無限制。"
-
-msgid "Maximum permissible number of items that could be returned by a request"
-msgstr "要求可以傳回的所允許項目數上限"
 
 #, python-format
 msgid "Maximum redirects (%(redirects)s) was exceeded."
 msgstr "已超出重新導向數目上限（%(redirects)s 個）。"
-
-msgid ""
-"Maximum size of image a user can upload in bytes. Defaults to 1099511627776 "
-"bytes (1 TB).WARNING: this value should only be increased after careful "
-"consideration and must be set to a value under 8 EB (9223372036854775808)."
-msgstr ""
-"使用者可以上傳的映像檔大小上限（以位元組為單位）。預設為1099511627776 個位元"
-"組 (1 TB)。警告：應僅在經過慎重考慮之後才增大此值，且必須設定為小於 8 EB "
-"(9223372036854775808) 的值。"
 
 #, python-format
 msgid "Member %(member_id)s is duplicated for image %(image_id)s"
@@ -1382,10 +774,6 @@ msgstr "Meta 資料定義名稱空間 %(namespace)s 受保護，無法將其刪�
 #, python-format
 msgid "Metadata definition namespace not found for id=%s"
 msgstr "找不到 ID 為 %s 的 meta 資料定義名稱空間"
-
-#, python-format
-msgid "Metadata definition namespace=%(namespace_name)swas not found."
-msgstr "找不到 meta 資料定義名稱空間 %(namespace_name)s。"
 
 #, python-format
 msgid ""
@@ -1429,9 +817,6 @@ msgstr "meta 資料定義標籤 %(tag_name)s 受保護，無法將其刪除。"
 msgid "Metadata definition tag not found for id=%s"
 msgstr "找不到 ID 為 %s 的 meta 資料定義標籤"
 
-msgid "Min string length may not be negative"
-msgstr "字串長度下限不能為負數"
-
 msgid "Minimal rows limit is 1."
 msgstr "列數下限限制為 1。"
 
@@ -1447,16 +832,6 @@ msgstr ""
 "區域 %(region)s 有多個「映像檔」服務相符項。這通常表示需要一個區域，但您尚未"
 "提供。"
 
-msgid "Must supply a positive, non-zero value for age."
-msgstr "必須為經歷時間提供非零正數值。"
-
-msgid "Name of the paste configuration file."
-msgstr "paste 配置檔的名稱。"
-
-#, python-format
-msgid "No artifact found with ID %s"
-msgstr "找不到 ID 為 %s 的構件"
-
 msgid "No authenticated user"
 msgstr "沒有已鑑別使用者"
 
@@ -1470,38 +845,6 @@ msgstr "從映像檔 %(img)s 中找不到 ID 為 %(loc)s 的位置"
 
 msgid "No permission to share that image"
 msgstr "沒有共用該映像檔的許可權"
-
-#, python-format
-msgid "No plugin for '%(name)s' has been loaded"
-msgstr "未載入 '%(name)s' 的外掛程式"
-
-msgid "No property to access"
-msgstr "沒有要存取的內容"
-
-#, python-format
-msgid "No such key '%s' in a dict"
-msgstr "字典中沒有此類鍵 '%s'"
-
-#, python-format
-msgid "Not a blob property '%s'"
-msgstr "不是二進位大型物件內容 '%s'"
-
-msgid "Not a downloadable entity"
-msgstr "不是可下載的實體"
-
-msgid "Not a list property"
-msgstr "不是清單內容"
-
-#, python-format
-msgid "Not a list property '%s'"
-msgstr "不是清單內容 '%s'"
-
-msgid "Not a valid value type"
-msgstr "不是有效的值類型"
-
-#, python-format
-msgid "Not all dependencies are in '%s' state"
-msgstr "並非所有相依關係都處於 '%s' 狀態"
 
 #, python-format
 msgid "Not allowed to create members for image %s."
@@ -1539,32 +882,14 @@ msgstr "不容許更新映像檔 %s 的標籤。"
 msgid "Not allowed to upload image data for image %(image_id)s: %(error)s"
 msgstr "不容許上傳映像檔 %(image_id)s 的映像檔資料：%(error)s"
 
-#, python-format
-msgid "Not an array idx '%s'"
-msgstr "不是陣列 idx '%s'"
-
 msgid "Number of sort dirs does not match the number of sort keys"
 msgstr "排序方向數目與排序鍵數目不符"
 
 msgid "OVA extract is limited to admin"
 msgstr "OVA 擷取已限制為管理者"
 
-msgid ""
-"OVF metadata of interest was not specified in ovf-metadata.json config file. "
-"Please set \"cim_pasd\" to a list of interested "
-"CIM_ProcessorAllocationSettingData properties."
-msgstr ""
-"在 ovf-metadata.json 配置檔中，未指定相關 OVF meta 資料。請將 \"cim_pasd\" 設"
-"為相關 CIM_ProcessorAllocationSettingData 內容的清單。"
-
-msgid "OVF properties config file \"ovf-metadata.json\" was not found."
-msgstr "找不到 OVF 內容配置檔 \"ovf-metadata.json\"。"
-
 msgid "Old and new sorting syntax cannot be combined"
 msgstr "無法結合新舊排序語法"
-
-msgid "Only list indexes are allowed for blob lists"
-msgstr "二進位大型物件清單只接受清單索引"
 
 #, python-format
 msgid "Operation \"%s\" requires a member named \"value\"."
@@ -1585,10 +910,6 @@ msgid "Operations must be JSON objects."
 msgstr "作業必須是 JSON 物件。"
 
 #, python-format
-msgid "Operator %(op)s is not supported"
-msgstr "運算子 %(op)s 不受支援"
-
-#, python-format
 msgid "Original locations is not empty: %s"
 msgstr "原始位置不是空的：%s"
 
@@ -1606,21 +927,6 @@ msgstr "名稱空間的擁有者。"
 
 msgid "Param values can't contain 4 byte unicode."
 msgstr "參數值不能包含 4 位元組 Unicode。"
-
-msgid ""
-"Partial name of a pipeline in your paste configuration file with the service "
-"name removed. For example, if your paste section name is [pipeline:glance-"
-"api-keystone] use the value \"keystone\""
-msgstr ""
-"paste 配置檔中 pipeline 的部分名稱（移除了服務名稱）。比方說，如果 paste 區段"
-"名稱為[pipeline:glance-api-keystone]，請使用值 \"keystone\""
-
-msgid "Path to the directory where json metadata files are stored"
-msgstr "在其中儲存 JSON meta 資料檔的目錄路徑"
-
-#, python-format
-msgid "Plugin name '%(plugin)s' should match artifact typename '%(name)s'"
-msgstr "外掛程式名稱 '%(plugin)s' 應該與構件類型名稱 '%(name)s' 相符"
 
 #, python-format
 msgid "Pointer `%s` contains \"~\" not part of a recognized escape sequence."
@@ -1642,24 +948,9 @@ msgstr "指標 `%s` 的開頭不是 \"/\"。"
 msgid "Pointer `%s` end with \"/\"."
 msgstr "指標 `%s` 的結尾是 \"/\"。"
 
-msgid ""
-"Pointer contains '~' which is not part of a recognized escape sequence [~0, "
-"~1]."
-msgstr "指標所包含的 '~' 不是可辨識 ESC 序列 [~0, ~1] 的一部分。"
-
 #, python-format
 msgid "Port \"%s\" is not valid."
 msgstr "埠 \"%s\" 無效。"
-
-msgid "Port the registry server is listening on."
-msgstr "登錄伺服器正在其上接聽的埠。"
-
-#, python-format
-msgid "Prerelease numeric component is too large (%d characters max)"
-msgstr "Prerelease 數值元件太大（上限為 %d 個字元）"
-
-msgid "Private key file to use when starting API server securely."
-msgstr "安全啟動 API 伺服器時要使用的私密金鑰檔。"
 
 #, python-format
 msgid "Process %d not running"
@@ -1691,36 +982,8 @@ msgstr "可能無法移除內容 %s。"
 msgid "Property %s must be set prior to saving data."
 msgstr "儲存資料之前必須設定內容 %s。"
 
-#, python-format
-msgid "Property '%(name)s' may not have value '%(val)s': %(msg)s"
-msgstr "內容 '%(name)s' 可能沒有值 '%(val)s'：%(msg)s"
-
-#, python-format
-msgid "Property '%s' is protected"
-msgstr "內容 '%s' 受保護"
-
 msgid "Property names can't contain 4 byte unicode."
 msgstr "內容名稱不能包含 4 位元組 Unicode。"
-
-#, python-format
-msgid ""
-"Property protection on operation %(operation)s for rule %(rule)s is not "
-"found. No role will be allowed to perform this operation."
-msgstr ""
-"找不到規則 %(rule)s 的作業 %(operation)s 上的內容保護。將不容許任何角色執行此"
-"作業。"
-
-#, python-format
-msgid "Property's %(prop)s value has not been found"
-msgstr "找不到內容 %(prop)s 的值"
-
-#, python-format
-msgid ""
-"Provided image size must match the stored image size. (provided size: "
-"%(ps)d, stored size: %(ss)d)"
-msgstr ""
-"提供的映像檔大小必須符合儲存的映像檔大小。（提供的大小：%(ps)d，儲存的大小："
-"%(ss)d）"
 
 #, python-format
 msgid "Provided object does not match schema '%(schema)s': %(reason)s"
@@ -1737,22 +1000,6 @@ msgstr "提供的作業類型 %(type)s 不受支援"
 msgid "Provides a user friendly description of the namespace."
 msgstr "提供對使用者更為友善的名稱空間說明。"
 
-msgid "Public images do not have members."
-msgstr "公用映像檔沒有成員。"
-
-msgid ""
-"Public url to use for versions endpoint. The default is None, which will use "
-"the request's host_url attribute to populate the URL base. If Glance is "
-"operating behind a proxy, you will want to change this to represent the "
-"proxy's URL."
-msgstr ""
-"要用於版本端點的公用 URL。預設值為 None，這將會使用要求的 host_url 屬性來移入"
-"基本 URL。如果 Glance 在 Proxy 後方作業，您將會想要變更此項以代表Proxy 的 "
-"URL。"
-
-msgid "Python module path of data access API"
-msgstr "資料存取 API 的 Python 模組路徑"
-
 msgid "Received invalid HTTP redirect."
 msgstr "收到無效的 HTTP 重新導向。"
 
@@ -1767,10 +1014,6 @@ msgstr "登錄服務無法使用 %s"
 #, python-format
 msgid "Registry was not configured correctly on API server. Reason: %(reason)s"
 msgstr "API 伺服器上未正確地配置登錄。原因：%(reason)s"
-
-#, python-format
-msgid "Relation %(name)s may not have multiple values"
-msgstr "關係 %(name)s 不能具有多個值"
 
 #, python-format
 msgid "Reload of %(serv)s not supported"
@@ -1791,15 +1034,6 @@ msgid "Request must be a list of commands"
 msgstr "要求必須是指令清單"
 
 msgid ""
-"Required image properties for signature verification do not exist. Cannot "
-"verify signature."
-msgstr "簽章驗證所需的映像檔內容不存在。無法驗證簽章。"
-
-#, python-format
-msgid "Required store %s is invalid"
-msgstr "需要的儲存庫 %s 無效"
-
-msgid ""
 "Resource type names should be aligned with Heat resource types whenever "
 "possible: http://docs.openstack.org/developer/heat/template_guide/openstack."
 "html"
@@ -1810,27 +1044,11 @@ msgstr ""
 msgid "Response from Keystone does not contain a Glance endpoint."
 msgstr "Keystone 的回應不包含 Glance 端點。"
 
-msgid "Role used to identify an authenticated user as administrator."
-msgstr "用來將已鑑別使用者識別為管理者的角色。"
-
-msgid ""
-"Run as a long-running process. When not specified (the default) run the "
-"scrub operation once and then exits. When specified do not exit and run "
-"scrub on wakeup_time interval as specified in the config."
-msgstr ""
-"作為長時間執行程序來執行。當未指定時（預設值），執行清除作業一次，然後結束。"
-"當指定時，不結束，並依據配置中指定的 wakeup_time 間隔來執行清除。"
-
 msgid "Scope of image accessibility"
 msgstr "映像檔的可存取性範圍"
 
 msgid "Scope of namespace accessibility."
 msgstr "名稱空間的可存取性範圍。"
-
-msgid ""
-"Secret key to use to sign Glance API and Glance Registry services tracing "
-"messages."
-msgstr "用來簽署 Glance API 及「Glance 登錄」追蹤訊息的秘密金鑰。"
 
 #, python-format
 msgid "Server %(serv)s is stopped"
@@ -1840,29 +1058,8 @@ msgstr "伺服器 %(serv)s 已停止"
 msgid "Server worker creation failed: %(reason)s."
 msgstr "建立伺服器工作程式失敗：%(reason)s。"
 
-msgid ""
-"Set a system wide quota for every user. This value is the total capacity "
-"that a user can use across all storage systems. A value of 0 means unlimited."
-"Optional unit can be specified for the value. Accepted units are B, KB, MB, "
-"GB and TB representing Bytes, KiloBytes, MegaBytes, GigaBytes and TeraBytes "
-"respectively. If no unit is specified then Bytes is assumed. Note that there "
-"should not be any space between value and unit and units are case sensitive."
-msgstr ""
-"給每個使用者設定系統通用的配額。此值是使用者可以在所有儲存體系統上使用的總容"
-"量。值 0 表示無限制。可以為該值指定選用單位。接受的單位有B、KB、MB、GB 和 "
-"TB，分別代表位元組、千位元組、百萬位元組、十億位元組和兆位元組。如果未指定單"
-"位，則將採用位元組。請注意，在值與單位之間不應有任何空格，並且單位區分大小"
-"寫。"
-
-#, python-format
-msgid "Show level %(shl)s is not supported in this operation"
-msgstr "顯示層次 %(shl)s 在此作業中不受支援"
-
 msgid "Signature verification failed"
 msgstr "簽章驗證失敗"
-
-msgid "Signature verification failed."
-msgstr "簽章驗證失敗。"
 
 msgid "Size of image file in bytes"
 msgstr "映像檔的大小（以位元組為單位）"
@@ -1890,9 +1087,6 @@ msgid ""
 msgstr ""
 "指定要用於給定資源類型的字首。將名稱空間內的任何內容套用至指定的資源類型時，"
 "都應該為該內容新增此字首。必須包括字首分隔字元（例如，冒號 :）。"
-
-msgid "Specifies which task executor to be used to run the task scripts."
-msgstr "指定要用於執行作業 Script 的作業執行程式。"
 
 msgid "Status must be \"pending\", \"accepted\" or \"rejected\"."
 msgstr "狀態必須是 \"pending\"、\"accepted\" 或 \"rejected\"。"
@@ -1983,10 +1177,6 @@ msgstr ""
 "則可以指定 Keystone 的 URL。"
 
 msgid ""
-"The address where the Swift authentication service is listening.(deprecated)"
-msgstr "Swift 鑑別服務正在接聽的位址。（已淘汰）"
-
-msgid ""
 "The administrators password. If \"use_user_token\" is not in effect, then "
 "admin credentials can be specified."
 msgstr "管理者密碼。如果 \"use_user_token\" 未生效，則可以指定管理認證。"
@@ -1996,26 +1186,9 @@ msgid ""
 "admin credentials can be specified."
 msgstr "管理者使用者名稱。如果 \"use_user_token\" 未生效，則可以指定管理認證。"
 
-msgid "The amount of time in seconds to delay before performing a delete."
-msgstr "執行刪除之前要延遲的時間量（以秒為單位）。"
-
-msgid ""
-"The amount of time to let an incomplete image remain in the cache, before "
-"the cache cleaner, if running, will remove the incomplete image."
-msgstr ""
-"在快取中保留不完整映像檔的時間量，超過該時間量後，快取刪改程式（如果在執行"
-"中）將移除不完整的映像檔。"
-
-msgid ""
-"The backlog value that will be used when creating the TCP listener socket."
-msgstr "建立 TCP 接聽器 Socket 時將使用的待辦事項值。"
-
 #, python-format
 msgid "The cert file you specified %s does not exist"
 msgstr "指定的憑證檔 %s 不存在"
-
-msgid "The config file that has the swift account(s)configs."
-msgstr "具有 Swift 帳戶配置的配置檔。"
 
 msgid "The current status of this task"
 msgstr "此作業的現行狀態"
@@ -2030,41 +1203,12 @@ msgstr ""
 "存放映像檔快取目錄 %(image_cache_dir)s 的裝置不支援 xattr。您可能需要編輯 "
 "fstab 並將 user_xattr 選項新增至存放快取目錄之裝置的適當行。"
 
-msgid "The driver to use for image cache management."
-msgstr "要用於映像檔快取管理的驅動程式。"
-
-#, python-format
-msgid "The format of the version %s is not valid. Use semver notation"
-msgstr "版本 %s 的格式無效。請使用 semver 表示法"
-
-msgid ""
-"The format to which images will be automatically converted. When using the "
-"RBD backend, this should be set to 'raw'"
-msgstr ""
-"映像檔將自動轉換成的格式。當使用 RBD 後端時，應該將此項設為「原始格式」"
-
 #, python-format
 msgid ""
 "The given uri is not valid. Please specify a valid uri from the following "
 "list of supported uri %(supported)s"
 msgstr ""
 "給定的 URI 無效。請從下列受支援的 URI %(supported)s 清單中指定有效的 URI"
-
-msgid "The hostname/IP of the pydev process listening for debug connections"
-msgstr "正在接聽除錯連線之 pydev 處理程序的主機名稱/IP"
-
-#, python-format
-msgid ""
-"The image %s is already present on the slave, but our check for it did not "
-"find it. This indicates that we do not have permissions to see all the "
-"images on the slave server."
-msgstr ""
-"映像檔 %s 已存在於從屬伺服器上，但檢查時並未找到該映像檔。這表示無權查看從屬"
-"伺服器上的所有映像檔。"
-
-#, python-format
-msgid "The incoming artifact blob is too large: %s"
-msgstr "送入的構件二進位大型物件太大：%s"
 
 #, python-format
 msgid "The incoming image is too large: %s"
@@ -2098,12 +1242,6 @@ msgstr ""
 
 #, python-format
 msgid ""
-"The limit has been exceeded on the number of allowed image properties. "
-"Attempted: %(num)s, Maximum: %(quota)s"
-msgstr "容許的映像檔內容數目已超出此限制。已嘗試：%(num)s，上限：%(quota)s"
-
-#, python-format
-msgid ""
 "The limit has been exceeded on the number of allowed image tags. Attempted: "
 "%(attempted)s, Maximum: %(maximum)s"
 msgstr ""
@@ -2116,17 +1254,6 @@ msgstr "位置 %(location)s 已存在"
 #, python-format
 msgid "The location data has an invalid ID: %d"
 msgstr "位置資料的 ID 無效：%d"
-
-msgid ""
-"The location of the property protection file.This file contains the rules "
-"for property protections and the roles/policies associated with it. If this "
-"config value is not specified, by default, property protections won't be "
-"enforced. If a value is specified and the file is not found, then the glance-"
-"api service will not start."
-msgstr ""
-"內容保護檔案的位置。此檔案包含用於內容保護的規則及與之相關聯的角色/原則。如果"
-"未指定此配置值，則依預設，不會強制施行內容保護。如果指定了值但找不到該檔案，"
-"則 glance-api 服務將不會啟動。"
 
 #, python-format
 msgid ""
@@ -2186,83 +1313,11 @@ msgstr ""
 "在下列名稱空間中，找不到名稱為 %(name)s 的 meta 資料定義標籤："
 "%(namespace_name)s。"
 
-msgid "The mode in which the engine will run. Can be 'serial' or 'parallel'."
-msgstr "將用於執行引擎的模式。可以為「串行」或「平行」。"
-
-msgid ""
-"The number of child process workers that will be created to service "
-"requests. The default will be equal to the number of CPUs available."
-msgstr ""
-"將建立用來處理服務要求的子程序工作程式數目。預設值將等於可用的 CPU 數目。"
-
-msgid ""
-"The number of parallel activities executed at the same time by the engine. "
-"The value can be greater than one when the engine mode is 'parallel'."
-msgstr "引擎同時執行的平行活動數目。當引擎模式為「平行」時，該值可以大於 1。"
-
 msgid "The parameters required by task, JSON blob"
 msgstr "作業所需的參數：JSON 二進位大型物件"
 
-msgid ""
-"The path to the cert file to use in SSL connections to the registry server, "
-"if any. Alternately, you may set the GLANCE_CLIENT_CERT_FILE environment "
-"variable to a filepath of the CA cert file"
-msgstr ""
-"要在登錄伺服器的 SSL 連線（如果有的話）中使用的憑證檔案路徑。或者，您可以將 "
-"GLANCE_CLIENT_CERT_FILE 環境變數設定為 CA 憑證檔案的檔案路徑"
-
-msgid ""
-"The path to the certifying authority cert file to use in SSL connections to "
-"the registry server, if any. Alternately, you may set the "
-"GLANCE_CLIENT_CA_FILE environment variable to a filepath of the CA cert file."
-msgstr ""
-"要在登錄伺服器的 SSL 連線（如果有的話）中使用的憑證管理中心憑證檔案的路徑。或"
-"者，您可以將 GLANCE_CLIENT_CA_FILE 環境變數設定為 CA 憑證檔案的檔案路徑。"
-
-msgid ""
-"The path to the key file to use in SSL connections to the registry server, "
-"if any. Alternately, you may set the GLANCE_CLIENT_KEY_FILE environment "
-"variable to a filepath of the key file"
-msgstr ""
-"要在登錄伺服器的 SSL 連線（如果有的話）中使用的金鑰檔路徑。或者，您可以將 "
-"GLANCE_CLIENT_KEY_FILE 環境變數設定為金鑰檔的檔案路徑"
-
-msgid ""
-"The path to the sqlite file database that will be used for image cache "
-"management."
-msgstr "將用於映像檔快取管理的 SQLite 檔案資料庫路徑。"
-
-msgid ""
-"The period of time, in seconds, that the API server will wait for a registry "
-"request to complete. A value of 0 implies no timeout."
-msgstr "API 伺服器將等待登錄要求完成的時段（以秒為單位）。值 0 表示無逾時。"
-
-msgid "The port on which a pydev process is listening for connections."
-msgstr "pydev 處理程序正在用來接聽連線的埠。"
-
-msgid "The port on which the server will listen."
-msgstr "伺服器將在其上進行接聽的埠。"
-
-msgid ""
-"The protocol to use for communication with the registry server.  Either http "
-"or https."
-msgstr "用於與登錄伺服器進行通訊的通訊協定。HTTP 或 HTTPS。"
-
-#, python-format
-msgid "The provided body %(body)s is invalid under given schema: %(schema)s"
-msgstr "在給定綱目 %(schema)s 下提供的主體 %(body)s 無效"
-
 msgid "The provided image is too large."
 msgstr "所提供的映像檔太大。"
-
-#, python-format
-msgid "The provided path '%(path)s' is invalid: %(explanation)s"
-msgstr "提供的路徑 '%(path)s' 無效：%(explanation)s"
-
-msgid ""
-"The reference to the default swift account/backing store parameters to use "
-"for adding new images."
-msgstr "對預設 Swift 帳戶/支援儲存庫參數的參照，以用於新增映像檔。"
 
 msgid ""
 "The region for the authentication service. If \"use_user_token\" is not in "
@@ -2325,22 +1380,11 @@ msgstr "已取消啟動所要求的映像檔。已禁止下載映像檔資料。
 msgid "The result of current task, JSON blob"
 msgstr "現行作業的結果：JSON 二進位大型物件"
 
-msgid "The signature data was not properly encoded using base64"
-msgstr "簽章資料未使用 base64 進行正確編碼"
-
 #, python-format
 msgid ""
 "The size of the data %(image_size)s will exceed the limit. %(remaining)s "
 "bytes remaining."
 msgstr "資料的大小 %(image_size)s 將超出該限制。剩餘 %(remaining)s 個位元組。"
-
-msgid ""
-"The size of thread pool to be used for scrubbing images. The default is one, "
-"which signifies serial scrubbing. Any value above one indicates the max "
-"number of images that may be scrubbed in parallel."
-msgstr ""
-"要用於清除映像檔的執行緒儲存區大小。預設值為 1，這表示序列清除。任何大於 1 的"
-"值都指示可平行清除的映像檔數目上限。"
 
 #, python-format
 msgid "The specified member %s could not be found"
@@ -2380,16 +1424,6 @@ msgid "The status of this image member"
 msgstr "此映像檔成員的狀態"
 
 msgid ""
-"The store names to use to get store preference order. The name must be "
-"registered by one of the stores defined by the 'stores' config option. This "
-"option will be applied when you using 'store_type' option as image location "
-"strategy defined by the 'location_strategy' config option."
-msgstr ""
-"用來取得儲存庫喜好設定順序的儲存庫名稱。名稱必須由'stores' 配置選項所定義的其"
-"中一個儲存庫進行登錄。當您使用 'store_type' 選項來作為 'location_strategy' 配"
-"置選項所定義的映像檔位置策略時，將套用此選項。"
-
-msgid ""
 "The strategy to use for authentication. If \"use_user_token\" is not in "
 "effect, then auth strategy can be specified."
 msgstr ""
@@ -2414,27 +1448,8 @@ msgstr "此內容所表示的作業類型"
 msgid "The unique namespace text."
 msgstr "唯一的名稱空間文字。"
 
-msgid ""
-"The upper limit (the maximum size of accumulated cache in bytes) beyond "
-"which the cache pruner, if running, starts cleaning the image cache."
-msgstr ""
-"上限（累計快取的大小上限，以位元組為單位），超出該上限時，快取刪改程式（如果"
-"在執行中）將開始清除映像檔快取。"
-
 msgid "The user friendly name for the namespace. Used by UI if available."
 msgstr "對使用者更為友善的名稱空間名稱。如果有的話，則由使用者介面使用。"
-
-msgid ""
-"The user to authenticate against the Swift authentication service "
-"(deprecated)"
-msgstr "要針對 Swift 鑑別服務進行鑑別的使用者（已淘汰）"
-
-msgid ""
-"The value for the socket option TCP_KEEPIDLE.  This is the time in seconds "
-"that the connection must be idle before TCP starts sending keepalive probes."
-msgstr ""
-"Socket 選項 TCP_KEEPIDLE 的值。這是 TCP開始傳送保持作用中探針之前連線必須閒置"
-"的秒數。"
 
 #, python-format
 msgid ""
@@ -2466,58 +1481,18 @@ msgid "There was an error connecting to a server"
 msgstr "連接至伺服器時發生錯誤"
 
 msgid ""
-"This config value indicates whether \"roles\" or \"policies\" are used in "
-"the property protection file."
-msgstr "此配置值指示在內容保護檔案中使用的是 \"roles\" 還是 \"policies\"。"
-
-msgid ""
 "This operation is currently not permitted on Glance Tasks. They are auto "
 "deleted after reaching the time based on their expires_at property."
 msgstr ""
 "目前不允許對 Glance 作業執行這項作業。根據它們的 expires_at內容，將在達到時間"
 "之後自動刪除它們。"
 
-msgid "This operation is currently not permitted on Glance images details."
-msgstr "目前不允許對 Glance 映像檔詳細資料執行這項作業。"
-
-msgid ""
-"This value sets what strategy will be used to determine the image location "
-"order. Currently two strategies are packaged with Glance 'location_order' "
-"and 'store_type'."
-msgstr ""
-"此值設定將用來判斷映像檔位置順序的策略。目前，Glance 隨附了兩個策略 "
-"'location_order' 及 'store_type'。"
-
 msgid ""
 "Time in hours for which a task lives after, either succeeding or failing"
 msgstr "作業在成功或失敗後存活的時間（小時）"
 
-msgid ""
-"Timeout for client connections' socket operations. If an incoming connection "
-"is idle for this number of seconds it will be closed. A value of '0' means "
-"wait forever."
-msgstr ""
-"用戶端連線的 Socket 作業逾時。如果送入的連線處於閒置的時間達到此秒數，則會將"
-"其關閉。值 '0' 表示永久等待。"
-
 msgid "Too few arguments."
 msgstr "引數太少。"
-
-msgid "Too few locations"
-msgstr "位置太少"
-
-msgid "Too many locations"
-msgstr "位置太多"
-
-#, python-format
-msgid "Total size is %(size)d bytes across %(img_count)d images"
-msgstr "大小總計為 %(size)d 個位元組，其包含映像檔數目為 %(img_count)d"
-
-msgid "Turn on/off delayed delete."
-msgstr "開啟/關閉延遲刪除。"
-
-msgid "Type version has to be a valid semver string"
-msgstr "類型版本必須是有效的 semver 字串"
 
 msgid ""
 "URI cannot contain more than one occurrence of a scheme.If you have "
@@ -2531,9 +1506,6 @@ msgstr ""
 
 msgid "URL to access the image file kept in external store"
 msgstr "用來存取外部儲存庫中所保留之映像檔的 URL"
-
-msgid "Unable to PUT to non-empty collection"
-msgstr "無法對非空集合執行 PUT 作業"
 
 #, python-format
 msgid ""
@@ -2571,9 +1543,6 @@ msgid ""
 "%(available)s."
 msgstr "在 JSON 綱目變更中找不到 `op`。它必須是下列其中一項：%(available)s。"
 
-msgid "Unable to get legacy image"
-msgstr "無法取得舊式映像檔"
-
 msgid "Unable to increase file descriptor limit.  Running as non-root?"
 msgstr "無法增加檔案描述子限制。要以非 root 使用者身分執行嗎？"
 
@@ -2593,42 +1562,9 @@ msgstr "無法載入綱目：%(reason)s"
 msgid "Unable to locate paste config file for %s."
 msgstr "找不到 %s 的 paste 配置檔。"
 
-msgid "Unable to modify collection in immutable or readonly property"
-msgstr "無法修改不可變內容或唯讀內容中的集合"
-
-#, python-format
-msgid "Unable to retrieve certificate with ID: %s"
-msgstr "無法擷取 ID 為 %s 的憑證"
-
-msgid "Unable to retrieve request id from context"
-msgstr "無法從環境定義中擷取要求 ID"
-
-msgid "Unable to specify artifact type explicitly"
-msgstr "無法明確指定構件類型"
-
-msgid "Unable to specify artifact type version explicitly"
-msgstr "無法明確指定構件類型版本"
-
-msgid "Unable to specify version if multiple types are possible"
-msgstr "如果可能存在多個類型，則無法指定版本"
-
-msgid "Unable to specify version if type is not specified"
-msgstr "如果未指定類型，則無法指定版本"
-
 #, python-format
 msgid "Unable to upload duplicate image data for image%(image_id)s: %(error)s"
 msgstr "無法上傳映像檔 %(image_id)s 的重複映像檔資料：%(error)s"
-
-msgid ""
-"Unable to verify signature since the algorithm is unsupported on this system"
-msgstr "無法驗證簽章，因為該算法在此系統上不受支援"
-
-#, python-format
-msgid "Unable to verify signature: %(reason)s"
-msgstr "無法驗證簽章：%(reason)s"
-
-msgid "Unauthorized image access"
-msgstr "未獲授權的映像檔存取"
 
 msgid "Unexpected body type. Expected list/dict."
 msgstr "非預期的內文類型。預期為清單/字典。"
@@ -2662,103 +1598,18 @@ msgstr "不支援的 sort_dir。可接受的值：%s"
 msgid "Unsupported sort_key. Acceptable values: %s"
 msgstr "不支援的 sort_key。可接受的值：%s"
 
-#, python-format
-msgid "Value %(value)d out of range, must not exceed %(max)d"
-msgstr "值 %(value)d 已超出範圍，不得超過 %(max)d"
-
-msgid "Value is greater than maximum"
-msgstr "值大於上限"
-
-msgid "Value is less than minimum"
-msgstr "值小於下限"
-
-msgid "Value is required"
-msgstr "需要值"
-
-#, python-format
-msgid "Version component is too large (%d max)"
-msgstr "版本元件太大（上限為 %d）"
-
-#, python-format
-msgid "Version is invalid: %(reason)s"
-msgstr "版本無效：%(reason)s"
-
 msgid "Virtual size of image in bytes"
 msgstr "映像檔的虛擬大小（以位元組為單位）"
-
-msgid "Visibility must be either \"public\" or \"private\""
-msgstr "可見性必須是 \"public\" 或 \"private\""
 
 #, python-format
 msgid "Waited 15 seconds for pid %(pid)s (%(file)s) to die; giving up"
 msgstr "等待 PID %(pid)s (%(file)s) 當掉已達到 15 秒；正在放棄"
 
 msgid ""
-"When false, no artifacts can be loaded regardless of available_plugins. When "
-"true, artifacts can be loaded."
-msgstr ""
-"如果為 false，則無論 available_plugins 為何，均無法載入任何構件。如果為 "
-"true，則可以載入構件。"
-
-msgid ""
 "When running server in SSL mode, you must specify both a cert_file and "
 "key_file option value in your configuration file"
 msgstr ""
 "在 SSL 模式下執行伺服器時，必須在配置檔中指定 cert_file 及 key_file 選項值"
-
-msgid ""
-"When true, this option sets the owner of an image to be the tenant. "
-"Otherwise, the owner of the  image will be the authenticated user issuing "
-"the request."
-msgstr ""
-"如果為 True，則此選項會將映像檔的擁有者設為承租人。否則，映像檔的擁有者將會是"
-"發出要求的已鑑別使用者。"
-
-msgid ""
-"When using SSL in connections to the registry server, do not require "
-"validation via a certifying authority. This is the registry's equivalent of "
-"specifying --insecure on the command line using glanceclient for the API."
-msgstr ""
-"如果在登錄伺服器的連線中使用 SSL，則不需要透過憑證管理中心進行驗證。此登錄相"
-"當於對 API 使用 glanceclient 時，在指令行上指定 --insecure。"
-
-msgid ""
-"Whether to allow users to specify image properties beyond what the image "
-"schema provides"
-msgstr "是否要容許使用者指定超出映像檔綱目所提供內容的映像檔內容"
-
-msgid ""
-"Whether to include the backend image locations in image properties. For "
-"example, if using the file system store a URL of \"file:///path/to/image\" "
-"will be returned to the user in the 'direct_url' meta-data field. Revealing "
-"storage location can be a security risk, so use this setting with caution! "
-"Setting this to true overrides the show_image_direct_url option."
-msgstr ""
-"是否要將後端映像檔位置包含在映像檔內容中。例如，如果使用檔案系統儲存庫，則會"
-"在 'direct_url' meta 資料欄位中將 URL \"file:///path/to/image\" 傳回給使用"
-"者。顯示儲存位置可能會導致安全風險，因此請小心使用此設定！將此項設為 true 將"
-"置換 show_image_direct_url 選項。"
-
-msgid ""
-"Whether to include the backend image storage location in image properties. "
-"Revealing storage location can be a security risk, so use this setting with "
-"caution!"
-msgstr ""
-"是否要將後端映像檔儲存體位置包含在映像檔內容中。顯示儲存體位置可能會導致安全"
-"風險，因此請小心使用此設定！"
-
-msgid ""
-"Whether to pass through headers containing user and tenant information when "
-"making requests to the registry. This allows the registry to use the context "
-"middleware without keystonemiddleware's auth_token middleware, removing "
-"calls to the keystone auth service. It is recommended that when using this "
-"option, secure communication between glance api and glance registry is "
-"ensured by means other than auth_token middleware."
-msgstr ""
-"是否要在向登錄發出要求時，透過包含使用者及承租人資訊的標頭來傳遞。這容許登錄"
-"在不具有 keystonemiddleware 的 auth_token 中介軟體時使用環境定義中介軟體，從"
-"而移除 keystone 鑑別服務呼叫。建議在使用此選項時，透過使用 auth_token 中介軟"
-"體之外的中介軟體，來保護 Glance API 和 Glance 登錄之間的通訊。"
 
 msgid ""
 "Whether to pass through the user token when making requests to the registry. "
@@ -2769,30 +1620,6 @@ msgstr ""
 "是否要在向登錄發出要求時透過使用者記號來傳遞。如果要在上傳大型檔案期間防止與"
 "記號有效期限相關的失敗，建議將此參數設定為 False。如果 \"use_user_token\" 未"
 "生效，則可以指定管理認證。"
-
-msgid ""
-"Work dir for asynchronous task operations. The directory set here will be "
-"used to operate over images - normally before they are imported in the "
-"destination store. When providing work dir, make sure enough space is "
-"provided for concurrent tasks to run efficiently without running out of "
-"space. A rough estimation can be done by multiplying the number of "
-"`max_workers` - or the N of workers running - by an average image size (e.g "
-"500MB). The image size estimation should be done based on the average size "
-"in your deployment. Note that depending on the tasks running you may need to "
-"multiply this number by some factor depending on what the task does. For "
-"example, you may want to double the available size if image conversion is "
-"enabled. All this being said, remember these are just estimations and you "
-"should do them based on the worst case scenario and be prepared to act in "
-"case they were wrong."
-msgstr ""
-"非同步作業的工作目錄。這裡所設定的目錄將用來對映像檔進行操作 - 一般在將映像檔"
-"匯入目的地儲存庫之前進行。提供工作目錄時，請確保提供足夠的空間，以讓並行作業"
-"能夠有效執行而不會出現空間不足狀況。可以將 'max_workers' 的數目或執行中工作程"
-"式的數目與平均映像檔大小（例如 500MB）相乘來粗略估計所需空間。應該根據部署的"
-"平均大小來估計映像檔大小。請注意，視執行中的作業而定，您可能需要根據作業的目"
-"的將此數目與某個因數相乘。例如，如果已啟用映像檔轉換，則您可能想要將可用大小"
-"加倍。話雖如此，但請注意，這些僅是估計，且您應該根據最差的情況來進行估計，並"
-"且準備好萬一估計錯誤也能有應對措施。"
 
 #, python-format
 msgid "Wrong command structure: %s"
@@ -2969,10 +1796,6 @@ msgstr "限制參數必須是整數"
 
 msgid "limit param must be positive"
 msgstr "限制參數必須是正數"
-
-#, python-format
-msgid "location: %s data lost"
-msgstr "位置：%s 資料已遺失"
 
 msgid "md5 hash of image contents."
 msgstr "映像檔內容的 md5 雜湊值。"

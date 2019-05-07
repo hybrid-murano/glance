@@ -12,11 +12,16 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+import os
+
+from cursive import exception as cursive_exception
 import glance_store
+from glance_store import backend
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import encodeutils
 from oslo_utils import excutils
+import six
 import webob.exc
 
 import glance.api.policy
@@ -37,16 +42,13 @@ CONF = cfg.CONF
 
 class ImageDataController(object):
     def __init__(self, db_api=None, store_api=None,
-                 policy_enforcer=None, notifier=None,
-                 gateway=None):
-        if gateway is None:
-            db_api = db_api or glance.db.get_api()
-            store_api = store_api or glance_store
-            policy = policy_enforcer or glance.api.policy.Enforcer()
-            notifier = notifier or glance.notifier.Notifier()
-            gateway = glance.gateway.Gateway(db_api, store_api,
-                                             notifier, policy)
-        self.gateway = gateway
+                 policy_enforcer=None, notifier=None):
+        db_api = db_api or glance.db.get_api()
+        store_api = store_api or glance_store
+        notifier = notifier or glance.notifier.Notifier()
+        self.policy = policy_enforcer or glance.api.policy.Enforcer()
+        self.gateway = glance.gateway.Gateway(db_api, store_api,
+                                              notifier, self.policy)
 
     def _restore(self, image_repo, image):
         """
@@ -64,6 +66,32 @@ class ImageDataController(object):
                    {'image_id': image.image_id,
                     'e': encodeutils.exception_to_unicode(e)})
             LOG.exception(msg)
+
+    def _unstage(self, image_repo, image, staging_store):
+        """
+        Restore the image to queued status and remove data from staging.
+
+        :param image_repo: The instance of ImageRepo
+        :param image: The image will be restored
+        :param staging_store: The store used for staging
+        """
+        # NOTE(abhishek): staging_store not being used in this function
+        # because of bug #1803498
+        # TODO(abhishek): refactor to use the staging_store when the
+        # "Rethinking Filesystem Access" spec is implemented in Train
+        file_path = str(CONF.node_staging_uri + '/' + image.image_id)[7:]
+        if os.path.exists(file_path):
+            try:
+                os.unlink(file_path)
+            except OSError as e:
+                LOG.error(_("Cannot delete staged image data %(fn)s "
+                            "[Errno %(en)d]"), {'fn': file_path,
+                                                'en': e.errno})
+        else:
+            LOG.warning(_("Staged image data not found "
+                          "at %(fn)s"), {'fn': file_path})
+
+        self._restore(image_repo, image)
 
     def _delete(self, image_repo, image):
         """Delete the image.
@@ -83,18 +111,31 @@ class ImageDataController(object):
 
     @utils.mutating
     def upload(self, req, image_id, data, size):
+        backend = None
+        if CONF.enabled_backends:
+            backend = req.headers.get('x-image-meta-store',
+                                      CONF.glance_store.default_backend)
+
+            try:
+                glance_store.get_store_from_store_identifier(backend)
+            except glance_store.UnknownScheme as exc:
+                raise webob.exc.HTTPBadRequest(explanation=exc.msg,
+                                               request=req,
+                                               content_type='text/plain')
+
         image_repo = self.gateway.get_repo(req.context)
         image = None
         refresher = None
         cxt = req.context
         try:
+            self.policy.enforce(cxt, 'upload_image', {})
             image = image_repo.get(image_id)
             image.status = 'saving'
             try:
                 if CONF.data_api == 'glance.db.registry.api':
                     # create a trust if backend is registry
                     try:
-                        # request user pluging for current token
+                        # request user plugin for current token
                         user_plugin = req.environ.get('keystone.token_auth')
                         roles = []
                         # use roles from request environment because they
@@ -110,19 +151,19 @@ class ImageDataController(object):
                                      "Use the existing user token."),
                                  encodeutils.exception_to_unicode(e))
 
-                image_repo.save(image)
-                image.set_data(data, size)
+                image_repo.save(image, from_state='queued')
+                image.set_data(data, size, backend=backend)
 
                 try:
                     image_repo.save(image, from_state='saving')
-                except exception.NotAuthenticated as e:
+                except exception.NotAuthenticated:
                     if refresher is not None:
                         # request a new token to update an image in database
                         cxt.auth_token = refresher.refresh_token()
                         image_repo = self.gateway.get_repo(req.context)
                         image_repo.save(image, from_state='saving')
                     else:
-                        raise e
+                        raise
 
                 try:
                     # release resources required for re-auth
@@ -225,7 +266,7 @@ class ImageDataController(object):
             raise webob.exc.HTTPServiceUnavailable(explanation=msg,
                                                    request=req)
 
-        except exception.SignatureVerificationError as e:
+        except cursive_exception.SignatureVerificationError as e:
             msg = (_LE("Signature verification failed for image %(id)s: %(e)s")
                    % {'id': image_id,
                       'e': encodeutils.exception_to_unicode(e)})
@@ -244,7 +285,98 @@ class ImageDataController(object):
 
         except Exception as e:
             with excutils.save_and_reraise_exception():
-                LOG.exception(_LE("Failed to upload image data due to "
+                LOG.error(_LE("Failed to upload image data due to "
+                              "internal error"))
+                self._restore(image_repo, image)
+
+    @utils.mutating
+    def stage(self, req, image_id, data, size):
+        image_repo = self.gateway.get_repo(req.context)
+        image = None
+
+        # NOTE(jokke): this is horrible way to do it but as long as
+        # glance_store is in a shape it is, the only way. Don't hold me
+        # accountable for it.
+        # TODO(abhishekk): After removal of backend module from glance_store
+        # need to change this to use multi_backend module.
+        def _build_staging_store():
+            conf = cfg.ConfigOpts()
+
+            try:
+                backend.register_opts(conf)
+            except cfg.DuplicateOptError:
+                pass
+
+            conf.set_override('filesystem_store_datadir',
+                              CONF.node_staging_uri[7:],
+                              group='glance_store')
+            staging_store = backend._load_store(conf, 'file')
+
+            try:
+                staging_store.configure()
+            except AttributeError:
+                msg = _("'node_staging_uri' is not set correctly. Could not "
+                        "load staging store.")
+                raise exception.BadStoreUri(message=msg)
+            return staging_store
+
+        staging_store = _build_staging_store()
+
+        try:
+            image = image_repo.get(image_id)
+            image.status = 'uploading'
+            image_repo.save(image, from_state='queued')
+            try:
+                staging_store.add(
+                    image_id, utils.LimitingReader(
+                        utils.CooperativeReader(data), CONF.image_size_cap), 0)
+            except glance_store.Duplicate as e:
+                msg = _("The image %s has data on staging") % image_id
+                raise webob.exc.HTTPConflict(explanation=msg)
+
+        except exception.NotFound as e:
+            raise webob.exc.HTTPNotFound(explanation=e.msg)
+
+        except glance_store.StorageFull as e:
+            msg = _("Image storage media "
+                    "is full: %s") % encodeutils.exception_to_unicode(e)
+            LOG.error(msg)
+            self._unstage(image_repo, image, staging_store)
+            raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
+                                                      request=req)
+
+        except exception.StorageQuotaFull as e:
+            msg = _("Image exceeds the storage "
+                    "quota: %s") % encodeutils.exception_to_unicode(e)
+            LOG.debug(msg)
+            self._unstage(image_repo, image, staging_store)
+            raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
+                                                      request=req)
+
+        except exception.ImageSizeLimitExceeded as e:
+            msg = _("The incoming image is "
+                    "too large: %s") % encodeutils.exception_to_unicode(e)
+            LOG.debug(msg)
+            self._unstage(image_repo, image, staging_store)
+            raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg,
+                                                      request=req)
+
+        except glance_store.StorageWriteDenied as e:
+            msg = _("Insufficient permissions on image "
+                    "storage media: %s") % encodeutils.exception_to_unicode(e)
+            LOG.error(msg)
+            self._unstage(image_repo, image, staging_store)
+            raise webob.exc.HTTPServiceUnavailable(explanation=msg,
+                                                   request=req)
+
+        except exception.InvalidImageStatusTransition as e:
+            msg = encodeutils.exception_to_unicode(e)
+            LOG.debug(msg)
+            raise webob.exc.HTTPConflict(explanation=e.msg, request=req)
+
+        except Exception as e:
+            with excutils.save_and_reraise_exception():
+                LOG.exception(_LE("Failed to stage image data due to "
                                   "internal error"))
                 self._restore(image_repo, image)
 
@@ -273,6 +405,24 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
         except exception.InvalidContentType as e:
             raise webob.exc.HTTPUnsupportedMediaType(explanation=e.msg)
 
+        if self.is_valid_encoding(request) and self.is_valid_method(request):
+            request.is_body_readable = True
+
+        image_size = request.content_length or None
+        return {'size': image_size, 'data': request.body_file}
+
+    def stage(self, request):
+        if "glance-direct" not in CONF.enabled_import_methods:
+            msg = _("'glance-direct' method is not available at this site.")
+            raise webob.exc.HTTPNotFound(explanation=msg)
+        try:
+            request.get_content_type(('application/octet-stream',))
+        except exception.InvalidContentType as e:
+            raise webob.exc.HTTPUnsupportedMediaType(explanation=e.msg)
+
+        if self.is_valid_encoding(request) and self.is_valid_method(request):
+            request.is_body_readable = True
+
         image_size = request.content_length or None
         return {'size': image_size, 'data': request.body_file}
 
@@ -280,17 +430,47 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
 class ResponseSerializer(wsgi.JSONResponseSerializer):
 
     def download(self, response, image):
+
         offset, chunk_size = 0, None
-        range_val = response.request.get_content_range()
+        # NOTE(dharinic): In case of a malformed range header,
+        # glance/common/wsgi.py will raise HTTPRequestRangeNotSatisfiable
+        # (setting status_code to 416)
+        range_val = response.request.get_range_from_request(image.size)
 
         if range_val:
-            # NOTE(flaper87): if not present, both, start
-            # and stop, will be None.
-            if range_val.start is not None:
-                offset = range_val.start
+            if isinstance(range_val, webob.byterange.Range):
+                response_end = image.size - 1
+                # NOTE(dharinic): webob parsing is zero-indexed.
+                # i.e.,to download first 5 bytes of a 10 byte image,
+                # request should be "bytes=0-4" and the response would be
+                # "bytes 0-4/10".
+                # Range if validated, will never have 'start' object as None.
+                if range_val.start >= 0:
+                    offset = range_val.start
+                else:
+                    # NOTE(dharinic): Negative start values needs to be
+                    # processed to allow suffix-length for Range request
+                    # like "bytes=-2" as per rfc7233.
+                    if abs(range_val.start) < image.size:
+                        offset = image.size + range_val.start
 
-            if range_val.stop is not None:
+                if range_val.end is not None and range_val.end < image.size:
+                    chunk_size = range_val.end - offset
+                    response_end = range_val.end - 1
+                else:
+                    chunk_size = image.size - offset
+
+            # NOTE(dharinic): For backward compatibility reasons, we maintain
+            # support for 'Content-Range' in requests even though it's not
+            # correct to use it in requests.
+            elif isinstance(range_val, webob.byterange.ContentRange):
+                response_end = range_val.stop - 1
+                # NOTE(flaper87): if not present, both, start
+                # and stop, will be None.
+                offset = range_val.start
                 chunk_size = range_val.stop - offset
+
+            response.status_int = 206
 
         response.headers['Content-Type'] = 'application/octet-stream'
 
@@ -300,6 +480,16 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
             # an iterator very strange
             response.app_iter = iter(image.get_data(offset=offset,
                                                     chunk_size=chunk_size))
+            # NOTE(dharinic): In case of a full image download, when
+            # chunk_size was none, reset it to image.size to set the
+            # response header's Content-Length.
+            if chunk_size is not None:
+                response.headers['Content-Range'] = 'bytes %s-%s/%s'\
+                                                    % (offset,
+                                                       response_end,
+                                                       image.size)
+            else:
+                chunk_size = image.size
         except glance_store.NotFound as e:
             raise webob.exc.HTTPNoContent(explanation=e.msg)
         except glance_store.RemoteServiceUnavailable as e:
@@ -317,9 +507,12 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
             response.headers['Content-MD5'] = image.checksum
         # NOTE(markwash): "response.app_iter = ..." also erroneously resets the
         # content-length
-        response.headers['Content-Length'] = str(image.size)
+        response.headers['Content-Length'] = six.text_type(chunk_size)
 
     def upload(self, response, result):
+        response.status_int = 204
+
+    def stage(self, response, result):
         response.status_int = 204
 
 

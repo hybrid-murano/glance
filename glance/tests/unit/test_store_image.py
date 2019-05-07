@@ -12,13 +12,12 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+from cursive import exception as cursive_exception
+from cursive import signature_utils
 import glance_store
 import mock
 
-from debtcollector import removals
-
 from glance.common import exception
-from glance.common import signature_utils
 import glance.location
 from glance.tests.unit import base as unit_test_base
 from glance.tests.unit import utils as unit_test_utils
@@ -190,65 +189,6 @@ class TestStoreImage(utils.BaseTestCase):
                           self.store_api.get_from_backend,
                           image.locations[0]['url'], context={})
 
-    @removals.remove(message="This will be removed in the N cycle.")
-    def test_old_image_set_data_valid_signature(self):
-        context = glance.context.RequestContext(user=USER1)
-        extra_properties = {
-            'signature_certificate_uuid': 'UUID',
-            'signature_hash_method': 'METHOD',
-            'signature_key_type': 'TYPE',
-            'signature': 'VALID'
-        }
-        image_stub = ImageStub(UUID2, status='queued',
-                               extra_properties=extra_properties)
-        self.stubs.Set(signature_utils, 'verify_signature',
-                       unit_test_utils.fake_old_verify_signature)
-        image = glance.location.ImageProxy(image_stub, context,
-                                           self.store_api, self.store_utils)
-        image.set_data('YYYY', 4)
-        self.assertEqual(UUID2, image.locations[0]['url'])
-        self.assertEqual('Z', image.checksum)
-        self.assertEqual('active', image.status)
-
-    @removals.remove(message="This will be removed in the N cycle.")
-    def test_old_image_set_data_invalid_signature(self):
-        context = glance.context.RequestContext(user=USER1)
-        extra_properties = {
-            'signature_certificate_uuid': 'UUID',
-            'signature_hash_method': 'METHOD',
-            'signature_key_type': 'TYPE',
-            'signature': 'INVALID'
-        }
-        image_stub = ImageStub(UUID2, status='queued',
-                               extra_properties=extra_properties)
-        self.stubs.Set(signature_utils, 'verify_signature',
-                       unit_test_utils.fake_old_verify_signature)
-        image = glance.location.ImageProxy(image_stub, context,
-                                           self.store_api, self.store_utils)
-        self.assertRaises(exception.SignatureVerificationError,
-                          image.set_data,
-                          'YYYY', 4)
-
-    @removals.remove(message="This will be removed in the N cycle.")
-    def test_old_image_set_data_invalid_signature_missing_metadata(self):
-        context = glance.context.RequestContext(user=USER1)
-        extra_properties = {
-            'signature_hash_method': 'METHOD',
-            'signature_key_type': 'TYPE',
-            'signature': 'INVALID'
-        }
-        image_stub = ImageStub(UUID2, status='queued',
-                               extra_properties=extra_properties)
-        self.stubs.Set(signature_utils, 'verify_signature',
-                       unit_test_utils.fake_old_verify_signature)
-        image = glance.location.ImageProxy(image_stub, context,
-                                           self.store_api, self.store_utils)
-        image.set_data('YYYY', 4)
-        self.assertEqual(UUID2, image.locations[0]['url'])
-        self.assertEqual('Z', image.checksum)
-        # Image is still active, since invalid signature was ignored
-        self.assertEqual('active', image.status)
-
     @mock.patch('glance.location.LOG')
     def test_image_set_data_valid_signature(self, mock_log):
         context = glance.context.RequestContext(user=USER1)
@@ -284,9 +224,12 @@ class TestStoreImage(utils.BaseTestCase):
                        unit_test_utils.fake_get_verifier)
         image = glance.location.ImageProxy(image_stub, context,
                                            self.store_api, self.store_utils)
-        self.assertRaises(exception.SignatureVerificationError,
-                          image.set_data,
-                          'YYYY', 4)
+        with mock.patch.object(self.store_api,
+                               'delete_from_backend') as mock_delete:
+            self.assertRaises(cursive_exception.SignatureVerificationError,
+                              image.set_data,
+                              'YYYY', 4)
+            mock_delete.assert_called()
 
     def test_image_set_data_invalid_signature_missing_metadata(self):
         context = glance.context.RequestContext(user=USER1)

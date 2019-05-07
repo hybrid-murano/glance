@@ -37,13 +37,46 @@ taskflow_executor_opts = [
     cfg.StrOpt('engine_mode',
                default='parallel',
                choices=('serial', 'parallel'),
-               help=_("The mode in which the engine will run. "
-                      "Can be 'serial' or 'parallel'.")),
+               help=_("""
+Set the taskflow engine mode.
+
+Provide a string type value to set the mode in which the taskflow
+engine would schedule tasks to the workers on the hosts. Based on
+this mode, the engine executes tasks either in single or multiple
+threads. The possible values for this configuration option are:
+``serial`` and ``parallel``. When set to ``serial``, the engine runs
+all the tasks in a single thread which results in serial execution
+of tasks. Setting this to ``parallel`` makes the engine run tasks in
+multiple threads. This results in parallel execution of tasks.
+
+Possible values:
+    * serial
+    * parallel
+
+Related options:
+    * max_workers
+
+""")),
+
     cfg.IntOpt('max_workers',
                default=10,
-               help=_("The number of parallel activities executed at the "
-                      "same time by the engine. The value can be greater "
-                      "than one when the engine mode is 'parallel'."),
+               min=1,
+               help=_("""
+Set the number of engine executable tasks.
+
+Provide an integer value to limit the number of workers that can be
+instantiated on the hosts. In other words, this number defines the
+number of parallel tasks that can be executed at the same time by
+the taskflow engine. This value can be greater than one when the
+engine mode is set to parallel.
+
+Possible values:
+    * Integer value greater than or equal to 1
+
+Related options:
+    * engine_mode
+
+"""),
                deprecated_opts=[_deprecated_opt])
 ]
 
@@ -79,11 +112,8 @@ class TaskExecutor(glance.async.TaskExecutor):
     def _get_flow(self, task):
         try:
             task_input = script_utils.unpack_task_input(task)
-            uri = script_utils.validate_location_uri(
-                task_input.get('import_from'))
 
             kwds = {
-                'uri': uri,
                 'task_id': task.task_id,
                 'task_type': task.type,
                 'context': self.context,
@@ -92,12 +122,20 @@ class TaskExecutor(glance.async.TaskExecutor):
                 'image_factory': self.image_factory
             }
 
+            if task.type == "import":
+                uri = script_utils.validate_location_uri(
+                    task_input.get('import_from'))
+                kwds['uri'] = uri
+            if task.type == 'api_image_import':
+                kwds['image_id'] = task_input['image_id']
+                kwds['import_req'] = task_input['import_req']
+                kwds['backend'] = task_input['backend']
             return driver.DriverManager('glance.flows', task.type,
                                         invoke_on_load=True,
                                         invoke_kwds=kwds).driver
         except urllib.error.URLError as exc:
             raise exception.ImportTaskError(message=exc.reason)
-        except exception.BadStoreUri as exc:
+        except (exception.BadStoreUri, exception.Invalid) as exc:
             raise exception.ImportTaskError(message=exc.msg)
         except RuntimeError:
             raise NotImplementedError()
@@ -134,6 +172,9 @@ class TaskExecutor(glance.async.TaskExecutor):
                 max_workers=CONF.taskflow_executor.max_workers)
             with llistener.DynamicLoggingListener(engine, log=LOG):
                 engine.run()
+        except exception.UploadException as exc:
+            task.fail(encodeutils.exception_to_unicode(exc))
+            self.task_repo.save(task)
         except Exception as exc:
             with excutils.save_and_reraise_exception():
                 LOG.error(_LE('Failed to execute task %(task_id)s: %(exc)s') %

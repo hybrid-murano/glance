@@ -14,9 +14,11 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import mock
 import os
 import tempfile
 
+from oslo_log import log as logging
 import six
 import webob
 
@@ -362,7 +364,7 @@ class TestUtils(test_utils.BaseTestCase):
                                         ']' if escaped else '')
 
             self.assertTrue(pair_str.startswith(expected_host))
-            self.assertTrue(port > 0)
+            self.assertGreater(port, 0)
 
             expected_pair = '%s:%d' % (expected_host, port)
             self.assertEqual(expected_pair, pair_str)
@@ -450,6 +452,16 @@ class SplitFilterOpTestCase(test_utils.BaseTestCase):
         returned = utils.split_filter_op(expr)
         self.assertEqual(('eq', expr), returned)
 
+    def test_default_operator_with_datetime(self):
+        expr = '2015-08-27T09:49:58Z'
+        returned = utils.split_filter_op(expr)
+        self.assertEqual(('eq', expr), returned)
+
+    def test_operator_with_datetime(self):
+        expr = 'lt:2015-08-27T09:49:58Z'
+        returned = utils.split_filter_op(expr)
+        self.assertEqual(('lt', '2015-08-27T09:49:58Z'), returned)
+
 
 class EvaluateFilterOpTestCase(test_utils.BaseTestCase):
 
@@ -486,3 +498,67 @@ class EvaluateFilterOpTestCase(test_utils.BaseTestCase):
     def test_invalid_operator(self):
         self.assertRaises(exception.InvalidFilterOperatorValue,
                           utils.evaluate_filter_op, '10', 'bar', '8')
+
+
+class ImportURITestCase(test_utils.BaseTestCase):
+
+    def test_validate_import_uri(self):
+        self.assertTrue(utils.validate_import_uri("http://foo.com"))
+
+        self.config(allowed_schemes=['http'],
+                    group='import_filtering_opts')
+        self.config(allowed_hosts=['example.com'],
+                    group='import_filtering_opts')
+        self.assertTrue(utils.validate_import_uri("http://example.com"))
+
+        self.config(allowed_ports=['8080'],
+                    group='import_filtering_opts')
+        self.assertTrue(utils.validate_import_uri("http://example.com:8080"))
+
+    def test_invalid_import_uri(self):
+        self.assertFalse(utils.validate_import_uri(""))
+
+        self.assertFalse(utils.validate_import_uri("fake_uri"))
+        self.config(disallowed_schemes=['ftp'],
+                    group='import_filtering_opts')
+        self.assertFalse(utils.validate_import_uri("ftp://example.com"))
+
+        self.config(disallowed_hosts=['foo.com'],
+                    group='import_filtering_opts')
+        self.assertFalse(utils.validate_import_uri("ftp://foo.com"))
+
+        self.config(disallowed_ports=['8484'],
+                    group='import_filtering_opts')
+        self.assertFalse(utils.validate_import_uri("http://localhost:8484"))
+
+    def test_ignored_filtering_options(self):
+        LOG = logging.getLogger('glance.common.utils')
+        with mock.patch.object(LOG, 'debug') as mock_run:
+            self.config(allowed_schemes=['https', 'ftp'],
+                        group='import_filtering_opts')
+            self.config(disallowed_schemes=['ftp'],
+                        group='import_filtering_opts')
+            self.assertTrue(utils.validate_import_uri("ftp://foo.com"))
+            mock_run.assert_called_once()
+        with mock.patch.object(LOG, 'debug') as mock_run:
+            self.config(allowed_schemes=[],
+                        group='import_filtering_opts')
+            self.config(disallowed_schemes=[],
+                        group='import_filtering_opts')
+            self.config(allowed_hosts=['example.com', 'foo.com'],
+                        group='import_filtering_opts')
+            self.config(disallowed_hosts=['foo.com'],
+                        group='import_filtering_opts')
+            self.assertTrue(utils.validate_import_uri("ftp://foo.com"))
+            mock_run.assert_called_once()
+        with mock.patch.object(LOG, 'debug') as mock_run:
+            self.config(allowed_hosts=[],
+                        group='import_filtering_opts')
+            self.config(disallowed_hosts=[],
+                        group='import_filtering_opts')
+            self.config(allowed_ports=[8080, 8484],
+                        group='import_filtering_opts')
+            self.config(disallowed_ports=[8484],
+                        group='import_filtering_opts')
+            self.assertTrue(utils.validate_import_uri("ftp://foo.com:8484"))
+            mock_run.assert_called_once()

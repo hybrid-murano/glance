@@ -16,12 +16,14 @@
 import uuid
 
 import glance_store
+import mock
 from mock import patch
-from mox3 import mox
 from oslo_config import cfg
 # NOTE(jokke): simplified transition to py3, behaves like py2 xrange
 from six.moves import range
 
+from glance.common import exception
+from glance.db.sqlalchemy import api as db_api
 from glance import scrubber
 from glance.tests import utils as test_utils
 
@@ -36,10 +38,8 @@ class TestScrubber(test_utils.BaseTestCase):
         self.config(group='glance_store', default_store='file',
                     filesystem_store_datadir=self.test_dir)
         glance_store.create_stores()
-        self.mox = mox.Mox()
 
     def tearDown(self):
-        self.mox.UnsetStubs()
         # These globals impact state outside of this test class, kill them.
         scrubber._file_queue = None
         scrubber._db_queue = None
@@ -49,32 +49,23 @@ class TestScrubber(test_utils.BaseTestCase):
         uri = 'file://some/path/%s' % uuid.uuid4()
         id = 'helloworldid'
         scrub = scrubber.Scrubber(glance_store)
-        scrub.registry = self.mox.CreateMockAnything()
-        scrub.registry.get_image(id).AndReturn({'status': 'pending_delete'})
-        scrub.registry.update_image(id, {'status': 'deleted'})
-        self.mox.StubOutWithMock(glance_store, "delete_from_backend")
-        glance_store.delete_from_backend(
-            uri,
-            mox.IgnoreArg()).AndRaise(ex)
-        self.mox.ReplayAll()
-        scrub._scrub_image(id, [(id, '-', uri)])
-        self.mox.VerifyAll()
+        with patch.object(glance_store,
+                          "delete_from_backend") as _mock_delete:
+            _mock_delete.side_effect = ex
+            scrub._scrub_image(id, [(id, '-', uri)])
 
-    def test_store_delete_successful(self):
+    @mock.patch.object(db_api, "image_get")
+    def test_store_delete_successful(self, mock_image_get):
         uri = 'file://some/path/%s' % uuid.uuid4()
         id = 'helloworldid'
 
         scrub = scrubber.Scrubber(glance_store)
-        scrub.registry = self.mox.CreateMockAnything()
-        scrub.registry.get_image(id).AndReturn({'status': 'pending_delete'})
-        scrub.registry.update_image(id, {'status': 'deleted'})
-        self.mox.StubOutWithMock(glance_store, "delete_from_backend")
-        glance_store.delete_from_backend(uri, mox.IgnoreArg()).AndReturn('')
-        self.mox.ReplayAll()
-        scrub._scrub_image(id, [(id, '-', uri)])
-        self.mox.VerifyAll()
+        with patch.object(glance_store,
+                          "delete_from_backend"):
+            scrub._scrub_image(id, [(id, '-', uri)])
 
-    def test_store_delete_store_exceptions(self):
+    @mock.patch.object(db_api, "image_get")
+    def test_store_delete_store_exceptions(self, mock_image_get):
         # While scrubbing image data, all store exceptions, other than
         # NotFound, cause image scrubbing to fail. Essentially, no attempt
         # would be made to update the status of image.
@@ -84,16 +75,13 @@ class TestScrubber(test_utils.BaseTestCase):
         ex = glance_store.GlanceStoreException()
 
         scrub = scrubber.Scrubber(glance_store)
-        scrub.registry = self.mox.CreateMockAnything()
-        self.mox.StubOutWithMock(glance_store, "delete_from_backend")
-        glance_store.delete_from_backend(
-            uri,
-            mox.IgnoreArg()).AndRaise(ex)
-        self.mox.ReplayAll()
-        scrub._scrub_image(id, [(id, '-', uri)])
-        self.mox.VerifyAll()
+        with patch.object(glance_store,
+                          "delete_from_backend") as _mock_delete:
+            _mock_delete.side_effect = ex
+            scrub._scrub_image(id, [(id, '-', uri)])
 
-    def test_store_delete_notfound_exception(self):
+    @mock.patch.object(db_api, "image_get")
+    def test_store_delete_notfound_exception(self, mock_image_get):
         # While scrubbing image data, NotFound exception is ignored and image
         # scrubbing succeeds
         uri = 'file://some/path/%s' % uuid.uuid4()
@@ -101,23 +89,41 @@ class TestScrubber(test_utils.BaseTestCase):
         ex = glance_store.NotFound(message='random')
 
         scrub = scrubber.Scrubber(glance_store)
-        scrub.registry = self.mox.CreateMockAnything()
-        scrub.registry.get_image(id).AndReturn({'status': 'pending_delete'})
-        scrub.registry.update_image(id, {'status': 'deleted'})
-        self.mox.StubOutWithMock(glance_store, "delete_from_backend")
-        glance_store.delete_from_backend(uri, mox.IgnoreArg()).AndRaise(ex)
-        self.mox.ReplayAll()
-        scrub._scrub_image(id, [(id, '-', uri)])
-        self.mox.VerifyAll()
+        with patch.object(glance_store,
+                          "delete_from_backend") as _mock_delete:
+            _mock_delete.side_effect = ex
+            scrub._scrub_image(id, [(id, '-', uri)])
+
+    def test_scrubber_exits(self):
+        # Checks for Scrubber exits when it is not able to fetch jobs from
+        # the queue
+        scrub_jobs = scrubber.ScrubDBQueue.get_all_locations
+        scrub_jobs = mock.MagicMock()
+        scrub_jobs.side_effect = exception.NotFound
+        scrub = scrubber.Scrubber(glance_store)
+        self.assertRaises(exception.FailedToGetScrubberJobs,
+                          scrub._get_delete_jobs)
+
+    @mock.patch.object(db_api, "image_restore")
+    def test_scrubber_revert_image_status(self, mock_image_restore):
+        scrub = scrubber.Scrubber(glance_store)
+        scrub.revert_image_status('fake_id')
+
+        mock_image_restore.side_effect = exception.ImageNotFound
+        self.assertRaises(exception.ImageNotFound,
+                          scrub.revert_image_status,
+                          'fake_id')
+
+        mock_image_restore.side_effect = exception.Conflict
+        self.assertRaises(exception.Conflict,
+                          scrub.revert_image_status,
+                          'fake_id')
 
 
 class TestScrubDBQueue(test_utils.BaseTestCase):
 
     def setUp(self):
         super(TestScrubDBQueue, self).setUp()
-
-    def tearDown(self):
-        super(TestScrubDBQueue, self).tearDown()
 
     def _create_image_list(self, count):
         images = []
@@ -132,11 +138,12 @@ class TestScrubDBQueue(test_utils.BaseTestCase):
         image_pager = ImagePager(images)
 
         def make_get_images_detailed(pager):
-            def mock_get_images_detailed(filters, marker=None):
+            def mock_get_images_detailed(ctx, filters, marker=None,
+                                         limit=None):
                 return pager()
             return mock_get_images_detailed
 
-        with patch.object(scrub_queue.registry, 'get_images_detailed') as (
+        with patch.object(db_api, 'image_get_all') as (
                 _mock_get_images_detailed):
             _mock_get_images_detailed.side_effect = (
                 make_get_images_detailed(image_pager))
@@ -150,11 +157,12 @@ class TestScrubDBQueue(test_utils.BaseTestCase):
         image_pager = ImagePager(images, page_size=4)
 
         def make_get_images_detailed(pager):
-            def mock_get_images_detailed(filters, marker=None):
+            def mock_get_images_detailed(ctx, filters, marker=None,
+                                         limit=None):
                 return pager()
             return mock_get_images_detailed
 
-        with patch.object(scrub_queue.registry, 'get_images_detailed') as (
+        with patch.object(db_api, 'image_get_all') as (
                 _mock_get_images_detailed):
             _mock_get_images_detailed.side_effect = (
                 make_get_images_detailed(image_pager))

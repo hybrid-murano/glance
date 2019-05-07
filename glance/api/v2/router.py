@@ -13,6 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from glance.api.v2 import discovery
 from glance.api.v2 import image_actions
 from glance.api.v2 import image_data
 from glance.api.v2 import image_members
@@ -424,6 +425,14 @@ class API(wsgi.Router):
                        controller=reject_method_resource,
                        action='reject',
                        allowed_methods='GET, PATCH, DELETE')
+        mapper.connect('/images/{image_id}/import',
+                       controller=images_resource,
+                       action='import_image',
+                       conditions={'method': ['POST']})
+        mapper.connect('/images/{image_id}/import',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='POST')
 
         image_actions_resource = image_actions.create_resource()
         mapper.connect('/images/{image_id}/actions/deactivate',
@@ -459,6 +468,14 @@ class API(wsgi.Router):
                        controller=reject_method_resource,
                        action='reject',
                        allowed_methods='GET, PUT')
+        mapper.connect('/images/{image_id}/stage',
+                       controller=image_data_resource,
+                       action='stage',
+                       conditions={'method': ['PUT']})
+        mapper.connect('/images/{image_id}/stage',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='PUT')
 
         image_tags_resource = image_tags.create_resource()
         mapper.connect('/images/{image_id}/tags/{tag_value}',
@@ -536,5 +553,26 @@ class API(wsgi.Router):
                        controller=reject_method_resource,
                        action='reject',
                        allowed_methods='GET, DELETE')
+
+        # Discovery API
+        info_resource = discovery.create_resource()
+        mapper.connect('/info/import',
+                       controller=info_resource,
+                       action='get_image_import',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
+        mapper.connect('/info/import',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='GET')
+        mapper.connect('/info/stores',
+                       controller=info_resource,
+                       action='get_stores',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
+        mapper.connect('/info/stores',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='GET')
 
         super(API, self).__init__(mapper)

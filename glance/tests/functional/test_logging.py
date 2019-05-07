@@ -19,6 +19,7 @@ import os
 import stat
 
 import httplib2
+from six.moves import http_client as http
 
 from glance.tests import functional
 
@@ -27,49 +28,50 @@ class TestLogging(functional.FunctionalTest):
 
     """Functional tests for Glance's logging output"""
 
-    def test_verbose_debug(self):
+    def test_debug(self):
         """
-        Test logging output proper when verbose and debug
-        is on.
+        Test logging output proper when debug is on.
         """
         self.cleanup()
         self.start_servers()
 
-        # The default functional test case has both verbose
-        # and debug on. Let's verify that debug statements
-        # appear in both the API and registry logs.
+        # The default functional test case has both debug on. Let's verify
+        # that debug statements appear in both the API and registry logs.
 
         self.assertTrue(os.path.exists(self.api_server.log_file))
 
-        api_log_out = open(self.api_server.log_file, 'r').read()
+        with open(self.api_server.log_file, 'r') as f:
+            api_log_out = f.read()
 
         self.assertIn('DEBUG glance', api_log_out)
 
         self.assertTrue(os.path.exists(self.registry_server.log_file))
 
-        registry_log_out = open(self.registry_server.log_file, 'r').read()
+        with open(self.registry_server.log_file, 'r') as freg:
+            registry_log_out = freg.read()
 
         self.assertIn('DEBUG glance', registry_log_out)
 
         self.stop_servers()
 
-    def test_no_verbose_no_debug(self):
+    def test_no_debug(self):
         """
-        Test logging output proper when verbose and debug
-        is off.
+        Test logging output proper when debug is off.
         """
         self.cleanup()
-        self.start_servers(debug=False, verbose=False)
+        self.start_servers(debug=False)
 
         self.assertTrue(os.path.exists(self.api_server.log_file))
 
-        api_log_out = open(self.api_server.log_file, 'r').read()
+        with open(self.api_server.log_file, 'r') as f:
+            api_log_out = f.read()
 
         self.assertNotIn('DEBUG glance', api_log_out)
 
         self.assertTrue(os.path.exists(self.registry_server.log_file))
 
-        registry_log_out = open(self.registry_server.log_file, 'r').read()
+        with open(self.registry_server.log_file, 'r') as freg:
+            registry_log_out = freg.read()
 
         self.assertNotIn('DEBUG glance', registry_log_out)
 
@@ -92,7 +94,7 @@ class TestLogging(functional.FunctionalTest):
 
         path = "http://%s:%d/" % ("127.0.0.1", self.api_port)
         response, content = httplib2.Http().request(path, 'GET')
-        self.assertEqual(300, response.status)
+        self.assertEqual(http.MULTIPLE_CHOICES, response.status)
 
         self.assertNotEmptyFile(self.api_server.log_file)
 

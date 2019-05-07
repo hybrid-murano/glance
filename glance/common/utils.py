@@ -41,10 +41,12 @@ from oslo_utils import excutils
 from oslo_utils import netutils
 from oslo_utils import strutils
 import six
+from six.moves import urllib
 from webob import exc
 
 from glance.common import exception
-from glance.i18n import _, _LE
+from glance.common import timeutils
+from glance.i18n import _, _LE, _LW
 
 CONF = cfg.CONF
 
@@ -124,6 +126,56 @@ def cooperative_read(fd):
 
 
 MAX_COOP_READER_BUFFER_SIZE = 134217728  # 128M seems like a sane buffer limit
+
+CONF.import_group('import_filtering_opts',
+                  'glance.async.flows._internal_plugins')
+
+
+def validate_import_uri(uri):
+    """Validate requested uri for Image Import web-download.
+
+    :param uri: target uri to be validated
+    """
+    if not uri:
+        return False
+
+    parsed_uri = urllib.parse.urlparse(uri)
+    scheme = parsed_uri.scheme
+    host = parsed_uri.hostname
+    port = parsed_uri.port
+    wl_schemes = CONF.import_filtering_opts.allowed_schemes
+    bl_schemes = CONF.import_filtering_opts.disallowed_schemes
+    wl_hosts = CONF.import_filtering_opts.allowed_hosts
+    bl_hosts = CONF.import_filtering_opts.disallowed_hosts
+    wl_ports = CONF.import_filtering_opts.allowed_ports
+    bl_ports = CONF.import_filtering_opts.disallowed_ports
+
+    # NOTE(jokke): Checking if both allowed and disallowed are defined and
+    # logging it to inform only allowed will be obeyed.
+    if wl_schemes and bl_schemes:
+        bl_schemes = []
+        LOG.debug("Both allowed and disallowed schemes has been configured. "
+                  "Will only process allowed list.")
+    if wl_hosts and bl_hosts:
+        bl_hosts = []
+        LOG.debug("Both allowed and disallowed hosts has been configured. "
+                  "Will only process allowed list.")
+    if wl_ports and bl_ports:
+        bl_ports = []
+        LOG.debug("Both allowed and disallowed ports has been configured. "
+                  "Will only process allowed list.")
+
+    if not scheme or ((wl_schemes and scheme not in wl_schemes) or
+                      parsed_uri.scheme in bl_schemes):
+        return False
+    if not host or ((wl_hosts and host not in wl_hosts) or
+                    host in bl_hosts):
+        return False
+    if port and ((wl_ports and port not in wl_ports) or
+                 port in bl_ports):
+        return False
+
+    return True
 
 
 class CooperativeReader(object):
@@ -219,20 +271,23 @@ class LimitingReader(object):
     Reader designed to fail when reading image data past the configured
     allowable amount.
     """
-    def __init__(self, data, limit):
+    def __init__(self, data, limit,
+                 exception_class=exception.ImageSizeLimitExceeded):
         """
         :param data: Underlying image data object
         :param limit: maximum number of bytes the reader should allow
+        :param exception_class: Type of exception to be raised
         """
         self.data = data
         self.limit = limit
         self.bytes_read = 0
+        self.exception_class = exception_class
 
     def __iter__(self):
         for chunk in self.data:
             self.bytes_read += len(chunk)
             if self.bytes_read > self.limit:
-                raise exception.ImageSizeLimitExceeded()
+                raise self.exception_class()
             else:
                 yield chunk
 
@@ -240,7 +295,7 @@ class LimitingReader(object):
         result = self.data.read(i)
         self.bytes_read += len(result)
         if self.bytes_read > self.limit:
-            raise exception.ImageSizeLimitExceeded()
+            raise self.exception_class()
         return result
 
 
@@ -421,13 +476,14 @@ def validate_key_cert(key_file, cert_file):
         data = encodeutils.to_utf8(data)
         digest = CONF.digest_algorithm
         if digest == 'sha1':
-            LOG.warn('The FIPS (FEDERAL INFORMATION PROCESSING STANDARDS)'
-                     ' state that the SHA-1 is not suitable for'
-                     ' general-purpose digital signature applications (as'
-                     ' specified in FIPS 186-3) that require 112 bits of'
-                     ' security. The default value is sha1 in Kilo for a'
-                     ' smooth upgrade process, and it will be updated'
-                     ' with sha256 in next release(L).')
+            LOG.warn(
+                _LW('The FIPS (FEDERAL INFORMATION PROCESSING STANDARDS)'
+                    ' state that the SHA-1 is not suitable for'
+                    ' general-purpose digital signature applications (as'
+                    ' specified in FIPS 186-3) that require 112 bits of'
+                    ' security. The default value is sha1 in Kilo for a'
+                    ' smooth upgrade process, and it will be updated'
+                    ' with sha256 in next release(L).'))
         out = crypto.sign(key, data, digest)
         crypto.verify(cert, out, data, digest)
     except crypto.Error as ce:
@@ -548,31 +604,6 @@ def no_4byte_params(f):
     return wrapper
 
 
-def validate_mysql_int(*args, **kwargs):
-    """
-    Make sure that all arguments are less than 2 ** 31 - 1.
-
-    This limitation is introduced because mysql stores INT in 4 bytes.
-    If the validation fails for some argument, exception.Invalid is raised with
-    appropriate information.
-    """
-    max_int = (2 ** 31) - 1
-    for param in args:
-        if param > max_int:
-            msg = _("Value %(value)d out of range, "
-                    "must not exceed %(max)d") % {"value": param,
-                                                  "max": max_int}
-            raise exception.Invalid(msg)
-
-    for param_str in kwargs:
-        param = kwargs.get(param_str)
-        if param and param > max_int:
-            msg = _("'%(param)s' value out of range, "
-                    "must not exceed %(max)d") % {"param": param_str,
-                                                  "max": max_int}
-            raise exception.Invalid(msg)
-
-
 def stash_conf_values():
     """
     Make a copy of some of the current global CONF's settings.
@@ -602,8 +633,17 @@ def split_filter_op(expression):
     """
     left, sep, right = expression.partition(':')
     if sep:
-        op = left
-        threshold = right
+        # If the expression is a date of the format ISO 8601 like
+        # CCYY-MM-DDThh:mm:ss+hh:mm and has no operator, it should
+        # not be partitioned, and a default operator of eq should be
+        # assumed.
+        try:
+            timeutils.parse_isotime(expression)
+            op = 'eq'
+            threshold = expression
+        except ValueError:
+            op = left
+            threshold = right
     else:
         op = 'eq'  # default operator
         threshold = left
@@ -666,7 +706,7 @@ def evaluate_filter_op(value, operator, threshold):
     :param operator: any supported filter operation
     :param threshold: to compare value against, as right side of expression
 
-    :raises: InvalidFilterOperatorValue if an unknown operator is provided
+    :raises InvalidFilterOperatorValue: if an unknown operator is provided
 
     :returns: boolean result of applied comparison
 

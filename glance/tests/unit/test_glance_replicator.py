@@ -12,6 +12,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from __future__ import absolute_import
+
 import copy
 import os
 import sys
@@ -22,6 +24,7 @@ import mock
 from oslo_serialization import jsonutils
 import six
 from six import moves
+from six.moves import http_client as http
 import webob
 
 from glance.cmd import replicator as glance_replicator
@@ -126,11 +129,12 @@ class ImageServiceTestCase(test_utils.BaseTestCase):
     def test_rest_errors(self):
         c = glance_replicator.ImageService(FakeHTTPConnection(), 'noauth')
 
-        for code, exc in [(400, webob.exc.HTTPBadRequest),
-                          (401, webob.exc.HTTPUnauthorized),
-                          (403, webob.exc.HTTPForbidden),
-                          (409, webob.exc.HTTPConflict),
-                          (500, webob.exc.HTTPInternalServerError)]:
+        for code, exc in [(http.BAD_REQUEST, webob.exc.HTTPBadRequest),
+                          (http.UNAUTHORIZED, webob.exc.HTTPUnauthorized),
+                          (http.FORBIDDEN, webob.exc.HTTPForbidden),
+                          (http.CONFLICT, webob.exc.HTTPConflict),
+                          (http.INTERNAL_SERVER_ERROR,
+                           webob.exc.HTTPInternalServerError)]:
             c.conn.prime_request('GET',
                                  ('v1/images/'
                                   '5dcddce0-cba5-4f18-9cf4-9853c7b207a6'), '',
@@ -145,12 +149,12 @@ class ImageServiceTestCase(test_utils.BaseTestCase):
         resp = {'images': [IMG_RESPONSE_ACTIVE, IMG_RESPONSE_QUEUED]}
         c.conn.prime_request('GET', 'v1/images/detail?is_public=None', '',
                              {'x-auth-token': 'noauth'},
-                             200, jsonutils.dumps(resp), {})
+                             http.OK, jsonutils.dumps(resp), {})
         c.conn.prime_request('GET',
                              ('v1/images/detail?marker=%s&is_public=None'
                               % IMG_RESPONSE_QUEUED['id']),
                              '', {'x-auth-token': 'noauth'},
-                             200, jsonutils.dumps({'images': []}), {})
+                             http.OK, jsonutils.dumps({'images': []}), {})
 
         imgs = list(c.get_images())
         self.assertEqual(2, len(imgs))
@@ -163,7 +167,7 @@ class ImageServiceTestCase(test_utils.BaseTestCase):
         c.conn.prime_request('GET',
                              'v1/images/%s' % IMG_RESPONSE_ACTIVE['id'],
                              '', {'x-auth-token': 'noauth'},
-                             200, image_contents, IMG_RESPONSE_ACTIVE)
+                             http.OK, image_contents, IMG_RESPONSE_ACTIVE)
 
         body = c.get_image(IMG_RESPONSE_ACTIVE['id'])
         self.assertEqual(image_contents, body.read())
@@ -187,7 +191,7 @@ class ImageServiceTestCase(test_utils.BaseTestCase):
         c.conn.prime_request('HEAD',
                              'v1/images/%s' % IMG_RESPONSE_ACTIVE['id'],
                              '', {'x-auth-token': 'noauth'},
-                             200, '', IMG_RESPONSE_ACTIVE)
+                             http.OK, '', IMG_RESPONSE_ACTIVE)
 
         header = c.get_image_meta(IMG_RESPONSE_ACTIVE['id'])
         self.assertIn('id', header)
@@ -222,7 +226,7 @@ class ImageServiceTestCase(test_utils.BaseTestCase):
 
         c.conn.prime_request('POST', 'v1/images',
                              image_body, image_meta_with_proto,
-                             200, '', IMG_RESPONSE_ACTIVE)
+                             http.OK, '', IMG_RESPONSE_ACTIVE)
 
         headers, body = c.add_image(IMG_RESPONSE_ACTIVE, image_body)
         self.assertEqual(IMG_RESPONSE_ACTIVE, headers)
@@ -237,7 +241,7 @@ class ImageServiceTestCase(test_utils.BaseTestCase):
         image_meta_headers['x-auth-token'] = 'noauth'
         image_meta_headers['Content-Type'] = 'application/octet-stream'
         c.conn.prime_request('PUT', 'v1/images/%s' % image_meta['id'],
-                             '', image_meta_headers, 200, '', '')
+                             '', image_meta_headers, http.OK, '', '')
         headers, body = c.add_image_meta(image_meta)
 
 
@@ -254,22 +258,22 @@ class FakeHttpResponse(object):
 
 
 FAKEIMAGES = [{'status': 'active', 'size': 100, 'dontrepl': 'banana',
-               'id': '5dcddce0-cba5-4f18-9cf4-9853c7b207a6'},
+               'id': '5dcddce0-cba5-4f18-9cf4-9853c7b207a6', 'name': 'x1'},
               {'status': 'deleted', 'size': 200, 'dontrepl': 'banana',
-               'id': 'f4da1d2a-40e8-4710-b3aa-0222a4cc887b'},
+               'id': 'f4da1d2a-40e8-4710-b3aa-0222a4cc887b', 'name': 'x2'},
               {'status': 'active', 'size': 300, 'dontrepl': 'banana',
-               'id': '37ff82db-afca-48c7-ae0b-ddc7cf83e3db'}]
+               'id': '37ff82db-afca-48c7-ae0b-ddc7cf83e3db', 'name': 'x3'}]
 FAKEIMAGES_LIVEMASTER = [{'status': 'active', 'size': 100,
-                          'dontrepl': 'banana',
+                          'dontrepl': 'banana', 'name': 'x1',
                           'id': '5dcddce0-cba5-4f18-9cf4-9853c7b207a6'},
                          {'status': 'deleted', 'size': 200,
-                          'dontrepl': 'banana',
+                          'dontrepl': 'banana', 'name': 'x2',
                           'id': 'f4da1d2a-40e8-4710-b3aa-0222a4cc887b'},
                          {'status': 'deleted', 'size': 300,
-                          'dontrepl': 'banana',
+                          'dontrepl': 'banana', 'name': 'x3',
                           'id': '37ff82db-afca-48c7-ae0b-ddc7cf83e3db'},
                          {'status': 'active', 'size': 100,
-                          'dontrepl': 'banana',
+                          'dontrepl': 'banana', 'name': 'x4',
                           'id': '15648dd7-8dd0-401c-bd51-550e1ba9a088'}]
 
 
@@ -278,7 +282,7 @@ class FakeImageService(object):
         self.authtoken = authtoken
 
     def get_images(self):
-        if self.authtoken == 'livemastertoken':
+        if self.authtoken == 'livesourcetoken':
             return FAKEIMAGES_LIVEMASTER
         return FAKEIMAGES
 
@@ -292,10 +296,10 @@ class FakeImageService(object):
         return {}
 
     def add_image_meta(self, meta):
-        return {'status': 200}, None
+        return {'status': http.OK}, None
 
     def add_image(self, meta, data):
-        return {'status': 200}, None
+        return {'status': http.OK}, None
 
 
 def get_image_service():
@@ -310,8 +314,9 @@ def check_no_args(command, args):
     try:
         glance_replicator.get_image_service = get_image_service
         command(options, args)
-    except TypeError:
-        no_args_error = True
+    except TypeError as e:
+        if str(e) == "Too few arguments.":
+            no_args_error = True
     finally:
         glance_replicator.get_image_service = orig_img_service
 
@@ -348,7 +353,7 @@ class ReplicationCommandsTestCase(test_utils.BaseTestCase):
 
     def test_replication_size(self):
         options = moves.UserDict()
-        options.slavetoken = 'slavetoken'
+        options.targettoken = 'targettoken'
         args = ['localhost:9292']
 
         stdout = sys.stdout
@@ -364,10 +369,18 @@ class ReplicationCommandsTestCase(test_utils.BaseTestCase):
             glance_replicator.get_image_service = orig_img_service
 
         output = output.rstrip()
-        self.assertEqual('Total size is 400 bytes across 2 images', output)
+        self.assertEqual(
+            'Total size is 400 bytes (400.0 B) across 2 images',
+            output
+        )
 
     def test_replication_size_with_no_args(self):
         args = []
+        command = glance_replicator.replication_size
+        self.assertTrue(check_no_args(command, args))
+
+    def test_replication_size_with_args_is_None(self):
+        args = None
         command = glance_replicator.replication_size
         self.assertTrue(check_no_args(command, args))
 
@@ -376,12 +389,26 @@ class ReplicationCommandsTestCase(test_utils.BaseTestCase):
         command = glance_replicator.replication_size
         self.assertTrue(check_bad_args(command, args))
 
+    def test_human_readable_size(self):
+        _human_readable_size = glance_replicator._human_readable_size
+
+        self.assertEqual('0.0 B', _human_readable_size(0))
+        self.assertEqual('1.0 B', _human_readable_size(1))
+        self.assertEqual('512.0 B', _human_readable_size(512))
+        self.assertEqual('1.0 KiB', _human_readable_size(1024))
+        self.assertEqual('2.0 KiB', _human_readable_size(2048))
+        self.assertEqual('8.0 KiB', _human_readable_size(8192))
+        self.assertEqual('64.0 KiB', _human_readable_size(65536))
+        self.assertEqual('93.3 KiB', _human_readable_size(95536))
+        self.assertEqual('117.7 MiB', _human_readable_size(123456789))
+        self.assertEqual('36.3 GiB', _human_readable_size(39022543360))
+
     def test_replication_dump(self):
         tempdir = self.useFixture(fixtures.TempDir()).path
 
         options = moves.UserDict()
         options.chunksize = 4096
-        options.mastertoken = 'mastertoken'
+        options.sourcetoken = 'sourcetoken'
         options.metaonly = False
         args = ['localhost:9292', tempdir]
 
@@ -468,7 +495,7 @@ class ReplicationCommandsTestCase(test_utils.BaseTestCase):
         # Finally, we're ready to test
         options = moves.UserDict()
         options.dontreplicate = 'dontrepl dontreplabsent'
-        options.slavetoken = 'slavetoken'
+        options.targettoken = 'targettoken'
         args = ['localhost:9292', tempdir]
 
         orig_img_service = glance_replicator.get_image_service
@@ -497,8 +524,8 @@ class ReplicationCommandsTestCase(test_utils.BaseTestCase):
         options = moves.UserDict()
         options.chunksize = 4096
         options.dontreplicate = 'dontrepl dontreplabsent'
-        options.mastertoken = 'livemastertoken'
-        options.slavetoken = 'liveslavetoken'
+        options.sourcetoken = 'livesourcetoken'
+        options.targettoken = 'livetargettoken'
         options.metaonly = False
         args = ['localhost:9292', 'localhost:9393']
 
@@ -525,8 +552,8 @@ class ReplicationCommandsTestCase(test_utils.BaseTestCase):
         options = moves.UserDict()
         options.chunksize = 4096
         options.dontreplicate = 'dontrepl dontreplabsent'
-        options.mastertoken = 'livemastertoken'
-        options.slavetoken = 'liveslavetoken'
+        options.sourcetoken = 'livesourcetoken'
+        options.targettoken = 'livetargettoken'
         options.metaonly = False
         args = ['localhost:9292', 'localhost:9393']
 

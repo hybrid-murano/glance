@@ -15,7 +15,7 @@
 #    under the License.
 
 """
-Utility methods to set testcases up for Swift and/or S3 tests.
+Utility methods to set testcases up for Swift tests.
 """
 
 from __future__ import print_function
@@ -24,6 +24,7 @@ import threading
 
 from oslo_utils import units
 from six.moves import BaseHTTPServer
+from six.moves import http_client as http
 
 
 FIVE_KB = 5 * units.Ki
@@ -35,13 +36,13 @@ class RemoteImageHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         Respond to an image HEAD request fake metadata
         """
         if 'images' in self.path:
-            self.send_response(200)
+            self.send_response(http.OK)
             self.send_header('Content-Type', 'application/octet-stream')
             self.send_header('Content-Length', FIVE_KB)
             self.end_headers()
             return
         else:
-            self.send_error(404, 'File Not Found: %s' % self.path)
+            self.send_error(http.NOT_FOUND, 'File Not Found: %s' % self.path)
             return
 
     def do_GET(self):
@@ -49,16 +50,16 @@ class RemoteImageHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         Respond to an image GET request with fake image content.
         """
         if 'images' in self.path:
-            self.send_response(200)
+            self.send_response(http.OK)
             self.send_header('Content-Type', 'application/octet-stream')
             self.send_header('Content-Length', FIVE_KB)
             self.end_headers()
-            image_data = '*' * FIVE_KB
+            image_data = b'*' * FIVE_KB
             self.wfile.write(image_data)
             self.wfile.close()
             return
         else:
-            self.send_error(404, 'File Not Found: %s' % self.path)
+            self.send_error(http.NOT_FOUND, 'File Not Found: %s' % self.path)
             return
 
     def log_message(self, format, *args):
@@ -84,6 +85,7 @@ def setup_http(test):
 
 
 def get_http_uri(test, image_id):
-    uri = 'http://%(http_ip)s:%(http_port)d/images/' % test.__dict__
+    uri = ('http://%(http_ip)s:%(http_port)d/images/' %
+           {'http_ip': test.http_ip, 'http_port': test.http_port})
     uri += image_id
     return uri

@@ -68,7 +68,7 @@ class TestRegistryV2Client(base.IsolatedUnitTest,
         uuid2_time = uuid1_time + datetime.timedelta(seconds=5)
         self.FIXTURES = [
             self.get_extra_fixture(
-                id=UUID1, name='fake image #1', is_public=False,
+                id=UUID1, name='fake image #1', visibility='shared',
                 disk_format='ami', container_format='ami', size=13,
                 virtual_size=26, properties={'type': 'kernel'},
                 location="swift://user:passwd@acct/container/obj.tar.0",
@@ -469,7 +469,8 @@ class TestRegistryV2Client(base.IsolatedUnitTest,
     def test_image_get(self):
         """Tests that the detailed info about an image returned"""
         fixture = self.get_fixture(id=UUID1, name='fake image #1',
-                                   is_public=False, size=13, virtual_size=26,
+                                   visibility='shared',
+                                   size=13, virtual_size=26,
                                    disk_format='ami', container_format='ami')
 
         data = self.client.image_get(image_id=UUID1)
@@ -677,7 +678,7 @@ class TestRegistryV2Client(base.IsolatedUnitTest,
         self.assertEqual(0, num_members)
 
     def test_image_member_find_include_deleted(self):
-        """Tests getting member images include the delted member"""
+        """Tests getting image members including the deleted member"""
         values = dict(image_id=UUID2, member='pattieblack')
         # create a member
         member = self.client.image_member_create(values=values)
@@ -731,10 +732,6 @@ class TestRegistryV2ClientApi(base.IsolatedUnitTest):
         """Establish a clean test environment"""
         super(TestRegistryV2ClientApi, self).setUp()
         reload_module(rapi)
-
-    def tearDown(self):
-        """Clear the test environment"""
-        super(TestRegistryV2ClientApi, self).tearDown()
 
     def test_configure_registry_client_not_using_use_user_token(self):
         self.config(use_user_token=False)

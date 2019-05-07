@@ -14,7 +14,9 @@
 #    under the License.
 
 import datetime
+import mock
 
+from oslo_serialization import jsonutils
 import webob
 
 from glance.api.v2 import metadef_namespaces as namespaces
@@ -22,6 +24,7 @@ from glance.api.v2 import metadef_objects as objects
 from glance.api.v2 import metadef_properties as properties
 from glance.api.v2 import metadef_resource_types as resource_types
 from glance.api.v2 import metadef_tags as tags
+import glance.gateway
 from glance.tests.unit import base
 import glance.tests.unit.utils as unit_test_utils
 
@@ -159,6 +162,7 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
         self.tag_controller = tags.TagsController(
             self.db, self.policy, self.notifier)
         self.deserializer = objects.RequestDeserializer()
+        self.property_deserializer = properties.RequestDeserializer()
 
     def _create_namespaces(self):
         req = unit_test_utils.get_fake_request()
@@ -393,6 +397,52 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
             [self.assertTrue(property_name.startswith(rt.prefix)) for
              property_name in object.properties.keys()]
 
+    @mock.patch('glance.api.v2.metadef_namespaces.LOG')
+    def test_cleanup_namespace_success(self, mock_log):
+        fake_gateway = glance.gateway.Gateway(db_api=self.db,
+                                              notifier=self.notifier,
+                                              policy_enforcer=self.policy)
+        req = unit_test_utils.get_fake_request()
+        ns_factory = fake_gateway.get_metadef_namespace_factory(
+            req.context)
+        ns_repo = fake_gateway.get_metadef_namespace_repo(req.context)
+        namespace = namespaces.Namespace()
+        namespace.namespace = 'FakeNamespace'
+        new_namespace = ns_factory.new_namespace(**namespace.to_dict())
+        ns_repo.add(new_namespace)
+
+        self.namespace_controller._cleanup_namespace(ns_repo, namespace, True)
+
+        mock_log.debug.assert_called_with(
+            "Cleaned up namespace %(namespace)s ",
+            {'namespace': namespace.namespace})
+
+    @mock.patch('glance.api.v2.metadef_namespaces.LOG')
+    @mock.patch('glance.api.authorization.MetadefNamespaceRepoProxy.remove')
+    def test_cleanup_namespace_exception(self, mock_remove, mock_log):
+        mock_remove.side_effect = Exception(u'Mock remove was called')
+
+        fake_gateway = glance.gateway.Gateway(db_api=self.db,
+                                              notifier=self.notifier,
+                                              policy_enforcer=self.policy)
+        req = unit_test_utils.get_fake_request()
+        ns_factory = fake_gateway.get_metadef_namespace_factory(
+            req.context)
+        ns_repo = fake_gateway.get_metadef_namespace_repo(req.context)
+        namespace = namespaces.Namespace()
+        namespace.namespace = 'FakeNamespace'
+        new_namespace = ns_factory.new_namespace(**namespace.to_dict())
+        ns_repo.add(new_namespace)
+
+        self.namespace_controller._cleanup_namespace(ns_repo, namespace, True)
+
+        called_msg = 'Failed to delete namespace %(namespace)s.' \
+                     'Exception: %(exception)s'
+        called_args = {'exception': u'Mock remove was called',
+                       'namespace': u'FakeNamespace'}
+        mock_log.error.assert_called_with((called_msg, called_args))
+        mock_remove.assert_called_once_with(mock.ANY)
+
     def test_namespace_show_non_existing(self):
         request = unit_test_utils.get_fake_request()
         self.assertRaises(webob.exc.HTTPNotFound,
@@ -606,6 +656,16 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
         namespace = self.namespace_controller.show(request, NAMESPACE4)
         self.assertEqual(NAMESPACE4, namespace.namespace)
 
+    def test_namespace_create_with_4byte_character(self):
+        request = unit_test_utils.get_fake_request()
+
+        namespace = namespaces.Namespace()
+        namespace.namespace = u'\U0001f693'
+
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.namespace_controller.create, request,
+                          namespace)
+
     def test_namespace_create_duplicate(self):
         request = unit_test_utils.get_fake_request()
 
@@ -810,6 +870,16 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
         self.assertRaises(webob.exc.HTTPNotFound,
                           self.namespace_controller.show, request, NAMESPACE1)
 
+    def test_namespace_update_with_4byte_character(self):
+        request = unit_test_utils.get_fake_request()
+
+        namespace = self.namespace_controller.show(request, NAMESPACE1)
+        namespace.namespace = u'\U0001f693'
+
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.namespace_controller.update, request,
+                          namespace, NAMESPACE1)
+
     def test_namespace_update_name_conflict(self):
         request = unit_test_utils.get_fake_request()
         namespace = self.namespace_controller.show(request, NAMESPACE1)
@@ -963,6 +1033,31 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
         self.assertEqual(PROPERTY2, property.name)
         self.assertEqual('string', property.type)
         self.assertEqual('title', property.title)
+
+    def test_property_create_overlimit_name(self):
+        request = unit_test_utils.get_fake_request('/metadefs/namespaces/'
+                                                   'Namespace3/'
+                                                   'properties')
+        request.body = jsonutils.dump_as_bytes({
+            'name': 'a' * 81, 'type': 'string', 'title': 'fake'})
+
+        exc = self.assertRaises(webob.exc.HTTPBadRequest,
+                                self.property_deserializer.create,
+                                request)
+        self.assertIn("Failed validating 'maxLength' in "
+                      "schema['properties']['name']", exc.explanation)
+
+    def test_property_create_with_4byte_character(self):
+        request = unit_test_utils.get_fake_request()
+
+        property = properties.PropertyType()
+        property.name = u'\U0001f693'
+        property.type = 'string'
+        property.title = 'title'
+
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.property_controller.create,
+                          request, NAMESPACE1, property)
 
     def test_property_create_with_operators(self):
         request = unit_test_utils.get_fake_request()
@@ -1131,6 +1226,29 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
                           PROPERTY1, property)
         self.assertNotificationsLog([])
 
+    def test_property_update_with_overlimit_name(self):
+        request = unit_test_utils.get_fake_request()
+        request.body = jsonutils.dump_as_bytes({
+            'name': 'a' * 81, 'type': 'string', 'title': 'fake'})
+        exc = self.assertRaises(webob.exc.HTTPBadRequest,
+                                self.property_deserializer.create,
+                                request)
+        self.assertIn("Failed validating 'maxLength' in "
+                      "schema['properties']['name']", exc.explanation)
+
+    def test_property_update_with_4byte_character(self):
+        request = unit_test_utils.get_fake_request(tenant=TENANT3)
+
+        property = self.property_controller.show(request, NAMESPACE3,
+                                                 PROPERTY1)
+        property.name = u'\U0001f693'
+        property.type = 'string'
+        property.title = 'title'
+
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.property_controller.update, request,
+                          NAMESPACE3, PROPERTY1, property)
+
     def test_property_update_non_existing(self):
         request = unit_test_utils.get_fake_request(tenant=TENANT3)
 
@@ -1287,6 +1405,39 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
         self.assertEqual([], object.required)
         self.assertEqual({}, object.properties)
 
+    def test_object_create_invalid_properties(self):
+        request = unit_test_utils.get_fake_request('/metadefs/namespaces/'
+                                                   'Namespace3/'
+                                                   'objects')
+        body = {
+            "name": "My Object",
+            "description": "object1 description.",
+            "properties": {
+                "property1": {
+                    "type": "integer",
+                    "title": "property",
+                    "description": "property description",
+                    "test-key": "test-value",
+                }
+            }
+        }
+        request.body = jsonutils.dump_as_bytes(body)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.deserializer.create,
+                          request)
+
+    def test_object_create_overlimit_name(self):
+        request = unit_test_utils.get_fake_request('/metadefs/namespaces/'
+                                                   'Namespace3/'
+                                                   'objects')
+        request.body = jsonutils.dump_as_bytes({'name': 'a' * 81})
+
+        exc = self.assertRaises(webob.exc.HTTPBadRequest,
+                                self.deserializer.create,
+                                request)
+        self.assertIn("Failed validating 'maxLength' in "
+                      "schema['properties']['name']", exc.explanation)
+
     def test_object_create_duplicate(self):
         request = unit_test_utils.get_fake_request()
 
@@ -1312,6 +1463,18 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
                           self.object_controller.create, request, object,
                           NAMESPACE1)
         self.assertNotificationsLog([])
+
+    def test_object_create_with_4byte_character(self):
+        request = unit_test_utils.get_fake_request()
+
+        object = objects.MetadefObject()
+        object.name = u'\U0001f693'
+        object.required = []
+        object.properties = {}
+
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.object_controller.create, request,
+                          object, NAMESPACE1)
 
     def test_object_create_non_existing_namespace(self):
         request = unit_test_utils.get_fake_request()
@@ -1415,6 +1578,25 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
         ])
         object = self.object_controller.show(request, NAMESPACE1, OBJECT2)
         self.assertEqual(OBJECT2, object.name)
+
+    def test_object_update_with_4byte_character(self):
+        request = unit_test_utils.get_fake_request()
+
+        object = self.object_controller.show(request, NAMESPACE1, OBJECT1)
+        object.name = u'\U0001f693'
+
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.object_controller.update, request,
+                          object, NAMESPACE1, OBJECT1)
+
+    def test_object_update_with_overlimit_name(self):
+        request = unit_test_utils.get_fake_request()
+        request.body = jsonutils.dump_as_bytes(
+            {"properties": {}, "name": "a" * 81, "required": []})
+        exc = self.assertRaises(webob.exc.HTTPBadRequest,
+                                self.deserializer.update, request)
+        self.assertIn("Failed validating 'maxLength' in "
+                      "schema['properties']['name']", exc.explanation)
 
     def test_object_update_conflict(self):
         request = unit_test_utils.get_fake_request(tenant=TENANT3)
@@ -1745,6 +1927,22 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
         tag = self.tag_controller.show(request, NAMESPACE1, TAG2)
         self.assertEqual(TAG2, tag.name)
 
+    def test_tag_create_overlimit_name(self):
+        request = unit_test_utils.get_fake_request()
+
+        exc = self.assertRaises(webob.exc.HTTPBadRequest,
+                                self.tag_controller.create,
+                                request, NAMESPACE1, 'a' * 81)
+        self.assertIn("Failed validating 'maxLength' in "
+                      "schema['properties']['name']", exc.explanation)
+
+    def test_tag_create_with_4byte_character(self):
+        request = unit_test_utils.get_fake_request()
+
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.tag_controller.create,
+                          request, NAMESPACE1, u'\U0001f693')
+
     def test_tag_create_tags(self):
         request = unit_test_utils.get_fake_request()
 
@@ -1872,6 +2070,25 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
         tag = self.tag_controller.show(request, NAMESPACE1, TAG2)
         self.assertEqual(TAG2, tag.name)
 
+    def test_tag_update_with_4byte_character(self):
+        request = unit_test_utils.get_fake_request()
+
+        tag = self.tag_controller.show(request, NAMESPACE1, TAG1)
+        tag.name = u'\U0001f693'
+
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.tag_controller.update, request, tag,
+                          NAMESPACE1, TAG1)
+
+    def test_tag_update_with_name_overlimit(self):
+        request = unit_test_utils.get_fake_request()
+        request.body = jsonutils.dump_as_bytes(
+            {"properties": {}, "name": "a" * 81, "required": []})
+        exc = self.assertRaises(webob.exc.HTTPBadRequest,
+                                self.deserializer.update, request)
+        self.assertIn("Failed validating 'maxLength' in "
+                      "schema['properties']['name']", exc.explanation)
+
     def test_tag_update_conflict(self):
         request = unit_test_utils.get_fake_request(tenant=TENANT3)
 
@@ -1903,3 +2120,16 @@ class TestMetadefsControllers(base.IsolatedUnitTest):
                           self.tag_controller.update, request, tag,
                           NAMESPACE4, TAG1)
         self.assertNotificationsLog([])
+
+
+class TestMetadefNamespaceResponseSerializers(base.IsolatedUnitTest):
+
+    def setUp(self):
+        super(TestMetadefNamespaceResponseSerializers, self).setUp()
+        self.serializer = namespaces.ResponseSerializer(schema={})
+        self.response = mock.Mock()
+        self.result = mock.Mock()
+
+    def test_delete_tags(self):
+        self.serializer.delete_tags(self.response, self.result)
+        self.assertEqual(204, self.response.status_int)

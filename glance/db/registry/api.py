@@ -31,7 +31,7 @@ database back-end.
 
 import functools
 
-from glance import glare
+from glance.db import utils as db_utils
 from glance.registry.client.v2 import api
 
 
@@ -54,21 +54,24 @@ def _get_client(func):
 
 
 @_get_client
-def image_create(client, values):
+def image_create(client, values, v1_mode=False):
     """Create an image from the values dictionary."""
-    return client.image_create(values=values)
+    return client.image_create(values=values, v1_mode=v1_mode)
 
 
 @_get_client
-def image_update(client, image_id, values, purge_props=False, from_state=None):
+def image_update(client, image_id, values, purge_props=False, from_state=None,
+                 v1_mode=False):
     """
     Set the given properties on an image and update it.
 
-    :raises: ImageNotFound if image does not exist.
+    :raises ImageNotFound: if image does not exist.
     """
     return client.image_update(values=values,
                                image_id=image_id,
-                               purge_props=purge_props, from_state=from_state)
+                               purge_props=purge_props,
+                               from_state=from_state,
+                               v1_mode=v1_mode)
 
 
 @_get_client
@@ -78,47 +81,22 @@ def image_destroy(client, image_id):
 
 
 @_get_client
-def image_get(client, image_id, force_show_deleted=False):
+def image_get(client, image_id, force_show_deleted=False, v1_mode=False):
     return client.image_get(image_id=image_id,
-                            force_show_deleted=force_show_deleted)
+                            force_show_deleted=force_show_deleted,
+                            v1_mode=v1_mode)
 
 
 def is_image_visible(context, image, status=None):
     """Return True if the image is visible in this context."""
-    # Is admin == image visible
-    if context.is_admin:
-        return True
-
-    # No owner == image visible
-    if image['owner'] is None:
-        return True
-
-    # Image is_public == image visible
-    if image['is_public']:
-        return True
-
-    # Perform tests based on whether we have an owner
-    if context.owner is not None:
-        if context.owner == image['owner']:
-            return True
-
-        # Figure out if this image is shared with that tenant
-        members = image_member_find(context,
-                                    image_id=image['id'],
-                                    member=context.owner,
-                                    status=status)
-        if members:
-            return True
-
-    # Private image
-    return False
+    return db_utils.is_image_visible(context, image, image_member_find, status)
 
 
 @_get_client
 def image_get_all(client, filters=None, marker=None, limit=None,
                   sort_key=None, sort_dir=None,
                   member_status='accepted', is_public=None,
-                  admin_as_user=False, return_tag=False):
+                  admin_as_user=False, return_tag=False, v1_mode=False):
     """
     Get all images that match zero or more filters.
 
@@ -139,6 +117,8 @@ def image_get_all(client, filters=None, marker=None, limit=None,
     :param return_tag: To indicates whether image entry in result includes it
                        relevant tag entries. This could improve upper-layer
                        query performance, to prevent using separated calls
+    :param v1_mode: If true, mutates the 'visibility' value of each image
+                    into the v1-compatible field 'is_public'
     """
     sort_key = ['created_at'] if not sort_key else sort_key
     sort_dir = ['desc'] if not sort_dir else sort_dir
@@ -147,7 +127,8 @@ def image_get_all(client, filters=None, marker=None, limit=None,
                                 member_status=member_status,
                                 is_public=is_public,
                                 admin_as_user=admin_as_user,
-                                return_tag=return_tag)
+                                return_tag=return_tag,
+                                v1_mode=v1_mode)
 
 
 @_get_client
@@ -563,53 +544,3 @@ def metadef_tag_delete_namespace_content(
 @_get_client
 def metadef_tag_count(client, namespace_name, session=None):
     return client.metadef_tag_count(namespace_name=namespace_name)
-
-
-@_get_client
-def artifact_create(client, values,
-                    type_name, type_version=None, session=None):
-    return client.artifact_create(values=values,
-                                  type_name=type_name,
-                                  type_version=type_version)
-
-
-@_get_client
-def artifact_update(client, values, artifact_id,
-                    type_name, type_version=None, session=None):
-    return client.artifact_update(values=values, artifact_id=artifact_id,
-                                  type_name=type_name,
-                                  type_version=type_version)
-
-
-@_get_client
-def artifact_delete(client, artifact_id,
-                    type_name, type_version=None, session=None):
-    return client.artifact_delete(artifact_id=artifact_id,
-                                  type_name=type_name,
-                                  type_version=type_version)
-
-
-@_get_client
-def artifact_get(client, artifact_id,
-                 type_name, type_version=None, session=None):
-    return client.artifact_get(artifact_id=artifact_id,
-                               type_name=type_name,
-                               type_version=type_version)
-
-
-@_get_client
-def artifact_get_all(client, marker=None, limit=None, sort_key=None,
-                     sort_dir=None, filters=None,
-                     show_level=glare.Showlevel.NONE, session=None):
-    if filters is None:
-        filters = {}
-    return client.artifact_create(marker, limit, sort_key,
-                                  sort_dir, filters, show_level)
-
-
-@_get_client
-def artifact_publish(client, artifact_id,
-                     type_name, type_version=None, session=None):
-    return client.artifact_publish(artifact_id=artifact_id,
-                                   type_name=type_name,
-                                   type_version=type_version)

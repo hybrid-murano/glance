@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 import six
+from six.moves import http_client as http
 import webob.exc
 from wsme.rest import json
 
@@ -34,17 +34,17 @@ import glance.schema
 
 LOG = logging.getLogger(__name__)
 
-CONF = cfg.CONF
-
 
 class TagsController(object):
-    def __init__(self, db_api=None, policy_enforcer=None, notifier=None):
+    def __init__(self, db_api=None, policy_enforcer=None, notifier=None,
+                 schema=None):
         self.db_api = db_api or glance.db.get_api()
         self.policy = policy_enforcer or policy.Enforcer()
         self.notifier = notifier or glance.notifier.Notifier()
         self.gateway = glance.gateway.Gateway(db_api=self.db_api,
                                               notifier=self.notifier,
                                               policy_enforcer=self.policy)
+        self.schema = schema or get_schema()
         self.tag_schema_link = '/v2/schemas/metadefs/tag'
 
     def create(self, req, namespace, tag_name):
@@ -52,10 +52,18 @@ class TagsController(object):
         tag_repo = self.gateway.get_metadef_tag_repo(req.context)
         tag_name_as_dict = {'name': tag_name}
         try:
+            self.schema.validate(tag_name_as_dict)
+        except exception.InvalidObject as e:
+            raise webob.exc.HTTPBadRequest(explanation=e.msg)
+        try:
             new_meta_tag = tag_factory.new_tag(
                 namespace=namespace,
                 **tag_name_as_dict)
             tag_repo.add(new_meta_tag)
+        except exception.Invalid as e:
+            msg = (_("Couldn't create metadata tag: %s")
+                   % encodeutils.exception_to_unicode(e))
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.Forbidden as e:
             LOG.debug("User not permitted to create metadata tag within "
                       "'%s' namespace", namespace)
@@ -152,6 +160,10 @@ class TagsController(object):
             metadef_tag.name = wsme_utils._get_value(
                 metadata_tag.name)
             updated_metadata_tag = meta_repo.save(metadef_tag)
+        except exception.Invalid as e:
+            msg = (_("Couldn't update metadata tag: %s")
+                   % encodeutils.exception_to_unicode(e))
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.Forbidden as e:
             LOG.debug("User not permitted to update metadata tag '%s' "
                       "within '%s' namespace", tag_name, namespace)
@@ -190,7 +202,8 @@ def _get_base_definitions():
 def _get_base_properties():
     return {
         "name": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 80
         },
         "created_at": {
             "type": "string",
@@ -353,11 +366,11 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         self.schema = schema or get_schema()
 
     def create(self, response, metadata_tag):
-        response.status_int = 201
+        response.status_int = http.CREATED
         self.show(response, metadata_tag)
 
     def create_tags(self, response, result):
-        response.status_int = 201
+        response.status_int = http.CREATED
         metadata_tags_json = json.tojson(MetadefTags, result)
         body = jsonutils.dumps(metadata_tags_json, ensure_ascii=False)
         response.unicode_body = six.text_type(body)
@@ -370,7 +383,7 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         response.content_type = 'application/json'
 
     def update(self, response, metadata_tag):
-        response.status_int = 200
+        response.status_int = http.OK
         self.show(response, metadata_tag)
 
     def index(self, response, result):
@@ -380,7 +393,7 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         response.content_type = 'application/json'
 
     def delete(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
 
 def get_tag_href(namespace_name, metadef_tag):

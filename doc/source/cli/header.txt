@@ -1,0 +1,8 @@
+﻿
+:Author: OpenStack Glance Project Team
+:Contact: openstack-discuss@lists.openstack.org
+:Date: 2018-08-30
+:Copyright: OpenStack Foundation
+:Version: 17.0.0
+:Manual section: 1
+:Manual group: cloud computing

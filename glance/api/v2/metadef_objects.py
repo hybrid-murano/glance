@@ -13,16 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 import six
+from six.moves import http_client as http
 import webob.exc
 from wsme.rest import json
 
 from glance.api import policy
 from glance.api.v2 import metadef_namespaces as namespaces
+import glance.api.v2.metadef_properties as properties
 from glance.api.v2.model.metadef_object import MetadefObject
 from glance.api.v2.model.metadef_object import MetadefObjects
 from glance.common import exception
@@ -34,8 +35,6 @@ import glance.notifier
 import glance.schema
 
 LOG = logging.getLogger(__name__)
-
-CONF = cfg.CONF
 
 
 class MetadefObjectsController(object):
@@ -61,6 +60,10 @@ class MetadefObjectsController(object):
             LOG.debug("User not permitted to create metadata object within "
                       "'%s' namespace", namespace)
             raise webob.exc.HTTPForbidden(explanation=e.msg)
+        except exception.Invalid as e:
+            msg = (_("Couldn't create metadata object: %s")
+                   % encodeutils.exception_to_unicode(e))
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
         except exception.Duplicate as e:
@@ -132,6 +135,10 @@ class MetadefObjectsController(object):
             metadef_object.properties = wsme_utils._get_value(
                 metadata_object.properties)
             updated_metadata_obj = meta_repo.save(metadef_object)
+        except exception.Invalid as e:
+            msg = (_("Couldn't update metadata object: %s")
+                   % encodeutils.exception_to_unicode(e))
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.Forbidden as e:
             LOG.debug("User not permitted to update metadata object '%s' "
                       "within '%s' namespace ", object_name, namespace)
@@ -172,7 +179,8 @@ def _get_base_definitions():
 def _get_base_properties():
     return {
         "name": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 80
         },
         "description": {
             "type": "string"
@@ -243,6 +251,10 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
         self._check_allowed(body)
         try:
             self.schema.validate(body)
+            if 'properties' in body:
+                for propertyname in body['properties']:
+                    schema = properties.get_schema(require_name=False)
+                    schema.validate(body['properties'][propertyname])
         except exception.InvalidObject as e:
             raise webob.exc.HTTPBadRequest(explanation=e.msg)
         metadata_object = json.fromjson(MetadefObject, body)
@@ -321,7 +333,7 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         self.schema = schema or get_schema()
 
     def create(self, response, metadata_object):
-        response.status_int = 201
+        response.status_int = http.CREATED
         self.show(response, metadata_object)
 
     def show(self, response, metadata_object):
@@ -331,7 +343,7 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         response.content_type = 'application/json'
 
     def update(self, response, metadata_object):
-        response.status_int = 200
+        response.status_int = http.OK
         self.show(response, metadata_object)
 
     def index(self, response, result):
@@ -342,7 +354,7 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         response.content_type = 'application/json'
 
     def delete(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
 
 def get_object_href(namespace_name, metadef_object):

@@ -18,10 +18,10 @@
 import datetime
 import uuid
 
-from oslo_config import cfg
 from oslo_serialization import jsonutils
 import routes
 import six
+from six.moves import http_client as http
 import webob
 
 import glance.api.common
@@ -33,8 +33,6 @@ from glance.db.sqlalchemy import models as db_models
 from glance.registry.api import v2 as rserver
 from glance.tests.unit import base
 from glance.tests import utils as test_utils
-
-CONF = cfg.CONF
 
 _gen_uuid = lambda: str(uuid.uuid4())
 
@@ -59,7 +57,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
              'status': 'active',
              'disk_format': 'ami',
              'container_format': 'ami',
-             'is_public': False,
+             'visibility': 'shared',
              'created_at': uuid1_time,
              'updated_at': uuid1_time,
              'deleted_at': None,
@@ -76,7 +74,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
              'status': 'active',
              'disk_format': 'vhd',
              'container_format': 'ovf',
-             'is_public': True,
+             'visibility': 'public',
              'created_at': uuid2_time,
              'updated_at': uuid2_time,
              'deleted_at': None,
@@ -131,7 +129,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
         image = res_dict
         for k, v in six.iteritems(fixture):
@@ -167,7 +165,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(1, len(images))
@@ -187,7 +185,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -201,7 +199,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -215,7 +213,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID5 = _gen_uuid()
         extra_fixture = {'id': UUID5,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -235,7 +233,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         images = jsonutils.loads(res.body)[0]
         # should be sorted by created_at desc, id desc
@@ -253,7 +251,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': None,
@@ -272,7 +270,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(2, len(images))
 
@@ -286,7 +284,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': None,
@@ -305,7 +303,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(images))
 
@@ -319,7 +317,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': None,
                          'container_format': 'ovf',
                          'name': 'Fake image',
@@ -338,7 +336,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(2, len(images))
 
@@ -352,7 +350,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': None,
                          'container_format': 'ovf',
                          'name': 'Fake image',
@@ -371,7 +369,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(images))
 
@@ -385,7 +383,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': None,
                          'name': 'Fake image',
@@ -404,7 +402,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(2, len(images))
 
@@ -418,7 +416,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': None,
                          'name': 'Fake image',
@@ -437,7 +435,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(images))
 
@@ -467,7 +465,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -481,7 +479,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -501,7 +499,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
         images = jsonutils.loads(res.body)[0]
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         self._compare_images_and_uuids([UUID4], images)
 
@@ -516,7 +514,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -529,7 +527,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
 
         extra_fixture = {'id': _gen_uuid(),
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -549,7 +547,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
         res_dict = jsonutils.loads(res.body)[0]
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         images = res_dict
         self._compare_images_and_uuids([UUID2], images)
@@ -563,7 +561,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         """
         extra_fixture = {'id': _gen_uuid(),
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -574,7 +572,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
 
         extra_fixture = {'id': _gen_uuid(),
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -592,7 +590,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
         res_dict = jsonutils.loads(res.body)[0]
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         images = res_dict
         self.assertEqual(2, len(images))
@@ -609,7 +607,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         extra_id = _gen_uuid()
         extra_fixture = {'id': extra_id,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'image-extra-1',
@@ -626,7 +624,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(2, len(images))
         self.assertEqual(extra_id, images[0]['id'])
@@ -639,7 +637,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(images))
 
@@ -650,7 +648,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(images))
 
@@ -661,7 +659,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(images))
 
@@ -672,7 +670,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(1, len(images))
         self.assertEqual(extra_id, images[0]['id'])
@@ -684,7 +682,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(images))
 
@@ -695,7 +693,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(images))
 
@@ -706,7 +704,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         images = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(images))
 
@@ -722,7 +720,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -736,7 +734,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -750,7 +748,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID5 = _gen_uuid()
         extra_fixture = {'id': UUID5,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -769,7 +767,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
         res_dict = jsonutils.loads(res.body)[0]
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         images = res_dict
         # (flaper87)registry's v1 forced is_public to True
@@ -786,7 +784,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'asdf',
@@ -798,7 +796,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'xyz',
@@ -809,7 +807,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID5 = _gen_uuid()
         extra_fixture = {'id': UUID5,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': None,
@@ -826,7 +824,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -844,7 +842,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'queued',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'asdf',
@@ -856,7 +854,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'xyz',
@@ -875,7 +873,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -892,7 +890,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'ami',
                          'container_format': 'ami',
                          'name': 'asdf',
@@ -906,7 +904,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vdi',
                          'container_format': 'ovf',
                          'name': 'xyz',
@@ -923,7 +921,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -940,7 +938,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'ami',
                          'container_format': 'ami',
                          'name': 'asdf',
@@ -954,7 +952,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'iso',
                          'container_format': 'bare',
                          'name': 'xyz',
@@ -972,7 +970,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -987,7 +985,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'ami',
                          'container_format': 'ami',
                          'name': 'asdf',
@@ -999,7 +997,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'iso',
                          'container_format': 'bare',
                          'name': 'xyz',
@@ -1017,7 +1015,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -1035,7 +1033,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -1049,7 +1047,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -1069,7 +1067,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -1087,7 +1085,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -1101,7 +1099,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'new name! #123',
@@ -1121,7 +1119,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -1140,7 +1138,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'asdf',
@@ -1154,7 +1152,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'xyz',
@@ -1168,7 +1166,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID5 = _gen_uuid()
         extra_fixture = {'id': UUID5,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'asdf',
@@ -1188,7 +1186,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -1202,7 +1200,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -1221,7 +1219,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID3 = _gen_uuid()
         extra_fixture = {'id': UUID3,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'asdf',
@@ -1235,7 +1233,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID4 = _gen_uuid()
         extra_fixture = {'id': UUID4,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'xyz',
@@ -1249,7 +1247,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         UUID5 = _gen_uuid()
         extra_fixture = {'id': UUID5,
                          'status': 'active',
-                         'is_public': True,
+                         'visibility': 'public',
                          'disk_format': 'vhd',
                          'container_format': 'ovf',
                          'name': 'asdf',
@@ -1269,7 +1267,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -1283,7 +1281,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -1297,7 +1295,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -1311,7 +1309,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         }]
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         res_dict = jsonutils.loads(res.body)[0]
 
         images = res_dict
@@ -1322,7 +1320,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         """Tests that the registry API creates the image"""
         fixture = {'name': 'fake public image',
                    'status': 'active',
-                   'is_public': True,
+                   'visibility': 'public',
                    'disk_format': 'vhd',
                    'container_format': 'ovf'}
 
@@ -1335,7 +1333,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
 
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         res_dict = jsonutils.loads(res.body)[0]
 
@@ -1348,7 +1346,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
     def test_create_image_with_min_disk(self):
         """Tests that the registry API creates the image"""
         fixture = {'name': 'fake public image',
-                   'is_public': True,
+                   'visibility': 'public',
                    'status': 'active',
                    'min_disk': 5,
                    'disk_format': 'vhd',
@@ -1363,7 +1361,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         res_dict = jsonutils.loads(res.body)[0]
 
@@ -1372,7 +1370,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
     def test_create_image_with_min_ram(self):
         """Tests that the registry API creates the image"""
         fixture = {'name': 'fake public image',
-                   'is_public': True,
+                   'visibility': 'public',
                    'status': 'active',
                    'min_ram': 256,
                    'disk_format': 'vhd',
@@ -1387,7 +1385,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         res_dict = jsonutils.loads(res.body)[0]
 
@@ -1397,7 +1395,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         """Tests that the registry API creates the image"""
         fixture = {'name': 'fake public image',
                    'status': 'active',
-                   'is_public': True,
+                   'visibility': 'public',
                    'disk_format': 'vhd',
                    'container_format': 'ovf'}
 
@@ -1410,7 +1408,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         res_dict = jsonutils.loads(res.body)[0]
 
@@ -1420,7 +1418,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         """Tests that the registry API creates the image"""
         fixture = {'name': 'fake public image',
                    'status': 'active',
-                   'is_public': True,
+                   'visibility': 'public',
                    'disk_format': 'vhd',
                    'container_format': 'ovf'}
 
@@ -1433,7 +1431,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         res_dict = jsonutils.loads(res.body)[0]
 
@@ -1456,7 +1454,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         res_dict = jsonutils.loads(res.body)[0]
 
@@ -1483,7 +1481,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         self.assertEqual(error_cls, res_dict['_error']['cls'])
         return res_dict
 
-    def _expect_ok(self, command, kwargs, method, expected_status=200):
+    def _expect_ok(self, command, kwargs, method, expected_status=http.OK):
         code, res_dict = self._send_request(command, kwargs)
         self.assertEqual(expected_status, code)
         return res_dict
@@ -1558,7 +1556,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
         res_dict = jsonutils.loads(res.body)[0]
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         orig_num_images = len(res_dict)
 
@@ -1570,7 +1568,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         # Verify one less image
         cmd = [{
@@ -1580,7 +1578,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
         res_dict = jsonutils.loads(res.body)[0]
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         new_num_images = len(res_dict)
         self.assertEqual(new_num_images, orig_num_images - 1)
@@ -1598,7 +1596,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
         res = req.get_response(self.api)
 
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
         deleted_image = jsonutils.loads(res.body)[0]
 
         self.assertEqual(image['id'], deleted_image['id'])
@@ -1616,7 +1614,7 @@ class TestRegistryRPC(base.IsolatedUnitTest):
         req.body = jsonutils.dump_as_bytes(cmd)
 
         res = req.get_response(self.api)
-        self.assertEqual(200, res.status_int)
+        self.assertEqual(http.OK, res.status_int)
 
         memb_list = jsonutils.loads(res.body)[0]
         self.assertEqual(0, len(memb_list))

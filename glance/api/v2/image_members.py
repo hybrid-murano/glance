@@ -20,6 +20,7 @@ from oslo_log import log as logging
 from oslo_serialization import jsonutils
 from oslo_utils import encodeutils
 import six
+from six.moves import http_client as http
 import webob
 
 from glance.api import policy
@@ -49,8 +50,8 @@ class ImageMembersController(object):
 
     def _get_member_repo(self, req, image):
         try:
-            # For public images, a forbidden exception with message
-            # "Public images do not have members" is thrown.
+            # For public, private, and community images, a forbidden exception
+            # with message "Only shared images have members." is thrown.
             return self.gateway.get_member_repo(image, req.context)
         except exception.Forbidden as e:
             msg = (_("Error fetching members of image %(image_id)s: "
@@ -97,7 +98,7 @@ class ImageMembersController(object):
         :param member_id: the member identifier
         :returns: The response body is a mapping of the following form
 
-        .. code-block:: json
+        ::
 
             {'member_id': <MEMBER>,
              'image_id': <IMAGE>,
@@ -115,6 +116,8 @@ class ImageMembersController(object):
                                                                member_id)
             member_repo.add(new_member)
             return new_member
+        except exception.Invalid as e:
+            raise webob.exc.HTTPBadRequest(explanation=e.msg)
         except exception.Forbidden:
             msg = _("Not allowed to create members for image %s.") % image_id
             LOG.warning(msg)
@@ -135,13 +138,14 @@ class ImageMembersController(object):
     @utils.mutating
     def update(self, req, image_id, member_id, status):
         """
-        Adds a membership to the image.
+        Update the status of a member for a given image.
         :param req: the Request object coming from the wsgi layer
         :param image_id: the image identifier
         :param member_id: the member identifier
+        :param status: the status of a member
         :returns: The response body is a mapping of the following form
 
-        .. code-block:: json
+        ::
 
             {'member_id': <MEMBER>,
              'image_id': <IMAGE>,
@@ -176,7 +180,7 @@ class ImageMembersController(object):
         :param image_id: The image identifier
         :returns: The response body is a mapping of the following form
 
-        .. code-block:: json
+        ::
 
             {'members': [
                 {'member_id': <MEMBER>,
@@ -207,7 +211,7 @@ class ImageMembersController(object):
         :param image_id: The image identifier
         :returns: The response body is a mapping of the following form
 
-        .. code-block:: json
+        ::
 
             {'member_id': <MEMBER>,
              'image_id': <IMAGE>,
@@ -234,7 +238,7 @@ class ImageMembersController(object):
         member = self._lookup_member(req, image, member_id)
         try:
             member_repo.remove(member)
-            return webob.Response(body='', status=204)
+            return webob.Response(body='', status=http.NO_CONTENT)
         except exception.Forbidden:
             msg = _("Not allowed to delete members for image %s.") % image_id
             LOG.warning(msg)

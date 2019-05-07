@@ -26,11 +26,11 @@ import re
 import six
 
 from oslo_log import log as logging
+from six.moves import http_client as http
 import webob
 
 from glance.api.common import size_checked_iter
 from glance.api import policy
-from glance.api.v1 import images
 from glance.common import exception
 from glance.common import utils
 from glance.common import wsgi
@@ -54,7 +54,6 @@ class CacheFilter(wsgi.Middleware):
 
     def __init__(self, app):
         self.cache = image_cache.ImageCache()
-        self.serializer = images.ImageSerializer()
         self.policy = policy.Enforcer()
         LOG.info(_LI("Initialized image cache middleware"))
         super(CacheFilter, self).__init__(app)
@@ -71,7 +70,12 @@ class CacheFilter(wsgi.Middleware):
         if not image_meta['size']:
             # override image size metadata with the actual cached
             # file size, see LP Bug #900959
-            image_meta['size'] = self.cache.get_image_size(image_meta['id'])
+            if not isinstance(image_meta, policy.ImageTarget):
+                image_meta['size'] = self.cache.get_image_size(
+                    image_meta['id'])
+            else:
+                image_meta.target.size = self.cache.get_image_size(
+                    image_meta['id'])
 
     @staticmethod
     def _match_request(request):
@@ -148,8 +152,17 @@ class CacheFilter(wsgi.Middleware):
 
         self._stash_request_info(request, image_id, method, version)
 
+        # Partial image download requests shall not be served from cache
+        # Bug: 1664709
+        # TODO(dharinic): If an image is already cached, add support to serve
+        # only the requested bytes (partial image download) from the cache.
+        if (request.headers.get('Content-Range') or
+                request.headers.get('Range')):
+            return None
+
         if request.method != 'GET' or not self.cache.is_cached(image_id):
             return None
+
         method = getattr(self, '_get_%s_image_metadata' % version)
         image_metadata = method(request, image_id)
 
@@ -199,21 +212,6 @@ class CacheFilter(wsgi.Middleware):
         else:
             return (image_id, method, version)
 
-    def _process_v1_request(self, request, image_id, image_iterator,
-                            image_meta):
-        # Don't display location
-        if 'location' in image_meta:
-            del image_meta['location']
-        image_meta.pop('location_data', None)
-        self._verify_metadata(image_meta)
-
-        response = webob.Response(request=request)
-        raw_response = {
-            'image_iterator': image_iterator,
-            'image_meta': image_meta,
-        }
-        return self.serializer.show(response, raw_response)
-
     def _process_v2_request(self, request, image_id, image_iterator,
                             image_meta):
         # We do some contortions to get the image_metadata so
@@ -238,8 +236,9 @@ class CacheFilter(wsgi.Middleware):
         # content-length got by the method "download" because of this issue:
         # https://github.com/Pylons/webob/issues/86
         response.headers['Content-Type'] = 'application/octet-stream'
-        response.headers['Content-MD5'] = (image.checksum.encode('utf-8')
-                                           if six.PY2 else image.checksum)
+        if image.checksum:
+            response.headers['Content-MD5'] = (image.checksum.encode('utf-8')
+                                               if six.PY2 else image.checksum)
         response.headers['Content-Length'] = str(image.size)
         return response
 
@@ -253,13 +252,17 @@ class CacheFilter(wsgi.Middleware):
         if not 200 <= status_code < 300:
             return resp
 
+        # Note(dharinic): Bug: 1664709: Do not cache partial images.
+        if status_code == http.PARTIAL_CONTENT:
+            return resp
+
         try:
             (image_id, method, version) = self._fetch_request_info(
                 resp.request)
         except TypeError:
             return resp
 
-        if method == 'GET' and status_code == 204:
+        if method == 'GET' and status_code == http.NO_CONTENT:
             # Bugfix:1251055 - Don't cache non-existent image files.
             # NOTE: Both GET for an image without locations and DELETE return
             # 204 but DELETE should be processed.

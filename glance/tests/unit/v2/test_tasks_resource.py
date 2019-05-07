@@ -20,6 +20,7 @@ import uuid
 import mock
 from oslo_config import cfg
 from oslo_serialization import jsonutils
+from six.moves import http_client as http
 # NOTE(jokke): simplified transition to py3, behaves like py2 xrange
 from six.moves import range
 import webob
@@ -56,7 +57,7 @@ def _db_fixture(task_id, **kwargs):
         'result': None,
         'owner': None,
         'message': None,
-        'expires_at': None,
+        'expires_at': default_datetime + datetime.timedelta(days=365),
         'created_at': default_datetime,
         'updated_at': default_datetime,
         'deleted_at': None,
@@ -72,13 +73,13 @@ def _domain_fixture(task_id, **kwargs):
         'task_id': task_id,
         'status': kwargs.get('status', 'pending'),
         'task_type': kwargs.get('type', 'import'),
-        'owner': kwargs.get('owner', None),
-        'expires_at': kwargs.get('expires_at', None),
+        'owner': kwargs.get('owner'),
+        'expires_at': kwargs.get('expires_at'),
         'created_at': kwargs.get('created_at', default_datetime),
         'updated_at': kwargs.get('updated_at', default_datetime),
         'task_input': kwargs.get('task_input', {}),
-        'message': kwargs.get('message', None),
-        'result': kwargs.get('result', None)
+        'message': kwargs.get('message'),
+        'result': kwargs.get('result')
     }
     task = glance.domain.Task(**task_properties)
     return task
@@ -371,7 +372,6 @@ class TestTasksController(test_utils.BaseTestCase):
         wrong_import_from = [
             "swift://cloud.foo/myaccount/mycontainer/path",
             "file:///path",
-            "s3://accesskey:secretkey@s3.amazonaws.com/bucket/key-id",
             "cinder://volume-id"
         ]
         executor_factory = self.gateway.get_task_executor_factory(
@@ -406,6 +406,28 @@ class TestTasksController(test_utils.BaseTestCase):
                        "valid uri from the following list of supported uri "
                        "%(supported)s") % {'supported': supported}
             self.assertEqual(msg, final_task.message)
+
+    def test_create_with_properties_missed(self):
+        request = unit_test_utils.get_fake_request()
+        executor_factory = self.gateway.get_task_executor_factory(
+            request.context)
+        task_repo = self.gateway.get_task_repo(request.context)
+
+        task = {
+            "type": "import",
+            "input": {
+                "import_from": "swift://cloud.foo/myaccount/mycontainer/path",
+                "import_from_format": "qcow2",
+            }
+        }
+        new_task = self.controller.create(request, task=task)
+        task_executor = executor_factory.new_task_executor(request.context)
+        task_executor.begin_processing(new_task.task_id)
+        final_task = task_repo.get(new_task.task_id)
+
+        self.assertEqual('failure', final_task.status)
+        msg = "Input does not contain 'image_properties' field"
+        self.assertEqual(msg, final_task.message)
 
     @mock.patch.object(glance.gateway.Gateway, 'get_task_factory')
     def test_notifications_on_create(self, mock_get_task_factory):
@@ -453,6 +475,14 @@ class TestTasksControllerPolicies(base.IsolatedUnitTest):
         self.assertRaises(webob.exc.HTTPForbidden, self.controller.get,
                           request, task_id=UUID2)
 
+    def test_access_get_unauthorized(self):
+        rules = {"tasks_api_access": False,
+                 "get_task": True}
+        self.policy.set_rules(rules)
+        request = unit_test_utils.get_fake_request()
+        self.assertRaises(webob.exc.HTTPForbidden, self.controller.get,
+                          request, task_id=UUID2)
+
     def test_create_task_unauthorized(self):
         rules = {"add_task": False}
         self.policy.set_rules(rules)
@@ -467,6 +497,72 @@ class TestTasksControllerPolicies(base.IsolatedUnitTest):
                           self.controller.delete,
                           request,
                           'fake_id')
+
+    def test_access_delete_unauthorized(self):
+        rules = {"tasks_api_access": False}
+        self.policy.set_rules(rules)
+        request = unit_test_utils.get_fake_request()
+        self.assertRaises(webob.exc.HTTPForbidden,
+                          self.controller.delete,
+                          request,
+                          'fake_id')
+
+
+class TestTasksDeserializerPolicies(test_utils.BaseTestCase):
+
+    # NOTE(rosmaita): this is a bit weird, but we check the access
+    # policy in the RequestDeserializer for calls that take bodies
+    # or query strings because we want to make sure the failure is
+    # a 403, not a 400 due to bad request format
+    def setUp(self):
+        super(TestTasksDeserializerPolicies, self).setUp()
+        self.policy = unit_test_utils.FakePolicyEnforcer()
+        self.deserializer = glance.api.v2.tasks.RequestDeserializer(
+            schema=None, policy_engine=self.policy)
+
+    bad_path = '/tasks?limit=NaN'
+
+    def test_access_index_authorized_bad_query_string(self):
+        """Allow access, fail with 400"""
+        rules = {"tasks_api_access": True,
+                 "get_tasks": True}
+        self.policy.set_rules(rules)
+        request = unit_test_utils.get_fake_request(self.bad_path)
+        self.assertRaises(webob.exc.HTTPBadRequest, self.deserializer.index,
+                          request)
+
+    def test_access_index_unauthorized(self):
+        """Disallow access with bad request, fail with 403"""
+        rules = {"tasks_api_access": False,
+                 "get_tasks": True}
+        self.policy.set_rules(rules)
+        request = unit_test_utils.get_fake_request(self.bad_path)
+        self.assertRaises(webob.exc.HTTPForbidden, self.deserializer.index,
+                          request)
+
+    bad_task = {'typo': 'import', 'input': {"import_from": "fake"}}
+
+    def test_access_create_authorized_bad_format(self):
+        """Allow access, fail with 400"""
+        rules = {"tasks_api_access": True,
+                 "add_task": True}
+        self.policy.set_rules(rules)
+        request = unit_test_utils.get_fake_request()
+        request.body = jsonutils.dump_as_bytes(self.bad_task)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          self.deserializer.create,
+                          request)
+
+    def test_access_create_unauthorized(self):
+        """Disallow access with bad request, fail with 403"""
+        rules = {"tasks_api_access": False,
+                 "add_task": True}
+        self.policy.set_rules(rules)
+        request = unit_test_utils.get_fake_request()
+        request.body = jsonutils.dump_as_bytes(self.bad_task)
+        self.assertRaises(webob.exc.HTTPForbidden,
+                          self.deserializer.create,
+                          request)
 
 
 class TestTasksDeserializer(test_utils.BaseTestCase):
@@ -790,7 +886,7 @@ class TestTasksSerializer(test_utils.BaseTestCase):
         self.serializer.create(response, self.fixtures[3])
 
         serialized_task = jsonutils.loads(response.body)
-        self.assertEqual(201, response.status_int)
+        self.assertEqual(http.CREATED, response.status_int)
         self.assertEqual(self.fixtures[3].task_id,
                          serialized_task['id'])
         self.assertEqual(self.fixtures[3].task_input,
@@ -804,7 +900,7 @@ class TestTasksSerializer(test_utils.BaseTestCase):
         self.serializer.create(response, self.fixtures[0])
 
         serialized_task = jsonutils.loads(response.body)
-        self.assertEqual(201, response.status_int)
+        self.assertEqual(http.CREATED, response.status_int)
         self.assertEqual(self.fixtures[0].task_id,
                          serialized_task['id'])
         self.assertEqual(self.fixtures[0].task_input,
@@ -817,7 +913,7 @@ class TestTasksSerializer(test_utils.BaseTestCase):
         self.serializer.create(response, self.fixtures[1])
 
         serialized_task = jsonutils.loads(response.body)
-        self.assertEqual(201, response.status_int)
+        self.assertEqual(http.CREATED, response.status_int)
         self.assertEqual(self.fixtures[1].task_id,
                          serialized_task['id'])
         self.assertEqual(self.fixtures[1].task_input,

@@ -42,7 +42,7 @@ class FakeImage(object):
     locations = [{'url': 'file:///not/a/path', 'metadata': {}}]
     tags = set([])
 
-    def set_data(self, data, size=None):
+    def set_data(self, data, size=None, backend=None):
         self.size = 0
         for d in data:
             self.size += len(d)
@@ -54,9 +54,6 @@ class FakeImage(object):
 class TestImageQuota(test_utils.BaseTestCase):
     def setUp(self):
         super(TestImageQuota, self).setUp()
-
-    def tearDown(self):
-        super(TestImageQuota, self).tearDown()
 
     def _get_image(self, location_count=1, image_size=10):
         context = FakeContext()
@@ -571,6 +568,10 @@ class TestQuotaImageTagsProxy(test_utils.BaseTestCase):
     def test_equals(self):
         proxy = glance.quota.QuotaImageTagsProxy(set([]))
         self.assertEqual(set([]), proxy)
+
+    def test_not_equals(self):
+        proxy = glance.quota.QuotaImageTagsProxy(set([]))
+        self.assertNotEqual('foo', proxy)
 
     def test_contains(self):
         proxy = glance.quota.QuotaImageTagsProxy(set(['foo']))
