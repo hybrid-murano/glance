@@ -13,9 +13,46 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import copy
+
+from keystoneauth1 import session
+from keystoneauth1 import token_endpoint
+from oslo_config import cfg
 from oslo_context import context
 
 from glance.api import policy
+
+CONF = cfg.CONF
+
+
+def _get_keystone_endpoint():
+    """Return the Keystone endpoint for token_endpoint auth.
+
+    Prefer auth_url from [keystone_authtoken]. Fall back to
+    www_authenticate_uri, which has been available since the minimum
+    supported keystonemiddleware release (5.1.0).
+    """
+    for opt in ('auth_url', 'www_authenticate_uri'):
+        endpoint = getattr(CONF.keystone_authtoken, opt)
+        if endpoint:
+            return endpoint
+    raise cfg.RequiredOptError('auth_url', group='keystone_authtoken')
+
+
+def get_ksa_client(context):
+    """Returns a keystoneauth Adapter using token from context.
+
+    This will return a simple keystoneauth adapter that can be used to
+    make requests against a remote service using the token provided
+    (and already authenticated) from the user and stored in a
+    RequestContext.
+
+    :param context: User request context
+    :returns: keystoneauth1 Adapter object
+    """
+    auth = token_endpoint.Token(_get_keystone_endpoint(),
+                                context.auth_token)
+    return session.Session(auth=auth)
 
 
 class RequestContext(context.RequestContext):
@@ -26,12 +63,10 @@ class RequestContext(context.RequestContext):
 
     """
 
-    def __init__(self, roles=None,
-                 owner_is_tenant=True, service_catalog=None,
-                 policy_enforcer=None, **kwargs):
+    FROM_DICT_EXTRA_KEYS = ['service_catalog', 'policy_enforcer']
+
+    def __init__(self, service_catalog=None, policy_enforcer=None, **kwargs):
         super(RequestContext, self).__init__(**kwargs)
-        self.roles = roles or []
-        self.owner_is_tenant = owner_is_tenant
         self.service_catalog = service_catalog
         self.policy_enforcer = policy_enforcer or policy.Enforcer()
         if not self.is_admin:
@@ -40,30 +75,37 @@ class RequestContext(context.RequestContext):
     def to_dict(self):
         d = super(RequestContext, self).to_dict()
         d.update({
-            'roles': self.roles,
             'service_catalog': self.service_catalog,
         })
         return d
 
-    @classmethod
-    def from_dict(cls, values):
-        return cls(**values)
-
     @property
     def owner(self):
         """Return the owner to correlate with an image."""
-        return self.tenant if self.owner_is_tenant else self.user
+        return self.project_id
 
     @property
     def can_see_deleted(self):
         """Admins can see deleted by default"""
         return self.show_deleted or self.is_admin
 
+    def elevated(self):
+        """Return a copy of this context with admin flag set."""
+
+        context = copy.copy(self)
+        context.roles = copy.deepcopy(self.roles)
+        if 'admin' not in context.roles:
+            context.roles.append('admin')
+
+        context.is_admin = True
+
+        return context
+
 
 def get_admin_context(show_deleted=False):
     """Create an administrator context."""
     return RequestContext(auth_token=None,
-                          tenant=None,
+                          project_id=None,
                           is_admin=True,
                           show_deleted=show_deleted,
                           overwrite=False)

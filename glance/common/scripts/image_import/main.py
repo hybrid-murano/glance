@@ -19,9 +19,7 @@ __all__ = [
 
 from oslo_concurrency import lockutils
 from oslo_log import log as logging
-from oslo_utils import encodeutils
 from oslo_utils import excutils
-import six
 
 from glance.api.v2 import images as v2_api
 from glance.common import exception
@@ -40,7 +38,7 @@ def run(t_id, context, task_repo, image_repo, image_factory):
 
 # NOTE(nikhil): This lock prevents more than N number of threads to be spawn
 # simultaneously. The number N represents the number of threads in the
-# executor pool. The value is set to 10 in the eventlet executor.
+# executor pool. The value is set by [taskflow_executor] max_workers.
 @lockutils.synchronized("glance_import")
 def _execute(t_id, task_repo, image_repo, image_factory):
     task = script_utils.get_task(task_repo, t_id)
@@ -54,7 +52,8 @@ def _execute(t_id, task_repo, image_repo, image_factory):
     try:
         task_input = script_utils.unpack_task_input(task)
 
-        uri = script_utils.validate_location_uri(task_input.get('import_from'))
+        uri = script_utils.validate_legacy_import_from_uri(
+            task_input.get('import_from'))
         image_id = import_image(image_repo, image_factory, task_input, t_id,
                                 uri)
 
@@ -65,8 +64,7 @@ def _execute(t_id, task_repo, image_repo, image_factory):
 
         # TODO(nikhil): need to bring back save_and_reraise_exception when
         # necessary
-        err_msg = ("Error: " + six.text_type(type(e)) + ': ' +
-                   encodeutils.exception_to_unicode(e))
+        err_msg = ("Error: " + str(type(e)) + ': ' + str(e))
         log_msg = _LE(err_msg + ("Task ID %s" % task.task_id))  # noqa
         LOG.exception(log_msg)
 
@@ -117,13 +115,9 @@ def import_image(image_repo, image_factory, task_input, task_id, uri):
 
 
 def create_image(image_repo, image_factory, image_properties, task_id):
-    _base_properties = []
-    for k, v in v2_api.get_base_properties().items():
-        _base_properties.append(k)
-
     properties = {}
     # NOTE: get the base properties
-    for key in _base_properties:
+    for key in v2_api.get_base_properties():
         try:
             properties[key] = image_properties.pop(key)
         except KeyError:
@@ -141,18 +135,35 @@ def create_image(image_repo, image_factory, image_properties, task_id):
     return image
 
 
-def set_image_data(image, uri, task_id):
+def set_image_data(image, uri, task_id, backend=None, set_active=True,
+                   callback=None):
     data_iter = None
     try:
         LOG.info(_LI("Task %(task_id)s: Got image data uri %(data_uri)s to be "
                  "imported"), {"data_uri": uri, "task_id": task_id})
-        data_iter = script_utils.get_image_data_iter(uri)
-        image.set_data(data_iter)
+        data_iter, size = script_utils.get_image_data_iter(uri)
+
+        if callback:
+            # If a callback was provided, wrap our data iterator to call
+            # the function every 60 seconds.
+            data_iter = script_utils.CallbackIterator(
+                data_iter, callback, min_interval=60)
+
+        if image.size is not None and image.size != size:
+            msg = _(
+                "Task %(task_id)s: Image size mismatch. Expected %(expected)d "
+                "but got %(actual)d"
+            ) % {"task_id": task_id, "expected": image.size, "actual": size}
+            raise exception.ImportTaskError(msg)
+        image.set_data(data_iter, size=size, backend=backend,
+                       set_active=set_active)
+
     except Exception as e:
         with excutils.save_and_reraise_exception():
-            LOG.warn(_LW("Task %(task_id)s failed with exception %(error)s") %
-                     {"error": encodeutils.exception_to_unicode(e),
-                      "task_id": task_id})
+            LOG.warning(_LW("Task %(task_id)s failed with exception "
+                            "%(error)s"),
+                        {"error": e,
+                         "task_id": task_id})
             LOG.info(_LI("Task %(task_id)s: Could not import image file"
                          " %(image_data)s"), {"image_data": uri,
                                               "task_id": task_id})

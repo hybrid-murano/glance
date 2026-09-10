@@ -1,10 +1,10 @@
 *.pyc
 *.log
 .glance-venv
-.venv
-.testrepository/
+.stestr/*
 .tox
 .coverage*
+.venv
 cover/*
 covhtml
 nosetests.xml
@@ -21,11 +21,16 @@ tests.sqlite
 glance/versioninfo
 subunit.log
 
+# generated policy file
+etc/policy.yaml.sample
+
 # Swap files range from .saa to .swp
 *.s[a-w][a-p]
 
 # Files created by doc build
 doc/source/api
+doc/source/_static/*.sample
+doc/source/contributor/api
 
 # Files created by releasenotes build
 releasenotes/build

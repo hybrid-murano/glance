@@ -14,8 +14,6 @@
 #    under the License.
 
 import jsonschema
-from oslo_utils import encodeutils
-import six
 
 from glance.common import exception
 from glance.i18n import _
@@ -37,12 +35,11 @@ class Schema(object):
         try:
             jsonschema.validate(obj, self.raw())
         except jsonschema.ValidationError as e:
-            reason = encodeutils.exception_to_unicode(e)
-            raise exception.InvalidObject(schema=self.name, reason=reason)
+            raise exception.InvalidObject(schema=self.name, reason=str(e))
 
     def filter(self, obj):
         filtered = {}
-        for key, value in six.iteritems(obj):
+        for key, value in obj.items():
             if self._filter_func(self.properties, key):
                 filtered[key] = value
 

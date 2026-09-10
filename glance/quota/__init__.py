@@ -17,7 +17,6 @@ import copy
 import glance_store as store
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import encodeutils
 from oslo_utils import excutils
 
 import glance.api.common
@@ -57,8 +56,13 @@ def _calc_required_size(context, image, locations):
             size_from_backend = None
 
             try:
-                size_from_backend = store.get_size_from_backend(
-                    location['url'], context=context)
+                if CONF.enabled_backends:
+                    size_from_backend = store.get_size_from_uri_and_backend(
+                        location['url'], location['metadata'].get('store'),
+                        context=context)
+                else:
+                    size_from_backend = store.get_size_from_backend(
+                        location['url'], context=context)
             except (store.UnknownScheme, store.NotFound):
                 pass
             except store.BadStoreUri:
@@ -94,25 +98,29 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
                                              item_proxy_class=ImageProxy,
                                              item_proxy_kwargs=proxy_kwargs)
 
-    def _enforce_image_property_quota(self, attempted):
+    def _enforce_image_property_quota(self, properties):
         if CONF.image_property_quota < 0:
             # If value is negative, allow unlimited number of properties
             return
+
+        attempted = len(
+            [x for x in properties.keys()
+             if not x.startswith(glance.api.common.GLANCE_RESERVED_NS)])
 
         maximum = CONF.image_property_quota
         if attempted > maximum:
             kwargs = {'attempted': attempted, 'maximum': maximum}
             exc = exception.ImagePropertyLimitExceeded(**kwargs)
-            LOG.debug(encodeutils.exception_to_unicode(exc))
+            LOG.debug(str(exc))
             raise exc
 
     def save(self, image, from_state=None):
         if image.added_new_properties():
-            self._enforce_image_property_quota(len(image.extra_properties))
+            self._enforce_image_property_quota(image.extra_properties)
         return super(ImageRepoProxy, self).save(image, from_state=from_state)
 
     def add(self, image):
-        self._enforce_image_property_quota(len(image.extra_properties))
+        self._enforce_image_property_quota(image.extra_properties)
         return super(ImageRepoProxy, self).add(image)
 
 
@@ -150,6 +158,9 @@ class QuotaImageTagsProxy(object):
     def __eq__(self, other):
         return self.tags == other
 
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
     def __iter__(self, *args, **kwargs):
         return self.tags.__iter__(*args, **kwargs)
 
@@ -157,6 +168,14 @@ class QuotaImageTagsProxy(object):
         return self.tags.__len__(*args, **kwargs)
 
     def __getattr__(self, name):
+        # Protect against deepcopy, which calls getattr. __getattr__
+        # is only called when an attribute is not "normal", so when
+        # self.tags is called, this is not.
+        if name == 'tags':
+            try:
+                return self.__getattribute__('tags')
+            except AttributeError:
+                return None
         return getattr(self.tags, name)
 
 
@@ -213,6 +232,9 @@ class QuotaImageLocationsProxy(object):
 
     def __eq__(self, other):
         return self.locations == other
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
 
     def __getitem__(self, *args, **kwargs):
         return self.locations.__getitem__(*args, **kwargs)
@@ -287,18 +309,17 @@ class ImageProxy(glance.domain.proxy.Image):
         super(ImageProxy, self).__init__(image)
         self.orig_props = set(image.extra_properties.keys())
 
-    def set_data(self, data, size=None):
+    def set_data(self, data, size=None, backend=None, set_active=True):
         remaining = glance.api.common.check_quota(
             self.context, size, self.db_api, image_id=self.image.image_id)
         if remaining is not None:
             # NOTE(jbresnah) we are trying to enforce a quota, put a limit
             # reader on the data
-            data = utils.LimitingReader(data, remaining)
-        try:
-            self.image.set_data(data, size=size)
-        except exception.ImageSizeLimitExceeded:
-            raise exception.StorageQuotaFull(image_size=size,
-                                             remaining=remaining)
+            data = utils.LimitingReader(
+                data, remaining, exception_class=exception.StorageQuotaFull)
+
+        self.image.set_data(data, size=size, backend=backend,
+                            set_active=set_active)
 
         # NOTE(jbresnah) If two uploads happen at the same time and neither
         # properly sets the size attribute[1] then there is a race condition

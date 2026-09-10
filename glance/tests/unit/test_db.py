@@ -14,12 +14,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import datetime
+from unittest import mock
 import uuid
 
-import mock
 from oslo_config import cfg
-from oslo_db import exception as db_exc
-from oslo_utils import encodeutils
+from oslo_utils.fixture import uuidsentinel as uuids
+from oslo_utils import timeutils
+from sqlalchemy import orm as sa_orm
 
 from glance.common import crypt
 from glance.common import exception
@@ -31,27 +33,6 @@ import glance.tests.utils as test_utils
 
 CONF = cfg.CONF
 CONF.import_opt('metadata_encryption_key', 'glance.common.config')
-
-
-@mock.patch('oslo_utils.importutils.import_module')
-class TestDbUtilities(test_utils.BaseTestCase):
-    def setUp(self):
-        super(TestDbUtilities, self).setUp()
-        self.config(data_api='silly pants')
-        self.api = mock.Mock()
-
-    def test_get_api_calls_configure_if_present(self, import_module):
-        import_module.return_value = self.api
-        self.assertEqual(glance.db.get_api(), self.api)
-        import_module.assert_called_once_with('silly pants')
-        self.api.configure.assert_called_once_with()
-
-    def test_get_api_skips_configure_if_missing(self, import_module):
-        import_module.return_value = self.api
-        del self.api.configure
-        self.assertEqual(glance.db.get_api(), self.api)
-        import_module.assert_called_once_with('silly pants')
-        self.assertFalse(hasattr(self.api, 'configure'))
 
 
 UUID1 = 'c80a1a6c-bd1f-41c5-90ee-81afedb1d58d'
@@ -74,6 +55,14 @@ CHECKSUM = '93264c3edf5972c9f1cb309543d38a5c'
 CHCKSUM1 = '43264c3edf4972c9f1cb309543d38a55'
 
 
+TASK_ID_1 = 'b3006bd0-461e-4228-88ea-431c14e918b4'
+TASK_ID_2 = '07b6b562-6770-4c8b-a649-37a515144ce9'
+TASK_ID_3 = '72d16bb6-4d70-48a5-83fe-14bb842dc737'
+
+NODE_REFERENCE_ID_1 = 1
+NODE_REFERENCE_ID_2 = 2
+
+
 def _db_fixture(id, **kwargs):
     obj = {
         'id': id,
@@ -93,6 +82,8 @@ def _db_fixture(id, **kwargs):
         'min_ram': None,
         'min_disk': None,
     }
+    if 'visibility' in kwargs:
+        obj.pop('is_public')
     obj.update(kwargs)
     return obj
 
@@ -106,16 +97,44 @@ def _db_image_member_fixture(image_id, member_id, **kwargs):
     return obj
 
 
-def _db_task_fixture(task_id, type, status, **kwargs):
+def _db_task_fixture(task_id, **kwargs):
+    default_datetime = timeutils.utcnow()
     obj = {
         'id': task_id,
-        'type': type,
-        'status': status,
-        'input': None,
+        'status': kwargs.get('status', 'pending'),
+        'type': 'import',
+        'input': kwargs.get('input', {}),
         'result': None,
         'owner': None,
+        'image_id': kwargs.get('image_id'),
+        'user_id': kwargs.get('user_id'),
+        'request_id': kwargs.get('request_id'),
         'message': None,
-        'deleted': False,
+        'expires_at': default_datetime + datetime.timedelta(days=365),
+        'created_at': default_datetime,
+        'updated_at': default_datetime,
+        'deleted_at': None,
+        'deleted': False
+    }
+    obj.update(kwargs)
+    return obj
+
+
+def _db_node_reference_fixture(node_id, node_url, **kwargs):
+    obj = {
+        'node_reference_id': node_id,
+        'node_reference_url': node_url,
+    }
+    obj.update(kwargs)
+    return obj
+
+
+def _db_cached_images_fixture(id, **kwargs):
+    obj = {
+        'id': id,
+        'image_id': kwargs.get('image_id'),
+        'size': kwargs.get('size'),
+        'hits': kwargs.get('hits')
     }
     obj.update(kwargs)
     return obj
@@ -127,11 +146,34 @@ class TestImageRepo(test_utils.BaseTestCase):
         super(TestImageRepo, self).setUp()
         self.db = unit_test_utils.FakeDB(initialize=False)
         self.context = glance.context.RequestContext(
-            user=USER1, tenant=TENANT1)
+            user_id=USER1, project_id=TENANT1)
         self.image_repo = glance.db.ImageRepo(self.context, self.db)
         self.image_factory = glance.domain.ImageFactory()
         self._create_images()
         self._create_image_members()
+        # Centralized cache
+        self._create_node_references()
+        self._create_cached_images()
+
+    def _create_node_references(self):
+        self.node_references = [
+            _db_node_reference_fixture(NODE_REFERENCE_ID_1, 'node_url_1'),
+            _db_node_reference_fixture(NODE_REFERENCE_ID_2, 'node_url_2'),
+        ]
+        [self.db.node_reference_create(
+            None, node_reference['node_reference_url'],
+            node_reference_id=node_reference['node_reference_id']
+        ) for node_reference in self.node_references]
+
+    def _create_cached_images(self):
+        self.cached_images = [
+            _db_cached_images_fixture(1, image_id=UUID1, size=256, hits=3),
+            _db_cached_images_fixture(1, image_id=UUID3, size=1024, hits=0)
+        ]
+        [self.db.insert_cache_details(
+            None, 'node_url_1', cached_image['image_id'],
+            cached_image['size'], hits=cached_image['hits']
+        ) for cached_image in self.cached_images]
 
     def _create_images(self):
         self.images = [
@@ -152,6 +194,53 @@ class TestImageRepo(test_utils.BaseTestCase):
         ]
         [self.db.image_create(None, image) for image in self.images]
 
+        # Create tasks associated with image
+        self.tasks = [
+            _db_task_fixture(
+                TASK_ID_1, image_id=UUID1, status='completed',
+                input={
+                    "image_id": UUID1,
+                    "import_req": {
+                        "method": {
+                            "name": "glance-direct"
+                        },
+                        "backend": ["fake-store"]
+                    },
+                },
+                user_id=USER1,
+                request_id='fake-request-id',
+            ),
+            _db_task_fixture(
+                TASK_ID_2, image_id=UUID1, status='completed',
+                input={
+                    "image_id": UUID1,
+                    "import_req": {
+                        "method": {
+                            "name": "copy-image"
+                        },
+                        "all_stores": True,
+                        "all_stores_must_succeed": False,
+                        "backend": ["fake-store", "fake_store_1"]
+                    },
+                },
+                user_id=USER1,
+                request_id='fake-request-id',
+            ),
+            _db_task_fixture(
+                TASK_ID_3, status='completed',
+                input={
+                    "image_id": UUID2,
+                    "import_req": {
+                        "method": {
+                            "name": "glance-direct"
+                        },
+                        "backend": ["fake-store"]
+                    },
+                },
+            ),
+        ]
+        [self.db.task_create(None, task) for task in self.tasks]
+
         self.db.image_tag_set_all(None, UUID1, ['ping', 'pong'])
 
     def _create_image_members(self):
@@ -162,6 +251,129 @@ class TestImageRepo(test_utils.BaseTestCase):
         [self.db.image_member_create(None, image_member)
             for image_member in self.image_members]
 
+    def test_node_reference_get_by_url(self):
+        node_reference = self.db.node_reference_get_by_url(self.context,
+                                                           'node_url_1')
+        self.assertEqual(NODE_REFERENCE_ID_1,
+                         node_reference['node_reference_id'])
+
+    def test_node_reference_get_by_url_not_found(self):
+        self.assertRaises(exception.NotFound,
+                          self.db.node_reference_get_by_url,
+                          self.context,
+                          'garbage_url')
+
+    def test_get_cached_images(self):
+        # Two images are cached on node 'node_url_1'
+        cached_images = self.db.get_cached_images(self.context,
+                                                  'node_url_1')
+        self.assertEqual(2, len(cached_images))
+
+        # Nothing is cached on node 'node_url_2'
+        cached_images = self.db.get_cached_images(self.context,
+                                                  'node_url_2')
+        self.assertEqual(0, len(cached_images))
+
+    def test_get_hit_count(self):
+        # Hit count will be 3 for image UUID1
+        self.assertEqual(3, self.db.get_hit_count(self.context,
+                                                  UUID1, 'node_url_1'))
+
+        # Hit count will be 0 for uncached image
+        self.assertEqual(0, self.db.get_hit_count(self.context,
+                                                  UUID2, 'node_url_1'))
+
+    def test_delete_all_cached_images(self):
+        # Verify that we have image cached
+        cached_images = self.db.get_cached_images(self.context,
+                                                  'node_url_1')
+        self.assertEqual(2, len(cached_images))
+
+        # Delete cached images from node_url_1
+        self.db.delete_all_cached_images(self.context, 'node_url_1')
+
+        # Verify that all cached images from node_url_1 are deleted
+        cached_images = self.db.get_cached_images(self.context,
+                                                  'node_url_1')
+        self.assertEqual(0, len(cached_images))
+
+    def test_delete_cached_image(self):
+        # Verify that we have image cached
+        cached_images = self.db.get_cached_images(self.context,
+                                                  'node_url_1')
+        self.assertEqual(2, len(cached_images))
+
+        # Delete cached image from node_url_1
+        self.db.delete_cached_image(self.context, UUID1, 'node_url_1')
+
+        # Verify that given image from node_url_1 is deleted
+        cached_images = self.db.get_cached_images(self.context,
+                                                  'node_url_1')
+        self.assertEqual(1, len(cached_images))
+
+    def test_get_least_recently_accessed(self):
+        recently_accessed = self.db.get_least_recently_accessed(
+            self.context, 'node_url_1')
+        # Verify we will only get one image in response
+        self.assertEqual(UUID1, recently_accessed)
+
+    def test_is_image_cached_for_node(self):
+        # Verify UUID1 is cached for node_url_1
+        self.assertTrue(self.db.is_image_cached_for_node(
+            self.context, 'node_url_1', UUID1))
+
+        # Verify UUID3 is not cached for node_url_2
+        self.assertFalse(self.db.is_image_cached_for_node(
+            self.context, 'node_url_2', UUID3))
+
+    def test_update_hit_count(self):
+        # Verify UUID1 on node_url_1 has 3 as hit count
+        self.assertEqual(3, self.db.get_hit_count(self.context,
+                                                  UUID1, 'node_url_1'))
+
+        # Update the hit count of UUID1
+        self.db.update_hit_count(self.context, UUID1, 'node_url_1')
+
+        # Verify hit count is now 4
+        self.assertEqual(4, self.db.get_hit_count(self.context,
+                                                  UUID1, 'node_url_1'))
+
+    def test_get_cached_nodes(self):
+        """Test getting cached nodes with detailed verification."""
+        # Test UUID1 - should be cached on node_url_1
+        cached_nodes = self.db.get_cached_nodes(self.context, UUID1)
+        self.assertEqual(['node_url_1'], cached_nodes)
+        self.assertEqual(1, len(cached_nodes))
+        self.assertIn('node_url_1', cached_nodes)
+
+        # Test UUID2 - should NOT be cached anywhere
+        cached_nodes = self.db.get_cached_nodes(self.context, UUID2)
+        self.assertEqual([], cached_nodes)
+        self.assertEqual(0, len(cached_nodes))
+
+        # Test UUID3 - should be cached on node_url_1
+        cached_nodes = self.db.get_cached_nodes(self.context, UUID3)
+        self.assertEqual(['node_url_1'], cached_nodes)
+        self.assertEqual(1, len(cached_nodes))
+        self.assertIn('node_url_1', cached_nodes)
+
+        # Test non-existent image - should return empty list
+        non_existent_uuid = 'non-existent-uuid-12345'
+        cached_nodes = self.db.get_cached_nodes(self.context,
+                                                non_existent_uuid)
+        self.assertEqual([], cached_nodes)
+        self.assertEqual(0, len(cached_nodes))
+
+        # Verify that UUID1 and UUID3 are cached on the same node
+        uuid1_nodes = self.db.get_cached_nodes(self.context, UUID1)
+        uuid3_nodes = self.db.get_cached_nodes(self.context, UUID3)
+        self.assertEqual(uuid1_nodes, uuid3_nodes)
+
+        # Verify that UUID2 is not cached on any node that UUID1 is cached on
+        uuid2_nodes = self.db.get_cached_nodes(self.context, UUID2)
+        for node in uuid1_nodes:
+            self.assertNotIn(node, uuid2_nodes)
+
     def test_get(self):
         image = self.image_repo.get(UUID1)
         self.assertEqual(UUID1, image.image_id)
@@ -171,6 +383,18 @@ class TestImageRepo(test_utils.BaseTestCase):
         self.assertEqual('active', image.status)
         self.assertEqual(256, image.size)
         self.assertEqual(TENANT1, image.owner)
+
+    def test_tasks_get_by_image(self):
+        tasks = self.db.tasks_get_by_image(self.context, UUID1)
+        self.assertEqual(2, len(tasks))
+        for task in tasks:
+            self.assertEqual(USER1, task['user_id'])
+            self.assertEqual('fake-request-id', task['request_id'])
+            self.assertEqual(UUID1, task['image_id'])
+
+    def test_tasks_get_by_image_not_exists(self):
+        tasks = self.db.tasks_get_by_image(self.context, UUID3)
+        self.assertEqual(0, len(tasks))
 
     def test_location_value(self):
         image = self.image_repo.get(UUID3)
@@ -190,7 +414,7 @@ class TestImageRepo(test_utils.BaseTestCase):
         fake_uuid = str(uuid.uuid4())
         exc = self.assertRaises(exception.ImageNotFound, self.image_repo.get,
                                 fake_uuid)
-        self.assertIn(fake_uuid, encodeutils.exception_to_unicode(exc))
+        self.assertIn(fake_uuid, str(exc))
 
     def test_get_forbidden(self):
         self.assertRaises(exception.NotFound, self.image_repo.get, UUID4)
@@ -202,7 +426,7 @@ class TestImageRepo(test_utils.BaseTestCase):
 
     def _do_test_list_status(self, status, expected):
         self.context = glance.context.RequestContext(
-            user=USER1, tenant=TENANT3)
+            user_id=USER1, project_id=TENANT3)
         self.image_repo = glance.db.ImageRepo(self.context, self.db)
         images = self.image_repo.list(member_status=status)
         self.assertEqual(expected, len(images))
@@ -245,8 +469,41 @@ class TestImageRepo(test_utils.BaseTestCase):
     def test_list_private_images(self):
         filters = {'visibility': 'private'}
         images = self.image_repo.list(filters=filters)
+        self.assertEqual(0, len(images))
+
+    def test_list_shared_images(self):
+        filters = {'visibility': 'shared'}
+        images = self.image_repo.list(filters=filters)
         image_ids = set([i.image_id for i in images])
         self.assertEqual(set([UUID2]), image_ids)
+
+    def test_list_shared_images_other_tenant(self):
+        # Create a private image owned by TENANT3
+        image5 = _db_fixture(uuids.image5, owner=TENANT3,
+                             name='5', size=512, is_public=False)
+        self.db.image_create(None, image5)
+
+        # Get a repo as TENANT3, since it has access to public,
+        # shared, and private images
+        context = glance.context.RequestContext(
+            user_id=USER1, project_id=TENANT3)
+        image_repo = glance.db.ImageRepo(context, self.db)
+        images = {i.image_id: i for i in image_repo.list()}
+
+        # No member set for public image UUID1
+        self.assertIsNone(images[UUID1].member)
+
+        # Member should be set to our tenant id for shared image UUID2
+        self.assertEqual(TENANT3, images[UUID2].member)
+
+        # No member set for private image5
+        self.assertIsNone(images[uuids.image5].member)
+
+    def test_list_all_images(self):
+        filters = {'visibility': 'all'}
+        images = self.image_repo.list(filters=filters)
+        image_ids = set([i.image_id for i in images])
+        self.assertEqual(set([UUID1, UUID2, UUID3]), image_ids)
 
     def test_list_with_checksum_filter_single_image(self):
         filters = {'checksum': CHECKSUM}
@@ -358,7 +615,7 @@ class TestImageRepo(test_utils.BaseTestCase):
         image.tags = ['king', 'kong']
         self.image_repo.save(image)
         current_update_time = image.updated_at
-        self.assertTrue(current_update_time > original_update_time)
+        self.assertGreater(current_update_time, original_update_time)
         image = self.image_repo.get(UUID1)
         self.assertEqual('foo', image.name)
         self.assertEqual(set(['king', 'kong']), image.tags)
@@ -370,13 +627,51 @@ class TestImageRepo(test_utils.BaseTestCase):
         image.image_id = fake_uuid
         exc = self.assertRaises(exception.ImageNotFound, self.image_repo.save,
                                 image)
-        self.assertIn(fake_uuid, encodeutils.exception_to_unicode(exc))
+        self.assertIn(fake_uuid, str(exc))
+
+    def test_save_excludes_atomic_props(self):
+        fake_uuid = str(uuid.uuid4())
+        image = self.image_repo.get(UUID1)
+
+        # Try to set the property normally
+        image.extra_properties['os_glance_import_task'] = fake_uuid
+        self.image_repo.save(image)
+
+        # Expect it was ignored
+        image = self.image_repo.get(UUID1)
+        self.assertNotIn('os_glance_import_task', image.extra_properties)
+
+        # Set the property atomically
+        self.image_repo.set_property_atomic(image,
+                                            'os_glance_import_task', fake_uuid)
+        # Expect it is set
+        image = self.image_repo.get(UUID1)
+        self.assertEqual(fake_uuid,
+                         image.extra_properties['os_glance_import_task'])
+
+        # Try to clobber it
+        image.extra_properties['os_glance_import_task'] = 'foo'
+        self.image_repo.save(image)
+
+        # Expect it is unchanged
+        image = self.image_repo.get(UUID1)
+        self.assertEqual(fake_uuid,
+                         image.extra_properties['os_glance_import_task'])
+
+        # Try to delete it
+        del image.extra_properties['os_glance_import_task']
+        self.image_repo.save(image)
+
+        # Expect it is still present and set accordingly
+        image = self.image_repo.get(UUID1)
+        self.assertEqual(fake_uuid,
+                         image.extra_properties['os_glance_import_task'])
 
     def test_remove_image(self):
         image = self.image_repo.get(UUID1)
         previous_update_time = image.updated_at
         self.image_repo.remove(image)
-        self.assertTrue(image.updated_at > previous_update_time)
+        self.assertGreater(image.updated_at, previous_update_time)
         self.assertRaises(exception.ImageNotFound, self.image_repo.get, UUID1)
 
     def test_remove_image_not_found(self):
@@ -385,7 +680,74 @@ class TestImageRepo(test_utils.BaseTestCase):
         image.image_id = fake_uuid
         exc = self.assertRaises(
             exception.ImageNotFound, self.image_repo.remove, image)
-        self.assertIn(fake_uuid, encodeutils.exception_to_unicode(exc))
+        self.assertIn(fake_uuid, str(exc))
+
+    def test_restore_image_status(self):
+        image_id = uuid.uuid4()
+        image = _db_fixture(image_id, name='restore_test', size=256,
+                            is_public=True, status='pending_delete')
+        self.db.image_create(self.context, image)
+        self.db.image_restore(self.context, image_id)
+        image = self.db.image_get(self.context, image_id)
+        self.assertEqual(image['status'], 'active')
+
+    def test_restore_image_status_not_found(self):
+        image_id = uuid.uuid4()
+        self.assertRaises(exception.ImageNotFound,
+                          self.db.image_restore,
+                          self.context,
+                          image_id)
+
+    def test_restore_image_status_not_pending_delete(self):
+        image_id = uuid.uuid4()
+        image = _db_fixture(image_id, name='restore_test', size=256,
+                            is_public=True, status='deleted')
+        self.db.image_create(self.context, image)
+        self.assertRaises(exception.Conflict,
+                          self.db.image_restore,
+                          self.context,
+                          image_id)
+
+    def test_image_set_property_atomic(self):
+        image_id = uuid.uuid4()
+        image = _db_fixture(image_id, name='test')
+
+        self.assertRaises(exception.ImageNotFound,
+                          self.db.image_set_property_atomic,
+                          image_id, 'foo', 'bar')
+
+        self.db.image_create(self.context, image)
+        self.db.image_set_property_atomic(image_id, 'foo', 'bar')
+        image = self.db.image_get(self.context, image_id)
+        self.assertEqual('foo', image['properties'][0]['name'])
+        self.assertEqual('bar', image['properties'][0]['value'])
+
+    def test_set_property_atomic(self):
+        image = self.image_repo.get(UUID1)
+        self.image_repo.set_property_atomic(image, 'foo', 'bar')
+        image = self.image_repo.get(image.image_id)
+        self.assertEqual({'foo': 'bar'}, image.extra_properties)
+
+    def test_image_delete_property_atomic(self):
+        image_id = uuid.uuid4()
+        image = _db_fixture(image_id, name='test')
+
+        self.assertRaises(exception.NotFound,
+                          self.db.image_delete_property_atomic,
+                          image_id, 'foo', 'bar')
+        self.db.image_create(self.context, image)
+        self.db.image_set_property_atomic(image_id, 'foo', 'bar')
+        self.db.image_delete_property_atomic(image_id, 'foo', 'bar')
+        image = self.image_repo.get(image_id)
+        self.assertEqual({}, image.extra_properties)
+
+    def test_delete_property_atomic(self):
+        image = self.image_repo.get(UUID1)
+        self.image_repo.set_property_atomic(image, 'foo', 'bar')
+        image = self.image_repo.get(image.image_id)
+        self.image_repo.delete_property_atomic(image, 'foo', 'bar')
+        image = self.image_repo.get(image.image_id)
+        self.assertEqual({}, image.extra_properties)
 
 
 class TestEncryptedLocations(test_utils.BaseTestCase):
@@ -393,7 +755,7 @@ class TestEncryptedLocations(test_utils.BaseTestCase):
         super(TestEncryptedLocations, self).setUp()
         self.db = unit_test_utils.FakeDB(initialize=False)
         self.context = glance.context.RequestContext(
-            user=USER1, tenant=TENANT1)
+            user_id=USER1, project_id=TENANT1)
         self.image_repo = glance.db.ImageRepo(self.context, self.db)
         self.image_factory = glance.domain.ImageFactory()
         self.crypt_key = '0123456789abcdef'
@@ -409,9 +771,11 @@ class TestEncryptedLocations(test_utils.BaseTestCase):
         self.image_repo.add(image)
         db_data = self.db.image_get(self.context, UUID1)
         self.assertNotEqual(db_data['locations'], ['foo', 'bar'])
-        decrypted_locations = [crypt.urlsafe_decrypt(self.crypt_key, l['url'])
-                               for l in db_data['locations']]
-        self.assertEqual([l['url'] for l in self.foo_bar_location],
+        decrypted_locations = [crypt.urlsafe_decrypt(self.crypt_key,
+                                                     location['url'])
+                               for location in db_data['locations']]
+        self.assertEqual([location['url']
+                          for location in self.foo_bar_location],
                          decrypted_locations)
 
     def test_encrypt_locations_on_save(self):
@@ -421,19 +785,23 @@ class TestEncryptedLocations(test_utils.BaseTestCase):
         self.image_repo.save(image)
         db_data = self.db.image_get(self.context, UUID1)
         self.assertNotEqual(db_data['locations'], ['foo', 'bar'])
-        decrypted_locations = [crypt.urlsafe_decrypt(self.crypt_key, l['url'])
-                               for l in db_data['locations']]
-        self.assertEqual([l['url'] for l in self.foo_bar_location],
+        decrypted_locations = [crypt.urlsafe_decrypt(self.crypt_key,
+                                                     location['url'])
+                               for location in db_data['locations']]
+        self.assertEqual([location['url']
+                          for location in self.foo_bar_location],
                          decrypted_locations)
 
     def test_decrypt_locations_on_get(self):
         url_loc = ['ping', 'pong']
-        orig_locations = [{'url': l, 'metadata': {}, 'status': 'active'}
-                          for l in url_loc]
-        encrypted_locs = [crypt.urlsafe_encrypt(self.crypt_key, l)
-                          for l in url_loc]
-        encrypted_locations = [{'url': l, 'metadata': {}, 'status': 'active'}
-                               for l in encrypted_locs]
+        orig_locations = [{'url': location, 'metadata': {}, 'status': 'active'}
+                          for location in url_loc]
+        encrypted_locs = [crypt.urlsafe_encrypt(self.crypt_key, location)
+                          for location in url_loc]
+        encrypted_locations = [{'url': location,
+                                'metadata': {},
+                                'status': 'active'}
+                               for location in encrypted_locs]
         self.assertNotEqual(encrypted_locations, orig_locations)
         db_data = _db_fixture(UUID1, owner=TENANT1,
                               locations=encrypted_locations)
@@ -447,12 +815,14 @@ class TestEncryptedLocations(test_utils.BaseTestCase):
 
     def test_decrypt_locations_on_list(self):
         url_loc = ['ping', 'pong']
-        orig_locations = [{'url': l, 'metadata': {}, 'status': 'active'}
-                          for l in url_loc]
-        encrypted_locs = [crypt.urlsafe_encrypt(self.crypt_key, l)
-                          for l in url_loc]
-        encrypted_locations = [{'url': l, 'metadata': {}, 'status': 'active'}
-                               for l in encrypted_locs]
+        orig_locations = [{'url': location, 'metadata': {}, 'status': 'active'}
+                          for location in url_loc]
+        encrypted_locs = [crypt.urlsafe_encrypt(self.crypt_key, location)
+                          for location in url_loc]
+        encrypted_locations = [{'url': location,
+                                'metadata': {},
+                                'status': 'active'}
+                               for location in encrypted_locs]
         self.assertNotEqual(encrypted_locations, orig_locations)
         db_data = _db_fixture(UUID1, owner=TENANT1,
                               locations=encrypted_locations)
@@ -471,7 +841,7 @@ class TestImageMemberRepo(test_utils.BaseTestCase):
         super(TestImageMemberRepo, self).setUp()
         self.db = unit_test_utils.FakeDB(initialize=False)
         self.context = glance.context.RequestContext(
-            user=USER1, tenant=TENANT1)
+            user_id=USER1, project_id=TENANT1)
         self.image_repo = glance.db.ImageRepo(self.context, self.db)
         self.image_member_factory = glance.domain.ImageMemberFactory()
         self._create_images()
@@ -485,7 +855,7 @@ class TestImageMemberRepo(test_utils.BaseTestCase):
             _db_fixture(UUID1, owner=TENANT1, name='1', size=256,
                         status='active'),
             _db_fixture(UUID2, owner=TENANT1, name='2',
-                        size=512, is_public=False),
+                        size=512, visibility='shared'),
         ]
         [self.db.image_create(None, image) for image in self.images]
 
@@ -585,7 +955,7 @@ class TestImageMemberRepo(test_utils.BaseTestCase):
         exc = self.assertRaises(exception.NotFound,
                                 self.image_member_repo.remove,
                                 fake_member)
-        self.assertIn(fake_uuid, encodeutils.exception_to_unicode(exc))
+        self.assertIn(fake_uuid, str(exc))
 
 
 class TestTaskRepo(test_utils.BaseTestCase):
@@ -593,8 +963,8 @@ class TestTaskRepo(test_utils.BaseTestCase):
     def setUp(self):
         super(TestTaskRepo, self).setUp()
         self.db = unit_test_utils.FakeDB(initialize=False)
-        self.context = glance.context.RequestContext(user=USER1,
-                                                     tenant=TENANT1)
+        self.context = glance.context.RequestContext(user_id=USER1,
+                                                     project_id=TENANT1)
         self.task_repo = glance.db.TaskRepo(self.context, self.db)
         self.task_factory = glance.domain.TaskFactory()
         self.fake_task_input = ('{"import_from": '
@@ -698,20 +1068,27 @@ class TestTaskRepo(test_utils.BaseTestCase):
 
     def test_add_task(self):
         task_type = 'import'
-        task = self.task_factory.new_task(task_type, None,
+        image_id = 'fake_image_id'
+        user_id = 'fake_user'
+        request_id = 'fake_request_id'
+        task = self.task_factory.new_task(task_type, None, image_id,
+                                          user_id, request_id,
                                           task_input=self.fake_task_input)
         self.assertEqual(task.updated_at, task.created_at)
         self.task_repo.add(task)
         retrieved_task = self.task_repo.get(task.task_id)
         self.assertEqual(task.updated_at, retrieved_task.updated_at)
         self.assertEqual(self.fake_task_input, retrieved_task.task_input)
+        self.assertEqual(image_id, task.image_id)
+        self.assertEqual(user_id, task.user_id)
+        self.assertEqual(request_id, task.request_id)
 
     def test_save_task(self):
         task = self.task_repo.get(UUID1)
         original_update_time = task.updated_at
         self.task_repo.save(task)
         current_update_time = task.updated_at
-        self.assertTrue(current_update_time > original_update_time)
+        self.assertGreater(current_update_time, original_update_time)
         task = self.task_repo.get(UUID1)
         self.assertEqual(current_update_time, task.updated_at)
 
@@ -723,37 +1100,41 @@ class TestTaskRepo(test_utils.BaseTestCase):
                           task.task_id)
 
 
-class RetryOnDeadlockTestCase(test_utils.BaseTestCase):
+class TestImageDeleteRace(test_utils.BaseTestCase):
 
-    def test_raise_deadlock(self):
+    @mock.patch.object(api, 'session_for_write')
+    @mock.patch.object(api, 'LOG')
+    def test_image_property_delete_stale_data(
+        self, mock_LOG, mock_session_for,
+    ):
+        mock_context = mock.MagicMock()
+        mock_session = mock_session_for.return_value
+        mock_result = (mock_session.__enter__.return_value.
+                       query.return_value.
+                       filter_by.return_value.
+                       one.return_value)
+        mock_result.delete.side_effect = sa_orm.exc.StaleDataError('myerror')
+        # StaleDataError should not be raised
+        r = api.image_property_delete(mock_context, 'myprop', 'myimage')
+        # We should not get the property back
+        self.assertIsNone(r)
+        # Make sure we logged it
+        mock_LOG.debug.assert_called_once_with(
+            'StaleDataError while deleting property %(prop)r '
+            'from image %(image)r likely means we raced during delete: '
+            '%(err)s', {'prop': 'myprop', 'image': 'myimage',
+                        'err': 'myerror'})
 
-        class TestException(Exception):
-            pass
-
-        self.attempts = 3
-
-        def _mock_get_session():
-            def _raise_exceptions():
-                self.attempts -= 1
-                if self.attempts <= 0:
-                    raise TestException("Exit")
-                raise db_exc.DBDeadlock("Fake Exception")
-            return _raise_exceptions
-
-        with mock.patch.object(api, 'get_session') as sess:
-            sess.side_effect = _mock_get_session()
-
-            try:
-                api._image_update(None, {}, 'fake-id')
-            except TestException:
-                self.assertEqual(3, sess.call_count)
-
-        # Test retry on image destroy if db deadlock occurs
-        self.attempts = 3
-        with mock.patch.object(api, 'get_session') as sess:
-            sess.side_effect = _mock_get_session()
-
-            try:
-                api.image_destroy(None, 'fake-id')
-            except TestException:
-                self.assertEqual(3, sess.call_count)
+    @mock.patch.object(api, 'session_for_write')
+    def test_image_property_delete_exception(self, mock_session_for):
+        mock_context = mock.MagicMock()
+        mock_session = mock_session_for.return_value
+        mock_result = (mock_session.__enter__.return_value.
+                       query.return_value.
+                       filter_by.return_value.
+                       one.return_value)
+        mock_result.delete.side_effect = RuntimeError
+        # Any other exception should be raised
+        self.assertRaises(RuntimeError,
+                          api.image_property_delete,
+                          mock_context, 'myprop', 'myimage')

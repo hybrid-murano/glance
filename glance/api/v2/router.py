@@ -13,6 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from glance.api.v2 import cached_images
+from glance.api.v2 import discovery
 from glance.api.v2 import image_actions
 from glance.api.v2 import image_data
 from glance.api.v2 import image_members
@@ -415,6 +417,11 @@ class API(wsgi.Router):
                        action='show',
                        conditions={'method': ['GET']},
                        body_reject=True)
+        mapper.connect('/images/{image_id}/tasks',
+                       controller=images_resource,
+                       action='get_task_info',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
         mapper.connect('/images/{image_id}',
                        controller=images_resource,
                        action='delete',
@@ -424,6 +431,23 @@ class API(wsgi.Router):
                        controller=reject_method_resource,
                        action='reject',
                        allowed_methods='GET, PATCH, DELETE')
+        mapper.connect('/images/{image_id}/import',
+                       controller=images_resource,
+                       action='import_image',
+                       conditions={'method': ['POST']})
+        mapper.connect('/images/{image_id}/import',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='POST')
+        mapper.connect('/stores/{store_id}/{image_id}',
+                       controller=images_resource,
+                       action='delete_from_store',
+                       conditions={'method': ['DELETE']},
+                       body_reject=True)
+        mapper.connect('/stores/{store_id}/{image_id}',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='DELETE')
 
         image_actions_resource = image_actions.create_resource()
         mapper.connect('/images/{image_id}/actions/deactivate',
@@ -459,6 +483,29 @@ class API(wsgi.Router):
                        controller=reject_method_resource,
                        action='reject',
                        allowed_methods='GET, PUT')
+        mapper.connect('/images/{image_id}/stage',
+                       controller=image_data_resource,
+                       action='stage',
+                       conditions={'method': ['PUT']})
+        mapper.connect('/images/{image_id}/stage',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='PUT')
+
+        # Location APIs
+        image_actions_resource = image_actions.create_resource()
+        mapper.connect('/images/{image_id}/locations',
+                       controller=images_resource,
+                       action='add_location',
+                       conditions={'method': ['POST']})
+        mapper.connect('/images/{image_id}/locations',
+                       controller=images_resource,
+                       action='get_locations',
+                       conditions={'method': ['GET']})
+        mapper.connect('/images/{image_id}/locations',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='POST')
 
         image_tags_resource = image_tags.create_resource()
         mapper.connect('/images/{image_id}/tags/{tag_value}',
@@ -536,5 +583,92 @@ class API(wsgi.Router):
                        controller=reject_method_resource,
                        action='reject',
                        allowed_methods='GET, DELETE')
+
+        # Discovery API
+        info_resource = discovery.create_resource()
+        mapper.connect('/info/import',
+                       controller=info_resource,
+                       action='get_image_import',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
+        mapper.connect('/info/import',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='GET')
+        mapper.connect('/info/stores',
+                       controller=info_resource,
+                       action='get_stores',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
+        mapper.connect('/info/stores',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='GET')
+        mapper.connect('/info/usage',
+                       controller=info_resource,
+                       action='get_usage',
+                       conditions={'method': ['GET']})
+        mapper.connect('/info/stores/detail',
+                       controller=info_resource,
+                       action='get_stores_detail',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
+        mapper.connect('/info/stores/detail',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='GET')
+
+        # Cache Management API
+        cache_manage_resource = cached_images.create_resource()
+        mapper.connect('/cache',
+                       controller=cache_manage_resource,
+                       action='get_cache_state',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
+        mapper.connect('/cache',
+                       controller=cache_manage_resource,
+                       action='clear_cache',
+                       conditions={'method': ['DELETE']})
+        mapper.connect('/cache',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='GET, DELETE')
+        mapper.connect('/cache/{image_id}',
+                       controller=cache_manage_resource,
+                       action='delete_cache_entry',
+                       conditions={'method': ['DELETE']})
+        mapper.connect('/cache/{image_id}',
+                       controller=cache_manage_resource,
+                       action='queue_image_from_api',
+                       conditions={'method': ['PUT']})
+        mapper.connect('/cache/{image_id}',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='DELETE, PUT')
+        mapper.connect('/cache/nodes/{image_id}',
+                       controller=cache_manage_resource,
+                       action='get_cached_nodes',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
+        mapper.connect('/cache/nodes/{image_id}',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='GET')
+        mapper.connect('/cache/clean',
+                       controller=cache_manage_resource,
+                       action='clean_cache',
+                       conditions={'method': ['POST']})
+        mapper.connect('/cache/clean',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='POST')
+        mapper.connect('/cache/prune',
+                       controller=cache_manage_resource,
+                       action='prune_cache',
+                       conditions={'method': ['POST']})
+        mapper.connect('/cache/prune',
+                       controller=reject_method_resource,
+                       action='reject',
+                       allowed_methods='POST')
 
         super(API, self).__init__(mapper)

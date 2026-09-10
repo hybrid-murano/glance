@@ -22,22 +22,22 @@ import uuid
 
 from oslo_db.sqlalchemy import models
 from oslo_serialization import jsonutils
+from oslo_utils import timeutils
 from sqlalchemy import BigInteger
 from sqlalchemy import Boolean
 from sqlalchemy import Column
 from sqlalchemy import DateTime
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import Enum
 from sqlalchemy import ForeignKey
 from sqlalchemy import Index
 from sqlalchemy import Integer
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import backref, relationship
 from sqlalchemy import sql
 from sqlalchemy import String
 from sqlalchemy import Text
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy import UniqueConstraint
-
-from glance.common import timeutils
 
 
 BASE = declarative_base()
@@ -69,7 +69,7 @@ class GlanceBase(models.ModelBase, models.TimestampMixin):
 
     def save(self, session=None):
         from glance.db.sqlalchemy import api as db_api
-        super(GlanceBase, self).save(session or db_api.get_session())
+        super(GlanceBase, self).save(session or db_api.session_for_write())
 
     created_at = Column(DateTime, default=lambda: timeutils.utcnow(),
                         nullable=False)
@@ -114,11 +114,13 @@ class Image(BASE, GlanceBase):
     """Represents an image in the datastore."""
     __tablename__ = 'images'
     __table_args__ = (Index('checksum_image_idx', 'checksum'),
-                      Index('ix_images_is_public', 'is_public'),
+                      Index('visibility_image_idx', 'visibility'),
                       Index('ix_images_deleted', 'deleted'),
                       Index('owner_image_idx', 'owner'),
                       Index('created_at_image_idx', 'created_at'),
-                      Index('updated_at_image_idx', 'updated_at'))
+                      Index('updated_at_image_idx', 'updated_at'),
+                      Index('os_hidden_image_idx', 'os_hidden'),
+                      Index('os_hash_value_image_idx', 'os_hash_value'))
 
     id = Column(String(36), primary_key=True,
                 default=lambda: str(uuid.uuid4()))
@@ -128,12 +130,18 @@ class Image(BASE, GlanceBase):
     size = Column(BigInteger().with_variant(Integer, "sqlite"))
     virtual_size = Column(BigInteger().with_variant(Integer, "sqlite"))
     status = Column(String(30), nullable=False)
-    is_public = Column(Boolean, nullable=False, default=False)
+    visibility = Column(Enum('private', 'public', 'shared', 'community',
+                        name='image_visibility'), nullable=False,
+                        server_default='shared')
     checksum = Column(String(32))
+    os_hash_algo = Column(String(64))
+    os_hash_value = Column(String(128))
     min_disk = Column(Integer, nullable=False, default=0)
     min_ram = Column(Integer, nullable=False, default=0)
     owner = Column(String(255))
     protected = Column(Boolean, nullable=False, default=False,
+                       server_default=sql.expression.false())
+    os_hidden = Column(Boolean, nullable=False, default=False,
                        server_default=sql.expression.false())
 
 
@@ -216,6 +224,7 @@ class Task(BASE, GlanceBase):
                       Index('ix_tasks_status', 'status'),
                       Index('ix_tasks_owner', 'owner'),
                       Index('ix_tasks_deleted', 'deleted'),
+                      Index('ix_tasks_image_id', 'image_id'),
                       Index('ix_tasks_updated_at', 'updated_at'))
 
     id = Column(String(36), primary_key=True,
@@ -224,6 +233,9 @@ class Task(BASE, GlanceBase):
     status = Column(String(30), nullable=False)
     owner = Column(String(255), nullable=False)
     expires_at = Column(DateTime, nullable=True)
+    image_id = Column(String(36), nullable=True)
+    request_id = Column(String(64), nullable=True)
+    user_id = Column(String(64), nullable=True)
 
 
 class TaskInfo(BASE, models.ModelBase):
@@ -243,6 +255,43 @@ class TaskInfo(BASE, models.ModelBase):
     input = Column(JSONEncodedDict())
     result = Column(JSONEncodedDict())
     message = Column(Text)
+
+
+class NodeReference(BASE, models.ModelBase):
+    """Represents node info in the datastore"""
+    __tablename__ = 'node_reference'
+    __table_args__ = (UniqueConstraint(
+        'node_reference_url',
+        name='uq_node_reference_node_reference_url'),)
+
+    node_reference_id = Column(BigInteger().with_variant(Integer, 'sqlite'),
+                               primary_key=True,
+                               nullable=False, autoincrement=True)
+    node_reference_url = Column(String(length=255),
+                                nullable=False)
+
+
+class CachedImages(BASE, models.ModelBase):
+    """Represents an image tag in the datastore."""
+    __tablename__ = 'cached_images'
+    __table_args__ = (UniqueConstraint(
+        'image_id',
+        'node_reference_id',
+        name='ix_cached_images_image_id_node_reference_id'),)
+
+    id = Column(BigInteger().with_variant(Integer, 'sqlite'),
+                primary_key=True, autoincrement=True,
+                nullable=False)
+    image_id = Column(String(36), nullable=False)
+    last_accessed = Column(DateTime, nullable=False)
+    last_modified = Column(DateTime, nullable=False)
+    size = Column(BigInteger(), nullable=False)
+    hits = Column(Integer, nullable=False)
+    checksum = Column(String(32), nullable=True)
+    node_reference_id = Column(
+        BigInteger().with_variant(Integer, 'sqlite'),
+        ForeignKey('node_reference.node_reference_id'),
+        nullable=False)
 
 
 def register_models(engine):

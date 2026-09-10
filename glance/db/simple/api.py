@@ -18,36 +18,33 @@ import copy
 import functools
 import uuid
 
+from oslo_config import cfg
 from oslo_log import log as logging
-import six
+from oslo_utils import timeutils as oslo_timeutils
 
 from glance.common import exception
-from glance.common import timeutils
 from glance.common import utils
+from glance.db import utils as db_utils
 from glance.i18n import _, _LI, _LW
 
-
+CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
 DATA = {
+    'cached_images': {},
     'images': {},
-    'members': {},
+    'members': [],
     'metadef_namespace_resource_types': [],
     'metadef_namespaces': [],
     'metadef_objects': [],
     'metadef_properties': [],
     'metadef_resource_types': [],
     'metadef_tags': [],
+    'node_reference': {},
     'tags': {},
     'locations': [],
     'tasks': {},
     'task_info': {},
-    'artifacts': {},
-    'artifact_properties': {},
-    'artifact_tags': {},
-    'artifact_dependencies': {},
-    'artifact_blobs': {},
-    'artifact_blob_locations': {}
 }
 
 INDEX = 0
@@ -69,9 +66,16 @@ def log_call(func):
     return wrapped
 
 
+def configure():
+    # No-op: workers check removed as standalone server is deprecated
+    # In uWSGI deployments, workers are managed by uWSGI, not Glance config
+    pass
+
+
 def reset():
     global DATA
     DATA = {
+        'cached_images': {},
         'images': {},
         'members': [],
         'metadef_namespace_resource_types': [],
@@ -80,11 +84,11 @@ def reset():
         'metadef_properties': [],
         'metadef_resource_types': [],
         'metadef_tags': [],
+        'node_reference': {},
         'tags': {},
         'locations': [],
         'tasks': {},
         'task_info': {},
-        'artifacts': {}
     }
 
 
@@ -103,7 +107,7 @@ def _get_session():
 
 @utils.no_4byte_params
 def _image_location_format(image_id, value, meta_data, status, deleted=False):
-    dt = timeutils.utcnow()
+    dt = oslo_timeutils.utcnow()
     return {
         'id': str(uuid.uuid4()),
         'image_id': image_id,
@@ -129,7 +133,7 @@ def _image_property_format(image_id, name, value):
 
 def _image_member_format(image_id, tenant_id, can_share, status='pending',
                          deleted=False):
-    dt = timeutils.utcnow()
+    dt = oslo_timeutils.utcnow()
     return {
         'id': str(uuid.uuid4()),
         'image_id': image_id,
@@ -162,17 +166,20 @@ def _format_task_from_db(task_ref, task_info_ref):
 
 
 def _task_format(task_id, **values):
-    dt = timeutils.utcnow()
+    dt = oslo_timeutils.utcnow()
     task = {
         'id': task_id,
         'type': 'import',
-        'status': 'pending',
+        'status': values.get('status', 'pending'),
         'owner': None,
         'expires_at': None,
         'created_at': dt,
         'updated_at': dt,
         'deleted_at': None,
         'deleted': False,
+        'image_id': values.get('image_id', None),
+        'request_id': values.get('request_id', None),
+        'user_id': values.get('user_id', None),
     }
     task.update(values)
     return task
@@ -199,12 +206,13 @@ def _image_update(image, values, properties):
     if 'properties' not in image.keys():
         image['properties'] = []
     image['properties'].extend(properties)
+    values = db_utils.ensure_image_dict_v2_compliant(values)
     image.update(values)
     return image
 
 
 def _image_format(image_id, **values):
-    dt = timeutils.utcnow()
+    dt = oslo_timeutils.utcnow()
     image = {
         'id': image_id,
         'name': None,
@@ -212,7 +220,7 @@ def _image_format(image_id, **values):
         'locations': [],
         'status': 'queued',
         'protected': False,
-        'is_public': False,
+        'visibility': 'shared',
         'container_format': None,
         'disk_format': None,
         'min_ram': 0,
@@ -220,11 +228,14 @@ def _image_format(image_id, **values):
         'size': None,
         'virtual_size': None,
         'checksum': None,
+        'os_hash_algo': None,
+        'os_hash_value': None,
         'tags': [],
         'created_at': dt,
         'updated_at': dt,
         'deleted_at': None,
         'deleted': False,
+        'os_hidden': False
     }
 
     locations = values.pop('locations', None)
@@ -253,37 +264,55 @@ def _filter_images(images, filters, context,
         status = None
 
     visibility = filters.pop('visibility', None)
+    os_hidden = filters.pop('os_hidden', False)
 
     for image in images:
         member = image_member_find(context, image_id=image['id'],
                                    member=context.owner, status=status)
         is_member = len(member) > 0
         has_ownership = context.owner and image['owner'] == context.owner
-        can_see = (image['is_public'] or has_ownership or is_member or
-                   (context.is_admin and not admin_as_user))
+        image_is_public = image['visibility'] == 'public'
+        image_is_community = image['visibility'] == 'community'
+        image_is_shared = image['visibility'] == 'shared'
+        image_is_hidden = image['os_hidden'] is True
+        acts_as_admin = context.is_admin and not admin_as_user
+        can_see = (image_is_public
+                   or image_is_community
+                   or has_ownership
+                   or (is_member and image_is_shared)
+                   or acts_as_admin)
         if not can_see:
             continue
 
         if visibility:
             if visibility == 'public':
-                if not image['is_public']:
+                if not image_is_public:
                     continue
             elif visibility == 'private':
-                if image['is_public']:
+                if not (image['visibility'] == 'private'):
                     continue
-                if not (has_ownership or (context.is_admin
-                        and not admin_as_user)):
+                if not (has_ownership or acts_as_admin):
                     continue
             elif visibility == 'shared':
-                if not is_member:
+                if not image_is_shared:
                     continue
+            elif visibility == 'community':
+                if not image_is_community:
+                    continue
+        else:
+            if (not has_ownership) and image_is_community:
+                continue
 
         if is_public is not None:
-            if not image['is_public'] == is_public:
+            if not image_is_public == is_public:
+                continue
+
+        if os_hidden:
+            if image_is_hidden:
                 continue
 
         to_add = True
-        for k, value in six.iteritems(filters):
+        for k, value in filters.items():
             key = k
             if k.endswith('_min') or k.endswith('_max'):
                 key = key[0:-4]
@@ -300,8 +329,8 @@ def _filter_images(images, filters, context,
             elif k in ['created_at', 'updated_at']:
                 attr_value = image.get(key)
                 operator, isotime = utils.split_filter_op(value)
-                parsed_time = timeutils.parse_isotime(isotime)
-                threshold = timeutils.normalize_time(parsed_time)
+                parsed_time = oslo_timeutils.parse_isotime(isotime)
+                threshold = oslo_timeutils.normalize_time(parsed_time)
                 to_add = utils.evaluate_filter_op(attr_value, operator,
                                                   threshold)
             elif k in ['name', 'id', 'status',
@@ -400,37 +429,81 @@ def _sort_images(images, sort_key, sort_dir):
     return images
 
 
+def image_set_property_atomic(image_id, name, value):
+    try:
+        image = DATA['images'][image_id]
+    except KeyError:
+        LOG.warning(_LW('Could not find image %s'), image_id)
+        raise exception.ImageNotFound()
+
+    prop = _image_property_format(image_id,
+                                  name,
+                                  value)
+    image['properties'].append(prop)
+
+
+def image_delete_property_atomic(image_id, name, value):
+    try:
+        image = DATA['images'][image_id]
+    except KeyError:
+        LOG.warning(_LW('Could not find image %s'), image_id)
+        raise exception.ImageNotFound()
+
+    for i, prop in enumerate(image['properties']):
+        if prop['name'] == name and prop['value'] == value:
+            del image['properties'][i]
+            return
+
+    raise exception.NotFound()
+
+
 def _image_get(context, image_id, force_show_deleted=False, status=None):
     try:
         image = DATA['images'][image_id]
     except KeyError:
-        LOG.warn(_LW('Could not find image %s') % image_id)
+        LOG.warning(_LW('Could not find image %s'), image_id)
         raise exception.ImageNotFound()
 
     if image['deleted'] and not (force_show_deleted
                                  or context.can_see_deleted):
-        LOG.warn(_LW('Unable to get deleted image'))
+        LOG.warning(_LW('Unable to get deleted image'))
         raise exception.ImageNotFound()
 
     if not is_image_visible(context, image):
-        LOG.warn(_LW('Unable to get unowned image'))
+        LOG.warning(_LW('Unable to get unowned image'))
         raise exception.Forbidden("Image not visible to you")
 
     return image
 
 
 @log_call
-def image_get(context, image_id, session=None, force_show_deleted=False):
-    image = _image_get(context, image_id, force_show_deleted)
-    return _normalize_locations(context, copy.deepcopy(image),
-                                force_show_deleted=force_show_deleted)
+def image_get(context, image_id, session=None, force_show_deleted=False,
+              v1_mode=False):
+    image = copy.deepcopy(_image_get(context, image_id, force_show_deleted))
+    image = _normalize_locations(context, image,
+                                 force_show_deleted=force_show_deleted)
+    if v1_mode:
+        image = db_utils.mutate_image_dict_to_v1(image)
+    return image
+
+
+@log_call
+def tasks_get_by_image(context, image_id):
+    db_tasks = DATA['tasks']
+    tasks = []
+    for task in db_tasks:
+        if db_tasks[task]['image_id'] == image_id:
+            if _is_task_visible(context, db_tasks[task]):
+                tasks.append(db_tasks[task])
+
+    return tasks
 
 
 @log_call
 def image_get_all(context, filters=None, marker=None, limit=None,
                   sort_key=None, sort_dir=None,
                   member_status='accepted', is_public=None,
-                  admin_as_user=False, return_tag=False):
+                  admin_as_user=False, return_tag=False, v1_mode=False):
     filters = filters or {}
     images = DATA['images'].values()
     images = _filter_images(images, filters, context, member_status,
@@ -446,8 +519,22 @@ def image_get_all(context, filters=None, marker=None, limit=None,
                                    force_show_deleted=force_show_deleted)
         if return_tag:
             img['tags'] = image_tag_get_all(context, img['id'])
+
+        if v1_mode:
+            img = db_utils.mutate_image_dict_to_v1(img)
         res.append(img)
     return res
+
+
+def image_restore(context, image_id):
+    """Restore the pending-delete image to active."""
+    image = _image_get(context, image_id)
+    if image['status'] != 'pending_delete':
+        msg = (_('cannot restore the image from %s to active (wanted '
+                 'from_state=pending_delete)') % image['status'])
+        raise exception.Conflict(msg)
+    values = {'status': 'active', 'deleted': 0}
+    image_update(context, image_id, values)
 
 
 @log_call
@@ -468,7 +555,7 @@ def image_property_delete(context, prop_ref, image_ref):
             prop = p
     if not prop:
         raise exception.NotFound()
-    prop['deleted_at'] = timeutils.utcnow()
+    prop['deleted_at'] = oslo_timeutils.utcnow()
     prop['deleted'] = True
     return prop
 
@@ -514,24 +601,23 @@ def image_member_count(context, image_id):
 
 
 @log_call
+@utils.no_4byte_params
 def image_member_create(context, values):
     member = _image_member_format(values['image_id'],
                                   values['member'],
                                   values.get('can_share', False),
                                   values.get('status', 'pending'),
                                   values.get('deleted', False))
-    global DATA
     DATA['members'].append(member)
     return copy.deepcopy(member)
 
 
 @log_call
 def image_member_update(context, member_id, values):
-    global DATA
     for member in DATA['members']:
         if member['id'] == member_id:
             member.update(values)
-            member['updated_at'] = timeutils.utcnow()
+            member['updated_at'] = oslo_timeutils.utcnow()
             return copy.deepcopy(member)
     else:
         raise exception.NotFound()
@@ -539,7 +625,6 @@ def image_member_update(context, member_id, values):
 
 @log_call
 def image_member_delete(context, member_id):
-    global DATA
     for i, member in enumerate(DATA['members']):
         if member['id'] == member_id:
             del DATA['members'][i]
@@ -571,7 +656,7 @@ def image_location_update(context, image_id, location):
         raise exception.Invalid(msg)
 
     deleted = location['status'] in ('deleted', 'pending_delete')
-    updated_time = timeutils.utcnow()
+    updated_time = oslo_timeutils.utcnow()
     delete_time = updated_time if deleted else None
 
     updated = False
@@ -589,7 +674,7 @@ def image_location_update(context, image_id, location):
     if not updated:
         msg = (_("No location found with ID %(loc)s from image %(img)s") %
                dict(loc=loc_id, img=image_id))
-        LOG.warn(msg)
+        LOG.warning(msg)
         raise exception.NotFound(msg)
 
 
@@ -605,7 +690,7 @@ def image_location_delete(context, image_id, location_id, status,
     for loc in DATA['locations']:
         if loc['id'] == location_id and loc['image_id'] == image_id:
             deleted = True
-            delete_time = delete_time or timeutils.utcnow()
+            delete_time = delete_time or oslo_timeutils.utcnow()
             loc.update({"deleted": deleted,
                         "status": status,
                         "updated_at": delete_time,
@@ -615,7 +700,7 @@ def image_location_delete(context, image_id, location_id, status,
     if not deleted:
         msg = (_("No location found with ID %(loc)s from image %(img)s") %
                dict(loc=location_id, img=image_id))
-        LOG.warn(msg)
+        LOG.warning(msg)
         raise exception.NotFound(msg)
 
 
@@ -647,7 +732,7 @@ def _image_locations_delete_all(context, image_id, delete_time=None):
                                   delete_time=delete_time)
 
     for i, loc in enumerate(DATA['locations']):
-        if image_id == loc['image_id'] and loc['deleted'] == False:
+        if image_id == loc['image_id'] and loc['deleted'] is False:
             del DATA['locations'][i]
 
 
@@ -667,7 +752,7 @@ def _normalize_locations(context, image, force_show_deleted=False):
     if force_show_deleted:
         locations = image['locations']
     else:
-        locations = filter(lambda x: not x['deleted'], image['locations'])
+        locations = [x for x in image['locations'] if not x['deleted']]
     image['locations'] = [{'id': loc['id'],
                            'url': loc['url'],
                            'metadata': loc['metadata'],
@@ -677,8 +762,7 @@ def _normalize_locations(context, image, force_show_deleted=False):
 
 
 @log_call
-def image_create(context, image_values):
-    global DATA
+def image_create(context, image_values, v1_mode=False):
     image_id = image_values.get('id', str(uuid.uuid4()))
 
     if image_id in DATA['images']:
@@ -691,7 +775,8 @@ def image_create(context, image_values):
                         'virtual_size', 'checksum', 'locations', 'owner',
                         'protected', 'is_public', 'container_format',
                         'disk_format', 'created_at', 'updated_at', 'deleted',
-                        'deleted_at', 'properties', 'tags'])
+                        'deleted_at', 'properties', 'tags', 'visibility',
+                        'os_hidden', 'os_hash_algo', 'os_hash_value'])
 
     incorrect_keys = set(image_values.keys()) - allowed_keys
     if incorrect_keys:
@@ -702,42 +787,54 @@ def image_create(context, image_values):
     DATA['images'][image_id] = image
     DATA['tags'][image_id] = image.pop('tags', [])
 
-    return _normalize_locations(context, copy.deepcopy(image))
+    image = _normalize_locations(context, copy.deepcopy(image))
+    if v1_mode:
+        image = db_utils.mutate_image_dict_to_v1(image)
+    return image
 
 
 @log_call
 def image_update(context, image_id, image_values, purge_props=False,
-                 from_state=None):
-    global DATA
+                 from_state=None, v1_mode=False, atomic_props=None):
     try:
         image = DATA['images'][image_id]
     except KeyError:
-        raise exception.ImageNotFound()
+        raise exception.ImageNotFound(image_id)
 
     location_data = image_values.pop('locations', None)
     if location_data is not None:
         _image_locations_set(context, image_id, location_data)
 
+    if atomic_props is None:
+        atomic_props = []
+
     # replace values for properties that already exist
     new_properties = image_values.pop('properties', {})
     for prop in image['properties']:
-        if prop['name'] in new_properties:
+        if prop['name'] in atomic_props:
+            continue
+        elif prop['name'] in new_properties:
             prop['value'] = new_properties.pop(prop['name'])
         elif purge_props:
             # this matches weirdness in the sqlalchemy api
             prop['deleted'] = True
 
-    image['updated_at'] = timeutils.utcnow()
-    _image_update(image, image_values, new_properties)
+    image['updated_at'] = oslo_timeutils.utcnow()
+    _image_update(image, image_values,
+                  {k: v for k, v in new_properties.items()
+                   if k not in atomic_props})
     DATA['images'][image_id] = image
-    return _normalize_locations(context, copy.deepcopy(image))
+
+    image = _normalize_locations(context, copy.deepcopy(image))
+    if v1_mode:
+        image = db_utils.mutate_image_dict_to_v1(image)
+    return image
 
 
 @log_call
 def image_destroy(context, image_id):
-    global DATA
     try:
-        delete_time = timeutils.utcnow()
+        delete_time = oslo_timeutils.utcnow()
         DATA['images'][image_id]['deleted'] = True
         DATA['images'][image_id]['deleted_at'] = delete_time
 
@@ -783,72 +880,28 @@ def image_tag_get(context, image_id, value):
 
 @log_call
 def image_tag_set_all(context, image_id, values):
-    global DATA
-    DATA['tags'][image_id] = values
+    DATA['tags'][image_id] = list(values)
 
 
 @log_call
 @utils.no_4byte_params
 def image_tag_create(context, image_id, value):
-    global DATA
     DATA['tags'][image_id].append(value)
     return value
 
 
 @log_call
 def image_tag_delete(context, image_id, value):
-    global DATA
     try:
         DATA['tags'][image_id].remove(value)
     except ValueError:
         raise exception.NotFound()
 
 
-def is_image_mutable(context, image):
-    """Return True if the image is mutable in this context."""
-    # Is admin == image mutable
-    if context.is_admin:
-        return True
-
-    # No owner == image not mutable
-    if image['owner'] is None or context.owner is None:
-        return False
-
-    # Image only mutable by its owner
-    return image['owner'] == context.owner
-
-
 def is_image_visible(context, image, status=None):
-    """Return True if the image is visible in this context."""
-    # Is admin == image visible
-    if context.is_admin:
-        return True
-
-    # No owner == image visible
-    if image['owner'] is None:
-        return True
-
-    # Image is_public == image visible
-    if image['is_public']:
-        return True
-
-    # Perform tests based on whether we have an owner
-    if context.owner is not None:
-        if context.owner == image['owner']:
-            return True
-
-        # Figure out if this image is shared with that tenant
-        if status == 'all':
-            status = None
-        members = image_member_find(context,
-                                    image_id=image['id'],
-                                    member=context.owner,
-                                    status=status)
-        if members:
-            return True
-
-    # Private image
-    return False
+    if status == 'all':
+        status = None
+    return db_utils.is_image_visible(context, image, image_member_find, status)
 
 
 def user_get_storage_usage(context, owner_id, image_id=None, session=None):
@@ -868,14 +921,13 @@ def user_get_storage_usage(context, owner_id, image_id=None, session=None):
 @log_call
 def task_create(context, values):
     """Create a task object"""
-    global DATA
-
     task_values = copy.deepcopy(values)
     task_id = task_values.get('id', str(uuid.uuid4()))
     required_attributes = ['type', 'status', 'input']
     allowed_attributes = ['id', 'type', 'status', 'input', 'result', 'owner',
                           'message', 'expires_at', 'created_at',
-                          'updated_at', 'deleted_at', 'deleted']
+                          'updated_at', 'deleted_at', 'deleted',
+                          'image_id', 'request_id', 'user_id']
 
     if task_id in DATA['tasks']:
         raise exception.Duplicate()
@@ -900,7 +952,6 @@ def task_create(context, values):
 @log_call
 def task_update(context, task_id, values):
     """Update a task object"""
-    global DATA
     task_values = copy.deepcopy(values)
     task_info_values = _pop_task_info_values(task_values)
     try:
@@ -910,7 +961,7 @@ def task_update(context, task_id, values):
         raise exception.TaskNotFound(task_id=task_id)
 
     task.update(task_values)
-    task['updated_at'] = timeutils.utcnow()
+    task['updated_at'] = oslo_timeutils.utcnow()
     DATA['tasks'][task_id] = task
     task_info = _task_info_update(task['id'], task_info_values)
 
@@ -928,12 +979,12 @@ def _task_get(context, task_id, force_show_deleted=False):
         task = DATA['tasks'][task_id]
     except KeyError:
         msg = _LW('Could not find task %s') % task_id
-        LOG.warn(msg)
+        LOG.warning(msg)
         raise exception.TaskNotFound(task_id=task_id)
 
     if task['deleted'] and not (force_show_deleted or context.can_see_deleted):
         msg = _LW('Unable to get deleted task %s') % task_id
-        LOG.warn(msg)
+        LOG.warning(msg)
         raise exception.TaskNotFound(task_id=task_id)
 
     if not _is_task_visible(context, task):
@@ -948,15 +999,27 @@ def _task_get(context, task_id, force_show_deleted=False):
 
 @log_call
 def task_delete(context, task_id):
-    global DATA
     try:
         DATA['tasks'][task_id]['deleted'] = True
-        DATA['tasks'][task_id]['deleted_at'] = timeutils.utcnow()
-        DATA['tasks'][task_id]['updated_at'] = timeutils.utcnow()
+        DATA['tasks'][task_id]['deleted_at'] = oslo_timeutils.utcnow()
+        DATA['tasks'][task_id]['updated_at'] = oslo_timeutils.utcnow()
         return copy.deepcopy(DATA['tasks'][task_id])
     except KeyError:
         LOG.debug("No task found with ID %s", task_id)
         raise exception.TaskNotFound(task_id=task_id)
+
+
+def _task_soft_delete(context):
+    """Scrub task entities which are expired """
+    now = oslo_timeutils.utcnow()
+    tasks = DATA['tasks'].values()
+
+    for task in tasks:
+        if (task['owner'] == context.owner and task['deleted'] is False
+                and task['expires_at'] <= now):
+
+            task['deleted'] = True
+            task['deleted_at'] = oslo_timeutils.utcnow()
 
 
 @log_call
@@ -972,6 +1035,7 @@ def task_get_all(context, filters=None, marker=None, limit=None,
     :param sort_dir: direction in which results should be sorted (asc, desc)
     :returns: tasks set
     """
+    _task_soft_delete(context)
     filters = filters or {}
     tasks = DATA['tasks'].values()
     tasks = _filter_tasks(tasks, filters, context)
@@ -1014,7 +1078,7 @@ def _filter_tasks(tasks, filters, context, admin_as_user=False):
             continue
 
         add = True
-        for k, value in six.iteritems(filters):
+        for k, value in filters.items():
             add = task[k] == value and task['deleted'] is False
             if not add:
                 break
@@ -1029,8 +1093,11 @@ def _sort_tasks(tasks, sort_key, sort_dir):
     reverse = False
     if tasks and not (sort_key in tasks[0]):
         raise exception.InvalidSortKey()
-    keyfn = lambda x: (x[sort_key] if x[sort_key] is not None else '',
-                       x['created_at'], x['id'])
+
+    def keyfn(x):
+        return (x[sort_key] if x[sort_key] is not None else '',
+                x['created_at'], x['id'])
+
     reverse = sort_dir == 'desc'
     tasks.sort(key=keyfn, reverse=reverse)
     return tasks
@@ -1062,7 +1129,6 @@ def _paginate_tasks(context, tasks, marker, limit, show_deleted):
 
 def _task_info_create(task_id, values):
     """Create a Task Info for Task with given task ID"""
-    global DATA
     task_info = _task_info_format(task_id, **values)
     DATA['task_info'][task_id] = task_info
 
@@ -1071,7 +1137,6 @@ def _task_info_create(task_id, values):
 
 def _task_info_update(task_id, values):
     """Update Task Info for Task with given task ID and updated values"""
-    global DATA
     try:
         task_info = DATA['task_info'][task_id]
     except KeyError:
@@ -1086,19 +1151,17 @@ def _task_info_update(task_id, values):
 
 def _task_info_get(task_id):
     """Get Task Info for Task with given task ID"""
-    global DATA
     try:
         task_info = DATA['task_info'][task_id]
     except KeyError:
         msg = _LW('Could not find task info %s') % task_id
-        LOG.warn(msg)
+        LOG.warning(msg)
         raise exception.TaskNotFound(task_id=task_id)
 
     return task_info
 
 
 def _metadef_delete_namespace_content(get_func, key, context, namespace_name):
-    global DATA
     metadefs = get_func(context, namespace_name)
     data = DATA[key]
     for metadef in metadefs:
@@ -1107,10 +1170,9 @@ def _metadef_delete_namespace_content(get_func, key, context, namespace_name):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_namespace_create(context, values):
     """Create a namespace object"""
-    global DATA
-
     namespace_values = copy.deepcopy(values)
     namespace_name = namespace_values.get('namespace')
     required_attributes = ['namespace', 'owner']
@@ -1140,9 +1202,9 @@ def metadef_namespace_create(context, values):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_namespace_update(context, namespace_id, values):
     """Update a namespace object"""
-    global DATA
     namespace_values = copy.deepcopy(values)
 
     namespace = metadef_namespace_get_by_id(context, namespace_id)
@@ -1160,7 +1222,7 @@ def metadef_namespace_update(context, namespace_id, values):
     DATA['metadef_namespaces'].remove(namespace)
 
     namespace.update(namespace_values)
-    namespace['updated_at'] = timeutils.utcnow()
+    namespace['updated_at'] = oslo_timeutils.utcnow()
     DATA['metadef_namespaces'].append(namespace)
 
     return namespace
@@ -1175,7 +1237,7 @@ def metadef_namespace_get_by_id(context, namespace_id):
     except StopIteration:
         msg = (_("Metadata definition namespace not found for id=%s")
                % namespace_id)
-        LOG.warn(msg)
+        LOG.warning(msg)
         raise exception.MetadefNamespaceNotFound(msg)
 
     if not _is_namespace_visible(context, namespace):
@@ -1213,7 +1275,7 @@ def metadef_namespace_get_all(context,
                               filters=None):
     """Get a namespaces list"""
     resource_types = filters.get('resource_types', []) if filters else []
-    visibility = filters.get('visibility', None) if filters else None
+    visibility = filters.get('visibility') if filters else None
 
     namespaces = []
     for namespace in DATA['metadef_namespaces']:
@@ -1239,8 +1301,6 @@ def metadef_namespace_get_all(context,
 @log_call
 def metadef_namespace_delete(context, namespace_name):
     """Delete a namespace object"""
-    global DATA
-
     namespace = metadef_namespace_get(context, namespace_name)
     DATA['metadef_namespaces'].remove(namespace)
 
@@ -1250,7 +1310,6 @@ def metadef_namespace_delete(context, namespace_name):
 @log_call
 def metadef_namespace_delete_content(context, namespace_name):
     """Delete a namespace content"""
-    global DATA
     namespace = metadef_namespace_get(context, namespace_name)
     namespace_id = namespace['id']
 
@@ -1306,7 +1365,7 @@ def metadef_object_get_by_id(context, namespace_name, object_id):
     else:
         msg = (_("Metadata definition object not found for id=%s")
                % object_id)
-        LOG.warn(msg)
+        LOG.warning(msg)
         raise exception.MetadefObjectNotFound(msg)
 
 
@@ -1327,10 +1386,9 @@ def metadef_object_get_all(context, namespace_name):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_object_create(context, namespace_name, values):
     """Create a metadef object"""
-    global DATA
-
     object_values = copy.deepcopy(values)
     object_name = object_values['name']
     required_attributes = ['name']
@@ -1367,10 +1425,9 @@ def metadef_object_create(context, namespace_name, values):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_object_update(context, namespace_name, object_id, values):
     """Update a metadef object"""
-    global DATA
-
     namespace = metadef_namespace_get(context, namespace_name)
 
     _check_namespace_visibility(context, namespace, namespace_name)
@@ -1395,7 +1452,7 @@ def metadef_object_update(context, namespace_name, object_id, values):
     DATA['metadef_objects'].remove(object)
 
     object.update(values)
-    object['updated_at'] = timeutils.utcnow()
+    object['updated_at'] = oslo_timeutils.utcnow()
     DATA['metadef_objects'].append(object)
 
     return object
@@ -1404,16 +1461,13 @@ def metadef_object_update(context, namespace_name, object_id, values):
 @log_call
 def metadef_object_delete(context, namespace_name, object_name):
     """Delete a metadef object"""
-    global DATA
-
     object = metadef_object_get(context, namespace_name, object_name)
     DATA['metadef_objects'].remove(object)
 
     return object
 
 
-def metadef_object_delete_namespace_content(context, namespace_name,
-                                            session=None):
+def metadef_object_delete_namespace_content(context, namespace_name):
     """Delete an object or raise if namespace or object doesn't exist."""
     return _metadef_delete_namespace_content(
         metadef_object_get_all, 'metadef_objects', context, namespace_name)
@@ -1450,10 +1504,9 @@ def metadef_property_count(context, namespace_name):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_property_create(context, namespace_name, values):
     """Create a metadef property"""
-    global DATA
-
     property_values = copy.deepcopy(values)
     property_name = property_values['name']
     required_attributes = ['name']
@@ -1493,10 +1546,9 @@ def metadef_property_create(context, namespace_name, values):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_property_update(context, namespace_name, property_id, values):
     """Update a metadef property"""
-    global DATA
-
     namespace = metadef_namespace_get(context, namespace_name)
 
     _check_namespace_visibility(context, namespace, namespace_name)
@@ -1522,7 +1574,7 @@ def metadef_property_update(context, namespace_name, property_id, values):
     DATA['metadef_properties'].remove(property)
 
     property.update(values)
-    property['updated_at'] = timeutils.utcnow()
+    property['updated_at'] = oslo_timeutils.utcnow()
     DATA['metadef_properties'].append(property)
 
     return property
@@ -1558,7 +1610,7 @@ def metadef_property_get_by_id(context, namespace_name, property_id):
     else:
         msg = (_("Metadata definition property not found for id=%s")
                % property_id)
-        LOG.warn(msg)
+        LOG.warning(msg)
         raise exception.MetadefPropertyNotFound(msg)
 
 
@@ -1584,16 +1636,13 @@ def metadef_property_get(context, namespace_name, property_name):
 @log_call
 def metadef_property_delete(context, namespace_name, property_name):
     """Delete a metadef property"""
-    global DATA
-
     property = metadef_property_get(context, namespace_name, property_name)
     DATA['metadef_properties'].remove(property)
 
     return property
 
 
-def metadef_property_delete_namespace_content(context, namespace_name,
-                                              session=None):
+def metadef_property_delete_namespace_content(context, namespace_name):
     """Delete a property or raise if it or namespace doesn't exist."""
     return _metadef_delete_namespace_content(
         metadef_property_get_all, 'metadef_properties', context,
@@ -1603,8 +1652,6 @@ def metadef_property_delete_namespace_content(context, namespace_name,
 @log_call
 def metadef_resource_type_create(context, values):
     """Create a metadef resource type"""
-    global DATA
-
     resource_type_values = copy.deepcopy(values)
     resource_type_name = resource_type_values['name']
 
@@ -1650,8 +1697,6 @@ def metadef_resource_type_get(context, resource_type_name):
 @log_call
 def metadef_resource_type_association_create(context, namespace_name,
                                              values):
-    global DATA
-
     association_values = copy.deepcopy(values)
 
     namespace = metadef_namespace_get(context, namespace_name)
@@ -1725,8 +1770,6 @@ def metadef_resource_type_association_get_all_by_namespace(context,
 @log_call
 def metadef_resource_type_association_delete(context, namespace_name,
                                              resource_type_name):
-    global DATA
-
     resource_type = metadef_resource_type_association_get(context,
                                                           namespace_name,
                                                           resource_type_name)
@@ -1763,7 +1806,7 @@ def metadef_tag_get_by_id(context, namespace_name, id):
             return tag
     else:
         msg = (_("Metadata definition tag not found for id=%s") % id)
-        LOG.warn(msg)
+        LOG.warning(msg)
         raise exception.MetadefTagNotFound(msg)
 
 
@@ -1785,10 +1828,9 @@ def metadef_tag_get_all(context, namespace_name, filters=None, marker=None,
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_tag_create(context, namespace_name, values):
     """Create a metadef tag"""
-    global DATA
-
     tag_values = copy.deepcopy(values)
     tag_name = tag_values['name']
     required_attributes = ['name']
@@ -1823,10 +1865,9 @@ def metadef_tag_create(context, namespace_name, values):
 
 
 @log_call
-def metadef_tag_create_tags(context, namespace_name, tag_list):
+def metadef_tag_create_tags(context, namespace_name, tag_list,
+                            can_append=False):
     """Create a metadef tag"""
-    global DATA
-
     namespace = metadef_namespace_get(context, namespace_name)
     _check_namespace_visibility(context, namespace, namespace_name)
 
@@ -1834,6 +1875,12 @@ def metadef_tag_create_tags(context, namespace_name, tag_list):
     allowed_attributes = ['name']
     data_tag_list = []
     tag_name_list = []
+    if can_append:
+        # NOTE(mrjoshi): We need to fetch existing tags here for duplicate
+        # check while adding new one
+        tag_name_list = [tag['name']
+                         for tag in metadef_tag_get_all(context,
+                                                        namespace_name)]
     for tag_value in tag_list:
         tag_values = copy.deepcopy(tag_value)
         tag_name = tag_values['name']
@@ -1858,8 +1905,8 @@ def metadef_tag_create_tags(context, namespace_name, tag_list):
 
         tag_values['namespace_id'] = namespace['id']
         data_tag_list.append(_format_tag(tag_values))
-
-    DATA['metadef_tags'] = []
+    if not can_append:
+        DATA['metadef_tags'] = []
     for tag in data_tag_list:
         DATA['metadef_tags'].append(tag)
 
@@ -1867,10 +1914,9 @@ def metadef_tag_create_tags(context, namespace_name, tag_list):
 
 
 @log_call
+@utils.no_4byte_params
 def metadef_tag_update(context, namespace_name, id, values):
     """Update a metadef tag"""
-    global DATA
-
     namespace = metadef_namespace_get(context, namespace_name)
 
     _check_namespace_visibility(context, namespace, namespace_name)
@@ -1891,7 +1937,7 @@ def metadef_tag_update(context, namespace_name, id, values):
     DATA['metadef_tags'].remove(tag)
 
     tag.update(values)
-    tag['updated_at'] = timeutils.utcnow()
+    tag['updated_at'] = oslo_timeutils.utcnow()
     DATA['metadef_tags'].append(tag)
     return tag
 
@@ -1899,16 +1945,13 @@ def metadef_tag_update(context, namespace_name, id, values):
 @log_call
 def metadef_tag_delete(context, namespace_name, name):
     """Delete a metadef tag"""
-    global DATA
-
     tags = metadef_tag_get(context, namespace_name, name)
     DATA['metadef_tags'].remove(tags)
 
     return tags
 
 
-def metadef_tag_delete_namespace_content(context, namespace_name,
-                                         session=None):
+def metadef_tag_delete_namespace_content(context, namespace_name):
     """Delete an tag or raise if namespace or tag doesn't exist."""
     return _metadef_delete_namespace_content(
         metadef_tag_get_all, 'metadef_tags', context, namespace_name)
@@ -1929,104 +1972,14 @@ def metadef_tag_count(context, namespace_name):
     return count
 
 
-def _artifact_format(artifact_id, **values):
-    dt = timeutils.utcnow()
-    artifact = {
-        'id': artifact_id,
-        'type_name': None,
-        'type_version_prefix': None,
-        'type_version_suffix': None,
-        'type_version_meta': None,
-        'version_prefix': None,
-        'version_suffix': None,
-        'version_meta': None,
-        'description': None,
-        'visibility': None,
-        'state': None,
-        'owner': None,
-        'scope': None,
-        'tags': [],
-        'properties': {},
-        'blobs': [],
-        'created_at': dt,
-        'updated_at': dt,
-        'deleted_at': None,
-        'deleted': False,
-    }
-
-    artifact.update(values)
-    return artifact
-
-
-@log_call
-def artifact_create(context, values, type_name, type_version):
-    global DATA
-    artifact_id = values.get('id', str(uuid.uuid4()))
-
-    if artifact_id in DATA['artifacts']:
-        raise exception.Duplicate()
-
-    if 'state' not in values:
-        raise exception.Invalid('state is a required attribute')
-
-    allowed_keys = set(['id',
-                        'type_name',
-                        'type_version',
-                        'name',
-                        'version',
-                        'description',
-                        'visibility',
-                        'state',
-                        'owner',
-                        'scope'])
-
-    incorrect_keys = set(values.keys()) - allowed_keys
-    if incorrect_keys:
-        raise exception.Invalid(
-            'The keys %s are not valid' % str(incorrect_keys))
-
-    artifact = _artifact_format(artifact_id, **values)
-    DATA['artifacts'][artifact_id] = artifact
-
-    return copy.deepcopy(artifact)
-
-
-def _artifact_get(context, artifact_id, type_name,
-                  type_version=None):
-    try:
-        artifact = DATA['artifacts'][artifact_id]
-        if (artifact['type_name'] != type_name or
-                (type_version is not None and
-                 artifact['type_version'] != type_version)):
-            raise KeyError
-    except KeyError:
-        LOG.info(_LI('Could not find artifact %s'), artifact_id)
-        raise exception.NotFound()
-
-    if artifact['deleted_at']:
-        LOG.info(_LI('Unable to get deleted image'))
-        raise exception.NotFound()
-
-    return artifact
-
-
-@log_call
-def artifact_get(context, artifact_id,
-                 type_name,
-                 type_version=None, session=None):
-    artifact = _artifact_get(context, artifact_id, type_name,
-                             type_version)
-    return copy.deepcopy(artifact)
-
-
 def _format_association(namespace, resource_type, association_values):
     association = {
         'namespace_id': namespace['id'],
         'resource_type': resource_type['id'],
         'properties_target': None,
         'prefix': None,
-        'created_at': timeutils.utcnow(),
-        'updated_at': timeutils.utcnow()
+        'created_at': oslo_timeutils.utcnow(),
+        'updated_at': oslo_timeutils.utcnow()
 
     }
     association.update(association_values)
@@ -2034,7 +1987,7 @@ def _format_association(namespace, resource_type, association_values):
 
 
 def _format_resource_type(values):
-    dt = timeutils.utcnow()
+    dt = oslo_timeutils.utcnow()
     resource_type = {
         'id': _get_metadef_id(),
         'name': values['name'],
@@ -2058,7 +2011,7 @@ def _format_property(values):
 
 
 def _format_namespace(values):
-    dt = timeutils.utcnow()
+    dt = oslo_timeutils.utcnow()
     namespace = {
         'id': _get_metadef_id(),
         'namespace': None,
@@ -2075,7 +2028,7 @@ def _format_namespace(values):
 
 
 def _format_object(values):
-    dt = timeutils.utcnow()
+    dt = oslo_timeutils.utcnow()
     object = {
         'id': _get_metadef_id(),
         'namespace_id': None,
@@ -2091,7 +2044,7 @@ def _format_object(values):
 
 
 def _format_tag(values):
-    dt = timeutils.utcnow()
+    dt = oslo_timeutils.utcnow()
     tag = {
         'id': _get_metadef_id(),
         'namespace_id': None,
@@ -2134,3 +2087,169 @@ def _get_metadef_id():
     global INDEX
     INDEX += 1
     return INDEX
+
+
+def _cached_image_format(cached_image):
+    """Format a cached image for consumption outside of this module"""
+    image_dict = {
+        'id': cached_image['id'],
+        'image_id': cached_image['image_id'],
+        'last_accessed': cached_image['last_accessed'].timestamp(),
+        'last_modified': cached_image['last_modified'].timestamp(),
+        'size': cached_image['size'],
+        'hits': cached_image['hits'],
+        'checksum': cached_image['checksum']
+    }
+
+    return image_dict
+
+
+@log_call
+def node_reference_get_by_url(context, node_reference_url):
+    db_data = DATA['node_reference']
+    for node_reference in db_data:
+        if db_data[node_reference]['node_reference_url'] == node_reference_url:
+            return db_data[node_reference]
+    else:
+        raise exception.NotFound()
+
+
+@log_call
+def node_reference_create(context, node_reference_url, **values):
+    node_reference_id = values.get('node_reference_id', 1)
+
+    if node_reference_id in DATA['node_reference']:
+        raise exception.Duplicate()
+
+    node_reference = {
+        'node_reference_id': node_reference_id,
+        'node_reference_url': node_reference_url
+    }
+
+    DATA['node_reference'][node_reference_id] = node_reference
+    return node_reference
+
+
+@log_call
+def get_hit_count(context, image_id, node_reference_url):
+    if image_id not in DATA['cached_images']:
+        return 0
+
+    cached_image = _cached_image_format(DATA['cached_images'][image_id])
+    return cached_image['hits']
+
+
+@log_call
+def get_cached_nodes(context, image_id):
+    all_images = DATA['cached_images']
+    node_references = DATA['node_reference']
+    cached_nodes = []
+    for image in all_images.values():
+        if image['image_id'] != image_id:
+            continue
+        for node in node_references:
+            node_reference = node_references[node]
+            if image['node_reference_id'] == \
+                    node_reference['node_reference_id']:
+                cached_nodes.append(node_reference['node_reference_url'])
+
+    return cached_nodes
+
+
+@log_call
+def get_cached_images(context, node_reference_url):
+    node_reference = node_reference_get_by_url(context, node_reference_url)
+    all_images = DATA['cached_images']
+    cached_images = []
+    for image_id in all_images:
+        if all_images[image_id]['node_reference_id'] == \
+                node_reference['node_reference_id']:
+            cached_images.append(_cached_image_format(all_images[image_id]))
+
+    return cached_images
+
+
+@log_call
+def delete_all_cached_images(context, node_reference_url):
+    node_reference = node_reference_get_by_url(context, node_reference_url)
+    all_images = all_images = tuple(DATA['cached_images'].keys())
+    for image_id in all_images:
+        if DATA['cached_images'][image_id]['node_reference_id'] == \
+                node_reference['node_reference_id']:
+            del DATA['cached_images'][image_id]
+
+
+@log_call
+def delete_cached_image(context, image_id, node_reference_url):
+    node_reference = node_reference_get_by_url(context, node_reference_url)
+    all_images = tuple(DATA['cached_images'].keys())
+    for image in all_images:
+        if DATA['cached_images'][image]['node_reference_id'] == \
+                node_reference['node_reference_id'] and image_id == \
+                DATA['cached_images'][image]['image_id']:
+            del DATA['cached_images'][image]
+            break
+
+
+@log_call
+def get_least_recently_accessed(context, node_reference_url):
+    all_images = get_cached_images(context, node_reference_url)
+    if all_images:
+        return all_images[0]['image_id']
+    return None
+
+
+@log_call
+def is_image_cached_for_node(context, node_reference_url, image_id):
+    node_reference = node_reference_get_by_url(context, node_reference_url)
+    all_images = DATA['cached_images']
+    for image_id in all_images:
+        if all_images[image_id]['node_reference_id'] == \
+                node_reference['node_reference_id'] and image_id == \
+                all_images[image_id]['image_id']:
+            return True
+    return False
+
+
+@log_call
+def insert_cache_details(context, node_reference_url, image_id,
+                         size, checksum=None, last_accessed=None,
+                         last_modified=None, hits=None):
+    node_reference = node_reference_get_by_url(context, node_reference_url)
+    accessed = last_accessed or oslo_timeutils.utcnow()
+    modified = last_modified or oslo_timeutils.utcnow()
+
+    values = {
+        'last_accessed': accessed,
+        'last_modified': modified,
+        'node_reference_id': node_reference['node_reference_id'],
+        'checksum': checksum,
+        'image_id': image_id,
+        'size': size,
+        'hits': hits or 0,
+        'id': str(uuid.uuid4()),
+    }
+
+    if image_id in DATA['cached_images']:
+        raise exception.Duplicate()
+
+    DATA['cached_images'][image_id] = values
+
+
+@log_call
+def update_hit_count(context, image_id, node_reference_url):
+    last_hit_count = get_hit_count(context, image_id, node_reference_url)
+    node_reference = node_reference_get_by_url(context, node_reference_url)
+    all_images = DATA['cached_images']
+    last_accessed = oslo_timeutils.utcnow()
+    values = {
+        'hits': last_hit_count + 1,
+        'last_accessed': last_accessed
+    }
+
+    for image_id in all_images:
+        if all_images[image_id]['node_reference_id'] == \
+                node_reference['node_reference_id'] and image_id == \
+                all_images[image_id]['image_id']:
+            all_images[image_id].update(values)
+            break

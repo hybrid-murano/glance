@@ -15,21 +15,23 @@
 # under the License.
 
 import copy
+import http.client as http
+import urllib.error
+import urllib.parse as urlparse
 
 import debtcollector
 import glance_store
 from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_serialization.jsonutils as json
-from oslo_utils import encodeutils
 from oslo_utils import uuidutils
-import six
-import six.moves.urllib.parse as urlparse
 import webob.exc
 
 from glance.api import common
 from glance.api import policy
+from glance.api.v2 import policy as api_policy
 from glance.common import exception
+from glance.common.scripts import utils as script_utils
 from glance.common import timeutils
 from glance.common import wsgi
 import glance.db
@@ -66,27 +68,46 @@ class TasksController(object):
 
     @debtcollector.removals.remove(message=_DEPRECATION_MESSAGE)
     def create(self, req, task):
-        task_factory = self.gateway.get_task_factory(req.context)
-        executor_factory = self.gateway.get_task_executor_factory(req.context)
-        task_repo = self.gateway.get_task_repo(req.context)
+        # NOTE(rosmaita): access to this call is enforced in the deserializer
+
+        ctxt = req.context
+        task_factory = self.gateway.get_task_factory(ctxt)
+        executor_factory = self.gateway.get_task_executor_factory(ctxt)
+        task_repo = self.gateway.get_task_repo(ctxt)
         try:
-            new_task = task_factory.new_task(task_type=task['type'],
-                                             owner=req.context.owner,
-                                             task_input=task['input'])
+            if task.get('type') == 'import':
+                task_input = task.get('input') or {}
+                script_utils.validate_legacy_import_from_uri(
+                    task_input.get('import_from'))
+            new_task = task_factory.new_task(
+                task_type=task['type'],
+                owner=ctxt.owner,
+                task_input=task['input'],
+                image_id=task['input'].get('image_id'),
+                user_id=ctxt.user_id,
+                request_id=ctxt.request_id)
             task_repo.add(new_task)
-            task_executor = executor_factory.new_task_executor(req.context)
-            pool = common.get_thread_pool("tasks_eventlet_pool")
-            pool.spawn_n(new_task.run, task_executor)
+            task_executor = executor_factory.new_task_executor(ctxt)
+            pool = common.get_thread_pool("tasks_pool")
+            pool.spawn(new_task.run, task_executor)
         except exception.Forbidden as e:
             msg = (_LW("Forbidden to create task. Reason: %(reason)s")
-                   % {'reason': encodeutils.exception_to_unicode(e)})
-            LOG.warn(msg)
+                   % {'reason': e})
+            LOG.warning(msg)
             raise webob.exc.HTTPForbidden(explanation=e.msg)
+        except exception.BadStoreUri as e:
+            raise webob.exc.HTTPBadRequest(explanation=e.msg)
+        except exception.Invalid as e:
+            raise webob.exc.HTTPBadRequest(explanation=e.msg)
+        except urllib.error.URLError as e:
+            raise webob.exc.HTTPBadRequest(explanation=str(e.reason))
         return new_task
 
     @debtcollector.removals.remove(message=_DEPRECATION_MESSAGE)
     def index(self, req, marker=None, limit=None, sort_key='created_at',
               sort_dir='desc', filters=None):
+        # NOTE(rosmaita): access to this call is enforced in the deserializer
+
         result = {}
         if filters is None:
             filters = {}
@@ -104,36 +125,38 @@ class TasksController(object):
                 result['next_marker'] = tasks[-1].task_id
         except (exception.NotFound, exception.InvalidSortKey,
                 exception.InvalidFilterRangeValue) as e:
-            LOG.warn(encodeutils.exception_to_unicode(e))
+            LOG.warning(str(e))
             raise webob.exc.HTTPBadRequest(explanation=e.msg)
         except exception.Forbidden as e:
-            LOG.warn(encodeutils.exception_to_unicode(e))
+            LOG.warning(str(e))
             raise webob.exc.HTTPForbidden(explanation=e.msg)
         result['tasks'] = tasks
         return result
 
     @debtcollector.removals.remove(message=_DEPRECATION_MESSAGE)
     def get(self, req, task_id):
+        _enforce_access_policy(self.policy, req)
         try:
             task_repo = self.gateway.get_task_repo(req.context)
             task = task_repo.get(task_id)
         except exception.NotFound as e:
             msg = (_LW("Failed to find task %(task_id)s. Reason: %(reason)s")
                    % {'task_id': task_id,
-                      'reason': encodeutils.exception_to_unicode(e)})
-            LOG.warn(msg)
+                      'reason': e})
+            LOG.warning(msg)
             raise webob.exc.HTTPNotFound(explanation=e.msg)
         except exception.Forbidden as e:
             msg = (_LW("Forbidden to get task %(task_id)s. Reason:"
                        " %(reason)s")
                    % {'task_id': task_id,
-                      'reason': encodeutils.exception_to_unicode(e)})
-            LOG.warn(msg)
+                      'reason': e})
+            LOG.warning(msg)
             raise webob.exc.HTTPForbidden(explanation=e.msg)
         return task
 
     @debtcollector.removals.remove(message=_DEPRECATION_MESSAGE)
     def delete(self, req, task_id):
+        _enforce_access_policy(self.policy, req)
         msg = (_("This operation is currently not permitted on Glance Tasks. "
                  "They are auto deleted after reaching the time based on "
                  "their expires_at property."))
@@ -200,11 +223,14 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
                 msg = _("Task '%s' is required") % param
                 raise webob.exc.HTTPBadRequest(explanation=msg)
 
-    def __init__(self, schema=None):
+    def __init__(self, schema=None, policy_engine=None):
         super(RequestDeserializer, self).__init__()
         self.schema = schema or get_task_schema()
+        # want to enforce the access policy as early as possible
+        self.policy_engine = policy_engine or policy.Enforcer()
 
     def create(self, request):
+        _enforce_access_policy(self.policy_engine, request)
         body = self._get_request_body(request)
         self._validate_create_body(body)
         try:
@@ -221,6 +247,7 @@ class RequestDeserializer(wsgi.JSONRequestDeserializer):
         return dict(task=task)
 
     def index(self, request):
+        _enforce_access_policy(self.policy_engine, request)
         params = request.params.copy()
         limit = params.pop('limit', None)
         marker = params.pop('marker', None)
@@ -248,7 +275,7 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
 
     def _inject_location_header(self, response, task):
         location = self._get_task_location(task)
-        response.headers['Location'] = location.encode('utf-8')
+        response.headers['Location'] = location
 
     def _get_task_location(self, task):
         return '/v2/tasks/%s' % task.task_id
@@ -267,6 +294,12 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
             'self': self._get_task_location(task),
             'schema': '/v2/schemas/task'
         }
+        if task.image_id:
+            task_view['image_id'] = task.image_id
+        if task.request_id:
+            task_view['request_id'] = task.request_id
+        if task.user_id:
+            task_view['user_id'] = task.user_id
         if task.expires_at:
             task_view['expires_at'] = timeutils.isotime(task.expires_at)
         task_view = schema.filter(task_view)  # domain
@@ -289,14 +322,13 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         return task_view
 
     def create(self, response, task):
-        response.status_int = 201
+        response.status_int = http.CREATED
         self._inject_location_header(response, task)
         self.get(response, task)
 
     def get(self, response, task):
         task_view = self._format_task(self.task_schema, task)
-        body = json.dumps(task_view, ensure_ascii=False)
-        response.unicode_body = six.text_type(body)
+        response.unicode_body = json.dumps(task_view, ensure_ascii=False)
         response.content_type = 'application/json'
 
     def index(self, response, result):
@@ -315,8 +347,7 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
             params['marker'] = result['next_marker']
             next_query = urlparse.urlencode(params)
             body['next'] = '/v2/tasks?%s' % next_query
-        response.unicode_body = six.text_type(json.dumps(body,
-                                                         ensure_ascii=False))
+        response.unicode_body = json.dumps(body, ensure_ascii=False)
         response.content_type = 'application/json'
 
 
@@ -331,6 +362,8 @@ _TASK_SCHEMA = {
         "description": _("The type of task represented by this content"),
         "enum": [
             "import",
+            "api_image_import",
+            "location_import",
         ],
         "type": "string"
     },
@@ -361,6 +394,18 @@ _TASK_SCHEMA = {
                          " when appropriate (usually on failure)"),
         "type": "string",
     },
+    "image_id": {
+        "description": _("Image associated with the task"),
+        "type": "string",
+    },
+    "request_id": {
+        "description": _("Human-readable informative request-id"),
+        "type": "string",
+    },
+    "user_id": {
+        "description": _("User associated with the task"),
+        "type": "string",
+    },
     "expires_at": {
         "description": _("Datetime when this resource would be"
                          " subject to removal"),
@@ -383,6 +428,12 @@ _TASK_SCHEMA = {
         'type': 'string'
     }
 }
+
+
+def _enforce_access_policy(policy_engine, request):
+    api_policy.TasksAPIPolicy(
+        request.context,
+        enforcer=policy_engine).tasks_api_access()
 
 
 def get_task_schema():

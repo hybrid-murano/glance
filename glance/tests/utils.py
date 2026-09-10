@@ -17,34 +17,44 @@
 
 import errno
 import functools
+import http.client
+import http.server
+import io
 import os
 import shlex
 import shutil
-import socket
+import signal
 import subprocess
+import threading
+import time
+from unittest import mock
 
+from alembic import command as alembic_command
 import fixtures
+from oslo_concurrency import lockutils
 from oslo_config import cfg
 from oslo_config import fixture as cfg_fixture
+from oslo_log.fixture import logging_error as log_fixture
 from oslo_log import log
-from oslo_serialization import jsonutils
-from oslotest import moxstubout
-import six
-from six.moves import BaseHTTPServer
+from oslo_policy import opts as opts
+from oslo_utils import timeutils
+from oslo_utils import units
 import testtools
 import webob
 
+from glance.api.v2 import cached_images
 from glance.common import config
 from glance.common import exception
 from glance.common import property_utils
-from glance.common import timeutils
 from glance.common import utils
 from glance.common import wsgi
 from glance import context
+from glance.db.sqlalchemy import alembic_migrations
 from glance.db.sqlalchemy import api as db_api
-from glance.db.sqlalchemy import models as db_models
+from glance.tests.unit import fixtures as glance_fixtures
 
 CONF = cfg.CONF
+LOG = log.getLogger(__name__)
 try:
     CONF.debug
 except cfg.NoSuchOptError:
@@ -72,16 +82,30 @@ class BaseTestCase(testtools.TestCase):
         # the following policy tests
         config.parse_args(args=[])
         self.addCleanup(CONF.reset)
-        mox_fixture = self.useFixture(moxstubout.MoxStubout())
-        self.stubs = mox_fixture.stubs
-        self.stubs.Set(exception, '_FATAL_EXCEPTION_FORMAT_ERRORS', True)
+        self.mock_object(exception, '_FATAL_EXCEPTION_FORMAT_ERRORS', True)
         self.test_dir = self.useFixture(fixtures.TempDir()).path
+        self.test_dir2 = self.useFixture(fixtures.TempDir()).path
         self.conf_dir = os.path.join(self.test_dir, 'etc')
         utils.safe_mkdirs(self.conf_dir)
+        self.lock_dir = os.path.join(self.test_dir, 'locks')
+        utils.safe_mkdirs(self.lock_dir)
+        lockutils.set_defaults(self.lock_dir)
         self.set_policy()
 
+        # Limit the amount of DeprecationWarning messages in the unit test logs
+        self.useFixture(glance_fixtures.WarningsFixture())
+
+        # Make sure logging output is limited but still test debug formatting
+        self.useFixture(log_fixture.get_logging_handle_error_fixture())
+        self.useFixture(glance_fixtures.StandardLogging())
+
+        if cached_images.WORKER:
+            cached_images.WORKER.terminate()
+            cached_images.WORKER = None
+
     def set_policy(self):
-        conf_file = "policy.json"
+        opts.set_defaults(CONF)
+        conf_file = "policy.yaml"
         self.policy_file = self._copy_data_file(conf_file, self.conf_dir)
         self.config(policy_file=self.policy_file, group='oslo_policy')
 
@@ -127,9 +151,21 @@ class BaseTestCase(testtools.TestCase):
         """
         self._config_fixture.config(**kw)
 
+    def mock_object(self, obj, attr_name, *args, **kwargs):
+        """"Use python mock to mock an object attribute
+
+        Mocks the specified objects attribute with the given value.
+        Automatically performs 'addCleanup' for the mock.
+        """
+        patcher = mock.patch.object(obj, attr_name, *args, **kwargs)
+        result = patcher.start()
+        self.addCleanup(patcher.stop)
+        return result
+
 
 class requires(object):
     """Decorator that initiates additional test setup/teardown."""
+
     def __init__(self, setup=None, teardown=None):
         self.setup = setup
         self.teardown = teardown
@@ -148,13 +184,14 @@ class requires(object):
 
 class depends_on_exe(object):
     """Decorator to skip test if an executable is unavailable"""
+
     def __init__(self, exe):
         self.exe = exe
 
     def __call__(self, func):
         def _runner(*args, **kw):
-            cmd = 'which %s' % self.exe
-            exitcode, out, err = execute(cmd, raise_error=False)
+            exitcode, out, err = execute('which %s' % self.exe,
+                                         raise_error=False)
             if exitcode != 0:
                 args[0].disabled_message = 'test requires exe: %s' % self.exe
                 args[0].disabled = True
@@ -196,7 +233,7 @@ def fork_exec(cmd,
     :param cmd: Command to execute as an array of arguments.
     :param exec_env: A dictionary representing the environment with
                      which to run the command.
-    :param logile: A path to a file which will hold the stdout/err of
+    :param logfile: A path to a file which will hold the stdout/err of
                    the child process.
     :param pass_fds: Sequence of file descriptors passed to the child.
     """
@@ -218,10 +255,7 @@ def fork_exec(cmd,
                         os.dup2(fptr.fileno(), desc)
                     except OSError:
                         pass
-        if pass_fds and hasattr(os, 'set_inheritable'):
-            # os.set_inheritable() is only available and needed
-            # since Python 3.4. On Python 3.3 and older, file descriptors are
-            # inheritable by default.
+        if pass_fds:
             for fd in pass_fds:
                 os.set_inheritable(fd, True)
 
@@ -233,7 +267,8 @@ def fork_exec(cmd,
 
 def wait_for_fork(pid,
                   raise_error=True,
-                  expected_exitcode=0):
+                  expected_exitcode=0,
+                  force=True):
     """
     Wait for a process to complete
 
@@ -242,18 +277,52 @@ def wait_for_fork(pid,
     is raised.
     """
 
-    rc = 0
-    try:
-        (pid, rc) = os.waitpid(pid, 0)
-        rc = os.WEXITSTATUS(rc)
-        if rc != expected_exitcode:
-            raise RuntimeError('The exit code %d is not %d'
-                               % (rc, expected_exitcode))
-    except Exception:
-        if raise_error:
-            raise
+    # For the first period, we wait without being pushy, but after
+    # this timer expires, we start sending SIGTERM
+    term_timer = timeutils.StopWatch(5)
+    term_timer.start()
 
-    return rc
+    # After this timer expires we start sending SIGKILL
+    nice_timer = timeutils.StopWatch(7)
+    nice_timer.start()
+
+    # Process gets a maximum amount of time to exit before we fail the
+    # test
+    total_timer = timeutils.StopWatch(10)
+    total_timer.start()
+
+    while not total_timer.expired():
+        try:
+            cpid, rc = os.waitpid(pid, force and os.WNOHANG or 0)
+            if cpid == 0 and force:
+                if not term_timer.expired():
+                    # Waiting for exit on first signal
+                    pass
+                elif not nice_timer.expired():
+                    # Politely ask the process to GTFO
+                    LOG.warning('Killing child %i with SIGTERM', pid)
+                    os.kill(pid, signal.SIGTERM)
+                else:
+                    # No more Mr. Nice Guy
+                    LOG.warning('Killing child %i with SIGKILL', pid)
+                    os.kill(pid, signal.SIGKILL)
+                    expected_exitcode = signal.SIGKILL
+                time.sleep(1)
+                continue
+            LOG.info('waitpid(%i) returned %i,%i', pid, cpid, rc)
+            if rc != expected_exitcode:
+                raise RuntimeError('The exit code %d is not %d'
+                                   % (rc, expected_exitcode))
+            return rc
+        except ChildProcessError:
+            # Nothing to wait for
+            return 0
+        except Exception as e:
+            LOG.error('Got wait error: %s', e)
+            if raise_error:
+                raise
+
+    raise RuntimeError('Gave up waiting for %i to exit!' % pid)
 
 
 def execute(cmd,
@@ -262,7 +331,8 @@ def execute(cmd,
             exec_env=None,
             expect_exit=True,
             expected_exitcode=0,
-            context=None):
+            context=None,
+            return_process=False):
     """
     Executes a command in a subprocess. Returns a tuple
     of (exitcode, out, err), where out is the string output
@@ -280,7 +350,12 @@ def execute(cmd,
     :param expect_exit: Optional flag true iff timely exit is expected
     :param expected_exitcode: expected exitcode from the launcher
     :param context: additional context for error message
+    :param return_process: return process to terminate explicitly
     """
+
+    # Long-lived children (expect_exit=False) must not use PIPE for
+    # stdout/stderr without a reader: the buffer fills and the child blocks on
+    # write. Discard I/O so daemons (e.g. glance-scrubber --daemon) run.
 
     env = os.environ.copy()
     if exec_env is not None:
@@ -303,15 +378,25 @@ def execute(cmd,
 
     # Also jack in the path cmd comes from, if it's absolute
     args = shlex.split(cmd)
+
     executable = args[0]
     if os.path.isabs(executable):
         path_ext.append(os.path.dirname(executable))
 
     env['PATH'] = ':'.join(path_ext) + ':' + env['PATH']
+    if expect_exit:
+        stdin_dest = subprocess.PIPE
+        stdout_dest = subprocess.PIPE
+        stderr_dest = subprocess.PIPE
+    else:
+        stdin_dest = subprocess.DEVNULL
+        stdout_dest = subprocess.DEVNULL
+        stderr_dest = subprocess.DEVNULL
+
     process = subprocess.Popen(args,
-                               stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE,
+                               stdin=stdin_dest,
+                               stdout=stdout_dest,
+                               stderr=stderr_dest,
                                env=env)
     if expect_exit:
         result = process.communicate()
@@ -331,6 +416,10 @@ def execute(cmd,
         if context:
             msg += "\n\nCONTEXT: %s" % context
         raise RuntimeError(msg)
+
+    if return_process:
+        return exitcode, out, err, process
+
     return exitcode, out, err
 
 
@@ -359,26 +448,6 @@ def find_executable(cmdname):
 
     # No dice...
     return None
-
-
-def get_unused_port():
-    """
-    Returns an unused port on localhost.
-    """
-    port, s = get_unused_port_and_socket()
-    s.close()
-    return port
-
-
-def get_unused_port_and_socket():
-    """
-    Returns an unused port on localhost and the open socket
-    from which it was created.
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(('localhost', 0))
-    addr, port = s.getsockname()
-    return (port, s)
 
 
 def xattr_writes_supported(path):
@@ -435,21 +504,21 @@ def minimal_add_command(port, name, suffix='', public=True):
 
 def start_http_server(image_id, image_data):
     def _get_http_handler_class(fixture):
-        class StaticHTTPRequestHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+        class StaticHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                self.send_response(200)
+                self.send_response(http.client.OK)
                 self.send_header('Content-Length', str(len(fixture)))
                 self.end_headers()
-                self.wfile.write(fixture)
+                self.wfile.write(fixture.encode('latin-1'))
                 return
 
             def do_HEAD(self):
                 # reserve non_existing_image_path for the cases where we expect
                 # 404 from the server
                 if 'non_existing_image_path' in self.path:
-                    self.send_response(404)
+                    self.send_response(http.client.NOT_FOUND)
                 else:
-                    self.send_response(200)
+                    self.send_response(http.client.OK)
                 self.send_header('Content-Length', str(len(fixture)))
                 self.end_headers()
                 return
@@ -463,83 +532,14 @@ def start_http_server(image_id, image_data):
 
     server_address = ('127.0.0.1', 0)
     handler_class = _get_http_handler_class(image_data)
-    httpd = BaseHTTPServer.HTTPServer(server_address, handler_class)
+    httpd = http.server.HTTPServer(server_address, handler_class)
     port = httpd.socket.getsockname()[1]
 
-    pid = os.fork()
-    if pid == 0:
-        httpd.serve_forever()
-    else:
-        return pid, port
+    thread = threading.Thread(target=httpd.serve_forever)
+    thread.daemon = True
+    thread.start()
 
-
-class RegistryAPIMixIn(object):
-
-    def create_fixtures(self):
-        for fixture in self.FIXTURES:
-            db_api.image_create(self.context, fixture)
-            with open(os.path.join(self.test_dir, fixture['id']),
-                      'wb') as image:
-                image.write(b"chunk00000remainder")
-
-    def destroy_fixtures(self):
-        db_models.unregister_models(db_api.get_engine())
-        db_models.register_models(db_api.get_engine())
-
-    def get_fixture(self, **kwargs):
-        fixture = {'name': 'fake public image',
-                   'status': 'active',
-                   'disk_format': 'vhd',
-                   'container_format': 'ovf',
-                   'is_public': True,
-                   'size': 20,
-                   'checksum': None}
-        fixture.update(kwargs)
-        return fixture
-
-    def get_minimal_fixture(self, **kwargs):
-        fixture = {'name': 'fake public image',
-                   'is_public': True,
-                   'disk_format': 'vhd',
-                   'container_format': 'ovf'}
-        fixture.update(kwargs)
-        return fixture
-
-    def get_extra_fixture(self, id, name, **kwargs):
-        created_at = kwargs.pop('created_at', timeutils.utcnow())
-        updated_at = kwargs.pop('updated_at', created_at)
-        return self.get_fixture(
-            id=id, name=name, deleted=False, deleted_at=None,
-            created_at=created_at, updated_at=updated_at,
-            **kwargs)
-
-    def get_api_response_ext(self, http_resp, url='/images', headers=None,
-                             body=None, method=None, api=None,
-                             content_type=None):
-        if api is None:
-            api = self.api
-        if headers is None:
-            headers = {}
-        req = webob.Request.blank(url)
-        for k, v in six.iteritems(headers):
-            req.headers[k] = v
-        if method:
-            req.method = method
-        if body:
-            req.body = body
-        if content_type == 'json':
-            req.content_type = 'application/json'
-        elif content_type == 'octet':
-            req.content_type = 'application/octet-stream'
-        res = req.get_response(api)
-        self.assertEqual(res.status_int, http_resp)
-        return res
-
-    def assertEqualImages(self, res, uuids, key='images', unjsonify=True):
-        images = jsonutils.loads(res.body)[key] if unjsonify else res
-        self.assertEqual(len(images), len(uuids))
-        for i, value in enumerate(uuids):
-            self.assertEqual(images[i]['id'], value)
+    return thread, httpd, port
 
 
 class FakeAuthMiddleware(wsgi.Middleware):
@@ -550,21 +550,21 @@ class FakeAuthMiddleware(wsgi.Middleware):
 
     def process_request(self, req):
         auth_token = req.headers.get('X-Auth-Token')
-        user = None
-        tenant = None
+        user_id = None
+        project_id = None
         roles = []
         if auth_token:
-            user, tenant, role = auth_token.split(':')
-            if tenant.lower() == 'none':
-                tenant = None
+            user_id, project_id, role = auth_token.split(':')
+            if project_id.lower() == 'none':
+                project_id = None
             roles = [role]
-            req.headers['X-User-Id'] = user
-            req.headers['X-Tenant-Id'] = tenant
+            req.headers['X-User-Id'] = user_id
+            req.headers['X-Project-Id'] = project_id
             req.headers['X-Roles'] = role
             req.headers['X-Identity-Status'] = 'Confirmed'
         kwargs = {
-            'user': user,
-            'tenant': tenant,
+            'user_id': user_id,
+            'project_id': project_id,
             'roles': roles,
             'is_admin': self.is_admin,
             'auth_token': auth_token,
@@ -574,9 +574,10 @@ class FakeAuthMiddleware(wsgi.Middleware):
 
 
 class FakeHTTPResponse(object):
-    def __init__(self, status=200, headers=None, data=None, *args, **kwargs):
+    def __init__(self, status=http.client.OK, headers=None, data=None,
+                 *args, **kwargs):
         data = data or b'I am a teapot, short and stout\n'
-        self.data = six.BytesIO(data)
+        self.data = io.BytesIO(data)
         self.read = self.data.read
         self.status = status
         self.headers = headers or {'content-length': len(data)}
@@ -597,9 +598,12 @@ class Httplib2WsgiAdapter(object):
 
     def request(self, uri, method="GET", body=None, headers=None):
         req = webob.Request.blank(uri, method=method, headers=headers)
-        req.body = body
+        if isinstance(body, str):
+            req.body = body.encode('utf-8')
+        else:
+            req.body = body
         resp = req.get_response(self.app)
-        return Httplib2WebobResponse(resp), resp.body
+        return Httplib2WebobResponse(resp), resp.body.decode('utf-8')
 
 
 class Httplib2WebobResponse(object):
@@ -643,3 +647,105 @@ class HttplibWsgiAdapter(object):
         response = self.req.get_response(self.app)
         return FakeHTTPResponse(response.status_code, response.headers,
                                 response.body)
+
+
+def db_sync(version='heads', engine=None):
+    """Migrate the database to `version` or the most recent version."""
+    if engine is None:
+        engine = db_api.get_engine()
+
+    alembic_config = alembic_migrations.get_alembic_config(engine=engine)
+    alembic_command.upgrade(alembic_config, version)
+
+
+def start_standalone_http_server():
+    def _get_http_handler_class():
+        class StaticHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                data = b"Hello World!!!"
+                self.send_response(http.client.OK)
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+
+        return StaticHTTPRequestHandler
+
+    server_address = ('127.0.0.1', 0)
+    handler_class = _get_http_handler_class()
+    httpd = http.server.HTTPServer(server_address, handler_class)
+    port = httpd.socket.getsockname()[1]
+
+    thread = threading.Thread(target=httpd.serve_forever)
+    thread.daemon = True
+    thread.start()
+
+    return thread, httpd, port
+
+
+def start_redirect_http_server(redirect_url):
+    """Start a local HTTP server that redirects to the given URL.
+
+    :param redirect_url: Location header value for the redirect response
+    :returns: tuple of (thread, httpd, port)
+    """
+    class RedirectHTTPRequestHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(http.client.FOUND)
+            self.send_header('Location', redirect_url)
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            # Suppress noisy request logging in tests
+            pass
+
+    server_address = ('127.0.0.1', 0)
+    httpd = http.server.HTTPServer(server_address, RedirectHTTPRequestHandler)
+    port = httpd.socket.getsockname()[1]
+
+    thread = threading.Thread(target=httpd.serve_forever)
+    thread.daemon = True
+    thread.start()
+
+    return thread, httpd, port
+
+
+class FakeData(object):
+    """Generate a bunch of data without storing it in memory.
+
+    This acts like a read-only file object which generates fake data
+    in chunks when read() is called or it is used as a generator. It
+    can generate an arbitrary amount of data without storing it in
+    memory.
+
+    :param length: The number of bytes to generate
+    :param chunk_size: The chunk size to return in iteration mode, or when
+                       read() is called unbounded
+
+    """
+    def __init__(self, length, chunk_size=64 * units.Ki):
+        self._max = length
+        self._chunk_size = chunk_size
+        self._len = 0
+
+    def read(self, length=None):
+        if length is None:
+            length = self._chunk_size
+
+        length = min(length, self._max - self._len)
+
+        self._len += length
+        if length == 0:
+            return b''
+        else:
+            return b'0' * length
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        r = self.read()
+        if len(r) == 0:
+            raise StopIteration()
+        else:
+            return r

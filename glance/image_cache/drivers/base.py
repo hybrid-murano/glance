@@ -90,6 +90,23 @@ class Driver(object):
             ]
 
         """
+        raise NotImplementedError
+
+    def get_cached_nodes(self, image_id):
+        """
+        Returns a list of nodes where image is cached.
+
+        :param image_id: Image ID to check for cached nodes
+
+        The list of records shall look like::
+
+            [
+                http://node_1:60999,
+                http://node_2:60999,
+                http://node_5:60999
+            ]
+
+        """
         return NotImplementedError
 
     def is_cached(self, image_id):

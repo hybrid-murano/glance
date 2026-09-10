@@ -1,4 +1,4 @@
-# Copyright 2012 OpenStack Foundation
+# Copyright 2018 RedHat Inc.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -25,7 +25,7 @@ from glance.i18n import _
 class CacheClient(base_client.BaseClient):
 
     DEFAULT_PORT = 9292
-    DEFAULT_DOC_ROOT = '/v1'
+    DEFAULT_DOC_ROOT = '/v2'
 
     def delete_cached_image(self, image_id):
         """
@@ -84,10 +84,10 @@ class CacheClient(base_client.BaseClient):
 
 
 def get_client(host, port=None, timeout=None, use_ssl=False, username=None,
-               password=None, tenant=None,
+               password=None, project=None,
+               user_domain_id=None, project_domain_id=None,
                auth_url=None, auth_strategy=None,
-               auth_token=None, region=None,
-               is_silent_upload=False, insecure=False):
+               auth_token=None, region=None, insecure=False):
     """
     Returns a new client Glance client object based on common kwargs.
     If an option isn't specified falls back to common environment variable
@@ -104,8 +104,8 @@ def get_client(host, port=None, timeout=None, use_ssl=False, username=None,
         os.getenv('OS_AUTH_USER', os.getenv('OS_USERNAME')),
         'password': password or
         os.getenv('OS_AUTH_KEY', os.getenv('OS_PASSWORD')),
-        'tenant': tenant or
-        os.getenv('OS_AUTH_TENANT', os.getenv('OS_TENANT_NAME')),
+        'project': project or
+        os.getenv('OS_AUTH_PROJECT', os.getenv('OS_PROJECT_NAME')),
         'auth_url': auth_url or
         os.getenv('OS_AUTH_URL'),
         'strategy': force_strategy or
@@ -113,6 +113,10 @@ def get_client(host, port=None, timeout=None, use_ssl=False, username=None,
         os.getenv('OS_AUTH_STRATEGY', 'noauth'),
         'region': region or
         os.getenv('OS_REGION_NAME'),
+        'user_domain_id': user_domain_id or os.getenv(
+            'OS_USER_DOMAIN_ID', 'default'),
+        'project_domain_id': project_domain_id or os.getenv(
+            'OS_PROJECT_DOMAIN_ID', 'default')
     }
 
     if creds['strategy'] == 'keystone' and not creds['auth_url']:

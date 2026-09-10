@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright 2010 United States Government as represented by the
 # Administrator of the National Aeronautics and Space Administration.
@@ -17,81 +17,20 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""
-Glance API Server
-"""
+"""Glance API console script entry point."""
 
-import os
 import sys
 
-import eventlet
-from oslo_utils import encodeutils
-
-
-# Monkey patch socket, time, select, threads
-eventlet.patcher.monkey_patch(all=False, socket=True, time=True,
-                              select=True, thread=True, os=True)
-
-# If ../glance/__init__.py exists, add ../ to Python search path, so that
-# it will override what happens to be installed in /usr/(local/)lib/python...
-possible_topdir = os.path.normpath(os.path.join(os.path.abspath(sys.argv[0]),
-                                   os.pardir,
-                                   os.pardir))
-if os.path.exists(os.path.join(possible_topdir, 'glance', '__init__.py')):
-    sys.path.insert(0, possible_topdir)
-
-import glance_store
-from oslo_config import cfg
-from oslo_log import log as logging
-import oslo_messaging
-import osprofiler.notifier
-import osprofiler.web
-
-from glance.common import config
-from glance.common import exception
-from glance.common import wsgi
-from glance import notifier
-
-CONF = cfg.CONF
-CONF.import_group("profiler", "glance.common.wsgi")
-logging.register_options(CONF)
-
-KNOWN_EXCEPTIONS = (RuntimeError,
-                    exception.WorkerCreationFailure,
-                    glance_store.exceptions.BadStoreConfiguration)
-
-
-def fail(e):
-    global KNOWN_EXCEPTIONS
-    return_code = KNOWN_EXCEPTIONS.index(type(e)) + 1
-    sys.stderr.write("ERROR: %s\n" % encodeutils.exception_to_unicode(e))
-    sys.exit(return_code)
+_STANDALONE_REMOVED_MSG = (
+    "ERROR: Standalone glance-api is no longer supported. "
+    "Deploy Glance under a WSGI server using "
+    "glance.wsgi.api:application.\n"
+)
 
 
 def main():
-    try:
-        config.parse_args()
-        config.set_config_defaults()
-        wsgi.set_eventlet_hub()
-        logging.setup(CONF, 'glance')
-        notifier.set_defaults()
-
-        if cfg.CONF.profiler.enabled:
-            _notifier = osprofiler.notifier.create("Messaging",
-                                                   oslo_messaging, {},
-                                                   notifier.get_transport(),
-                                                   "glance", "api",
-                                                   cfg.CONF.bind_host)
-            osprofiler.notifier.set(_notifier)
-            osprofiler.web.enable(cfg.CONF.profiler.hmac_keys)
-        else:
-            osprofiler.web.disable()
-
-        server = wsgi.Server(initialize_glance_store=True)
-        server.start(config.load_paste_app('glance-api'), default_port=9292)
-        server.wait()
-    except KNOWN_EXCEPTIONS as e:
-        fail(e)
+    sys.stderr.write(_STANDALONE_REMOVED_MSG)
+    sys.exit(1)
 
 
 if __name__ == '__main__':

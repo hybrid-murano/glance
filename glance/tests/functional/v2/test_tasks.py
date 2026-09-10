@@ -14,10 +14,10 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import http.client as http
 import uuid
 
 from oslo_serialization import jsonutils
-import requests
 
 from glance.tests import functional
 
@@ -28,49 +28,30 @@ TENANT3 = str(uuid.uuid4())
 TENANT4 = str(uuid.uuid4())
 
 
-class TestTasks(functional.FunctionalTest):
-
-    def setUp(self):
-        super(TestTasks, self).setUp()
-        self.cleanup()
-        self.api_server.deployment_flavor = 'noauth'
-
-    def _url(self, path):
-        return 'http://127.0.0.1:%d%s' % (self.api_port, path)
-
-    def _headers(self, custom_headers=None):
-        base_headers = {
-            'X-Identity-Status': 'Confirmed',
-            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
-            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
-            'X-Tenant-Id': TENANT1,
-            'X-Roles': 'admin',
-        }
-        base_headers.update(custom_headers or {})
-        return base_headers
+class TestTasks(functional.SynchronousAPIBase):
 
     def test_task_not_allowed_non_admin(self):
-        self.start_servers(**self.__dict__.copy())
+        self.start_server()
         roles = {'X-Roles': 'member'}
         # Task list should be empty
-        path = self._url('/v2/tasks')
-        response = requests.get(path, headers=self._headers(roles))
-        self.assertEqual(403, response.status_code)
+        path = '/v2/tasks'
+        response = self.api_get(path, headers=self._headers(roles))
+        self.assertEqual(http.FORBIDDEN, response.status_code)
 
     def test_task_lifecycle(self):
-        self.start_servers(**self.__dict__.copy())
+        self.start_server()
         # Task list should be empty
-        path = self._url('/v2/tasks')
-        response = requests.get(path, headers=self._headers())
-        self.assertEqual(200, response.status_code)
+        path = '/v2/tasks'
+        response = self.api_get(path, headers=self._headers())
+        self.assertEqual(http.OK, response.status_code)
         tasks = jsonutils.loads(response.text)['tasks']
         self.assertEqual(0, len(tasks))
 
         # Create a task
-        path = self._url('/v2/tasks')
+        path = '/v2/tasks'
         headers = self._headers({'content-type': 'application/json'})
 
-        data = jsonutils.dumps({
+        json = {
             "type": "import",
             "input": {
                 "import_from": "http://example.com",
@@ -80,28 +61,32 @@ class TestTasks(functional.FunctionalTest):
                     'container_format': 'ovf'
                 }
             }
-        })
-        response = requests.post(path, headers=headers, data=data)
-        self.assertEqual(201, response.status_code)
+        }
+        response = self.api_post(path, headers=headers, json=json)
+        self.assertEqual(http.CREATED, response.status_code)
 
         # Returned task entity should have a generated id and status
         task = jsonutils.loads(response.text)
         task_id = task['id']
 
         self.assertIn('Location', response.headers)
+        path = f'http://localhost{path}'
         self.assertEqual(path + '/' + task_id, response.headers['Location'])
 
-        checked_keys = set([u'created_at',
-                            u'id',
-                            u'input',
-                            u'message',
-                            u'owner',
-                            u'schema',
-                            u'self',
-                            u'status',
-                            u'type',
-                            u'result',
-                            u'updated_at'])
+        checked_keys = set(['created_at',
+                            'id',
+                            'input',
+                            'message',
+                            'owner',
+                            'schema',
+                            'self',
+                            'status',
+                            'type',
+                            'result',
+                            'updated_at',
+                            'request_id',
+                            'user_id'
+                            ])
         self.assertEqual(checked_keys, set(task.keys()))
         expected_task = {
             'status': 'pending',
@@ -119,26 +104,16 @@ class TestTasks(functional.FunctionalTest):
             self.assertEqual(value, task[key], key)
 
         # Tasks list should now have one entry
-        path = self._url('/v2/tasks')
-        response = requests.get(path, headers=self._headers())
-        self.assertEqual(200, response.status_code)
+        path = '/v2/tasks'
+        response = self.api_get(path, headers=self._headers())
+        self.assertEqual(http.OK, response.status_code)
         tasks = jsonutils.loads(response.text)['tasks']
         self.assertEqual(1, len(tasks))
         self.assertEqual(task_id, tasks[0]['id'])
 
         # Attempt to delete a task
-        path = self._url('/v2/tasks/%s' % tasks[0]['id'])
-        response = requests.delete(path, headers=self._headers())
-        self.assertEqual(405, response.status_code)
+        path = f'/v2/tasks/{tasks[0]["id"]}'
+        response = self.api_delete(path, headers=self._headers())
+        self.assertEqual(http.METHOD_NOT_ALLOWED, response.status_code)
         self.assertIsNotNone(response.headers.get('Allow'))
         self.assertEqual('GET', response.headers.get('Allow'))
-
-        self.stop_servers()
-
-
-class TestTasksWithRegistry(TestTasks):
-    def setUp(self):
-        super(TestTasksWithRegistry, self).setUp()
-        self.api_server.data_api = (
-            'glance.tests.functional.v2.registry_data_api')
-        self.registry_server.deployment_flavor = 'trusted-auth'

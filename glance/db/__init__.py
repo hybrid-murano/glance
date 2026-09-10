@@ -24,11 +24,9 @@ from wsme.rest import json
 from glance.api.v2.model.metadef_property_type import PropertyType
 from glance.common import crypt
 from glance.common import exception
-from glance.common.glare import serialization
-from glance.common import location_strategy
+from glance.common import utils as common_utils
 import glance.domain
 import glance.domain.proxy
-from glance import glare as ga
 from glance.i18n import _
 
 CONF = cfg.CONF
@@ -37,9 +35,11 @@ CONF.import_opt('metadata_encryption_key', 'glance.common.config')
 
 
 def get_api():
-    api = importutils.import_module(CONF.data_api)
+    api = importutils.import_module('glance.db.sqlalchemy.api')
+
     if hasattr(api, 'configure'):
         api.configure()
+
     return api
 
 
@@ -57,99 +57,7 @@ IMAGE_ATTRS = BASE_MODEL_ATTRS | set(['name', 'status', 'size', 'virtual_size',
                                       'min_disk', 'min_ram', 'is_public',
                                       'locations', 'checksum', 'owner',
                                       'protected'])
-
-
-class ArtifactRepo(object):
-    fields = ['id', 'name', 'version', 'type_name', 'type_version',
-              'visibility', 'state', 'owner', 'scope', 'created_at',
-              'updated_at', 'tags', 'dependencies', 'blobs', 'properties']
-
-    def __init__(self, context, db_api, plugins):
-        self.context = context
-        self.db_api = db_api
-        self.plugins = plugins
-
-    def get(self, artifact_id, type_name=None, type_version=None,
-            show_level=None, include_deleted=False):
-        if show_level is None:
-            show_level = ga.Showlevel.BASIC
-        try:
-            db_api_artifact = self.db_api.artifact_get(self.context,
-                                                       artifact_id,
-                                                       type_name,
-                                                       type_version,
-                                                       show_level)
-            if db_api_artifact["state"] == 'deleted' and not include_deleted:
-                raise exception.ArtifactNotFound(artifact_id)
-        except (exception.ArtifactNotFound, exception.ArtifactForbidden):
-            msg = _("No artifact found with ID %s") % artifact_id
-            raise exception.ArtifactNotFound(msg)
-        return serialization.deserialize_from_db(db_api_artifact, self.plugins)
-
-    def list(self, marker=None, limit=None,
-             sort_keys=None, sort_dirs=None, filters=None,
-             show_level=None):
-        sort_keys = ['created_at'] if sort_keys is None else sort_keys
-        sort_dirs = ['desc'] if sort_dirs is None else sort_dirs
-        if show_level is None:
-            show_level = ga.Showlevel.NONE
-        db_api_artifacts = self.db_api.artifact_get_all(
-            self.context, filters=filters, marker=marker, limit=limit,
-            sort_keys=sort_keys, sort_dirs=sort_dirs, show_level=show_level)
-        artifacts = []
-        for db_api_artifact in db_api_artifacts:
-            artifact = serialization.deserialize_from_db(db_api_artifact,
-                                                         self.plugins)
-            artifacts.append(artifact)
-        return artifacts
-
-    def _format_artifact_from_db(self, db_artifact):
-        kwargs = {k: db_artifact.get(k, None) for k in self.fields}
-        return glance.domain.Artifact(**kwargs)
-
-    def add(self, artifact):
-        artifact_values = serialization.serialize_for_db(artifact)
-        artifact_values['updated_at'] = artifact.updated_at
-        self.db_api.artifact_create(self.context, artifact_values,
-                                    artifact.type_name, artifact.type_version)
-
-    def save(self, artifact):
-        artifact_values = serialization.serialize_for_db(artifact)
-        try:
-            db_api_artifact = self.db_api.artifact_update(
-                self.context,
-                artifact_values,
-                artifact.id,
-                artifact.type_name,
-                artifact.type_version)
-        except (exception.ArtifactNotFound,
-                exception.ArtifactForbidden):
-            msg = _("No artifact found with ID %s") % artifact.id
-            raise exception.ArtifactNotFound(msg)
-        return serialization.deserialize_from_db(db_api_artifact, self.plugins)
-
-    def remove(self, artifact):
-        try:
-            self.db_api.artifact_delete(self.context, artifact.id,
-                                        artifact.type_name,
-                                        artifact.type_version)
-        except (exception.NotFound, exception.Forbidden):
-            msg = _("No artifact found with ID %s") % artifact.id
-            raise exception.ArtifactNotFound(msg)
-
-    def publish(self, artifact):
-        try:
-            artifact_changed = (
-                self.db_api.artifact_publish(
-                    self.context,
-                    artifact.id,
-                    artifact.type_name,
-                    artifact.type_version))
-            return serialization.deserialize_from_db(artifact_changed,
-                                                     self.plugins)
-        except (exception.NotFound, exception.Forbidden):
-            msg = _("No artifact found with ID %s") % artifact.id
-            raise exception.ArtifactNotFound(msg)
+IMAGE_ATOMIC_PROPS = set(['os_glance_import_task'])
 
 
 class ImageRepo(object):
@@ -186,7 +94,6 @@ class ImageRepo(object):
         return images
 
     def _format_image_from_db(self, db_image, db_tags):
-        visibility = 'public' if db_image['is_public'] else 'private'
         properties = {}
         for prop in db_image.pop('properties'):
             # NOTE(markwash) db api requires us to filter deleted
@@ -196,27 +103,43 @@ class ImageRepo(object):
                      if loc['status'] == 'active']
         if CONF.metadata_encryption_key:
             key = CONF.metadata_encryption_key
-            for l in locations:
-                l['url'] = crypt.urlsafe_decrypt(key, l['url'])
+            for location in locations:
+                location['url'] = crypt.urlsafe_decrypt(key, location['url'])
+
+        # NOTE(danms): If the image is shared and we are not the
+        # owner, we must have found it because we are a member. Set
+        # our tenant on the image as 'member' for policy checks in the
+        # upper layers. For any other image stage, we found the image
+        # some other way, so leave member=None.
+        if (db_image['visibility'] == 'shared' and
+                self.context.owner != db_image['owner']):
+            member = self.context.owner
+        else:
+            member = None
+
         return glance.domain.Image(
             image_id=db_image['id'],
             name=db_image['name'],
             status=db_image['status'],
             created_at=db_image['created_at'],
             updated_at=db_image['updated_at'],
-            visibility=visibility,
+            visibility=db_image['visibility'],
             min_disk=db_image['min_disk'],
             min_ram=db_image['min_ram'],
             protected=db_image['protected'],
-            locations=location_strategy.get_ordered_locations(locations),
+            locations=common_utils.sort_image_locations(locations),
             checksum=db_image['checksum'],
+            os_hash_algo=db_image['os_hash_algo'],
+            os_hash_value=db_image['os_hash_value'],
             owner=db_image['owner'],
             disk_format=db_image['disk_format'],
             container_format=db_image['container_format'],
             size=db_image['size'],
             virtual_size=db_image['virtual_size'],
             extra_properties=properties,
-            tags=db_tags
+            tags=db_tags,
+            os_hidden=db_image['os_hidden'],
+            member=member,
         )
 
     def _format_image_to_db(self, image):
@@ -241,13 +164,16 @@ class ImageRepo(object):
             'protected': image.protected,
             'locations': locations,
             'checksum': image.checksum,
+            'os_hash_algo': image.os_hash_algo,
+            'os_hash_value': image.os_hash_value,
             'owner': image.owner,
             'disk_format': image.disk_format,
             'container_format': image.container_format,
             'size': image.size,
             'virtual_size': image.virtual_size,
-            'is_public': image.visibility == 'public',
+            'visibility': image.visibility,
             'properties': dict(image.extra_properties),
+            'os_hidden': image.os_hidden
         }
 
     def add(self, image):
@@ -269,15 +195,13 @@ class ImageRepo(object):
         if (image_values['size'] is not None
            and image_values['size'] > CONF.image_size_cap):
             raise exception.ImageSizeLimitExceeded
-        try:
-            new_values = self.db_api.image_update(self.context,
-                                                  image.image_id,
-                                                  image_values,
-                                                  purge_props=True,
-                                                  from_state=from_state)
-        except (exception.ImageNotFound, exception.Forbidden):
-            msg = _("No image found with ID %s") % image.image_id
-            raise exception.ImageNotFound(msg)
+        new_values = self.db_api.image_update(self.context,
+                                              image.image_id,
+                                              image_values,
+                                              purge_props=True,
+                                              from_state=from_state,
+                                              atomic_props=(
+                                                  IMAGE_ATOMIC_PROPS))
         self.db_api.image_tag_set_all(self.context, image.image_id,
                                       image.tags)
         image.updated_at = new_values['updated_at']
@@ -293,6 +217,14 @@ class ImageRepo(object):
         # NOTE(markwash): don't update tags?
         new_values = self.db_api.image_destroy(self.context, image.image_id)
         image.updated_at = new_values['updated_at']
+
+    def set_property_atomic(self, image, name, value):
+        self.db_api.image_set_property_atomic(
+            image.image_id, name, value)
+
+    def delete_property_atomic(self, image, name, value):
+        self.db_api.image_delete_property_atomic(
+            image.image_id, name, value)
 
 
 class ImageProxy(glance.domain.proxy.Image):
@@ -420,6 +352,9 @@ class TaskRepo(object):
             task_input=db_task['input'],
             result=db_task['result'],
             message=db_task['message'],
+            image_id=db_task['image_id'],
+            user_id=db_task['user_id'],
+            request_id=db_task['request_id'],
         )
 
     def _format_task_stub_from_db(self, db_task):
@@ -431,6 +366,9 @@ class TaskRepo(object):
             expires_at=db_task['expires_at'],
             created_at=db_task['created_at'],
             updated_at=db_task['updated_at'],
+            image_id=db_task['image_id'],
+            user_id=db_task['user_id'],
+            request_id=db_task['request_id'],
         )
 
     def _format_task_to_db(self, task):
@@ -444,6 +382,9 @@ class TaskRepo(object):
                 'expires_at': task.expires_at,
                 'created_at': task.created_at,
                 'updated_at': task.updated_at,
+                'image_id': task.image_id,
+                'request_id': task.request_id,
+                'user_id': task.user_id,
                 }
         return task
 
@@ -532,12 +473,8 @@ class MetadefNamespaceRepo(object):
         )
 
     def get(self, namespace):
-        try:
-            db_api_namespace = self.db_api.metadef_namespace_get(
-                self.context, namespace)
-        except (exception.NotFound, exception.Forbidden):
-            msg = _('Could not find namespace %s') % namespace
-            raise exception.NotFound(msg)
+        db_api_namespace = self.db_api.metadef_namespace_get(
+            self.context, namespace)
         return self._format_namespace_from_db(db_api_namespace)
 
     def list(self, marker=None, limit=None, sort_key='created_at',
@@ -909,7 +846,7 @@ class MetadefTagRepo(object):
             self._format_metadef_tag_to_db(metadata_tag)
         )
 
-    def add_tags(self, metadata_tags):
+    def add_tags(self, metadata_tags, can_append=False):
         tag_list = []
         namespace = None
         for metadata_tag in metadata_tags:
@@ -918,7 +855,7 @@ class MetadefTagRepo(object):
                 namespace = metadata_tag.namespace
 
         self.db_api.metadef_tag_create_tags(
-            self.context, namespace, tag_list)
+            self.context, namespace, tag_list, can_append)
 
     def get(self, namespace, name):
         try:

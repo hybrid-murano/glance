@@ -12,13 +12,15 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+import http.client as http
+
 import glance_store
 from oslo_log import log as logging
-from oslo_utils import encodeutils
 import webob.exc
 
 from glance.api import policy
 from glance.api.v2 import images as v2_api
+from glance.api.v2 import policy as api_policy
 from glance.common import exception
 from glance.common import utils
 from glance.common import wsgi
@@ -46,6 +48,8 @@ class Controller(object):
         image_repo = self.gateway.get_repo(req.context)
         try:
             image = image_repo.get(image_id)
+            api_policy.ImageAPIPolicy(req.context, image,
+                                      self.policy).modify_image()
             image.tags.add(tag_value)
             image_repo.save(image)
         except exception.NotFound:
@@ -57,14 +61,13 @@ class Controller(object):
             LOG.warning(msg)
             raise webob.exc.HTTPForbidden(explanation=msg)
         except exception.Invalid as e:
-            msg = (_("Could not update image: %s")
-                   % encodeutils.exception_to_unicode(e))
+            msg = (_("Could not update image: %s") % e)
             LOG.warning(msg)
             raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.ImageTagLimitExceeded as e:
             msg = (_("Image tag limit exceeded for image %(id)s: %(e)s:")
                    % {"id": image_id,
-                      "e": encodeutils.exception_to_unicode(e)})
+                      "e": e})
             LOG.warning(msg)
             raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg)
 
@@ -73,6 +76,9 @@ class Controller(object):
         image_repo = self.gateway.get_repo(req.context)
         try:
             image = image_repo.get(image_id)
+            api_policy.ImageAPIPolicy(req.context, image,
+                                      self.policy).modify_image()
+
             if tag_value not in image.tags:
                 raise webob.exc.HTTPNotFound()
             image.tags.remove(tag_value)
@@ -89,10 +95,10 @@ class Controller(object):
 
 class ResponseSerializer(wsgi.JSONResponseSerializer):
     def update(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
     def delete(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
 
 class RequestDeserializer(wsgi.JSONRequestDeserializer):

@@ -20,9 +20,7 @@ import glance_store
 from oslo_config import cfg
 from oslo_log import log as logging
 import oslo_messaging
-from oslo_utils import encodeutils
 from oslo_utils import excutils
-import six
 import webob
 
 from glance.common import exception
@@ -32,17 +30,55 @@ from glance.i18n import _, _LE
 
 
 notifier_opts = [
-    cfg.StrOpt('default_publisher_id', default="image.localhost",
-               help='Default publisher_id for outgoing notifications.'),
-    cfg.ListOpt('disabled_notifications', default=[],
-                help='List of disabled notifications. A notification can be '
-                     'given either as a notification type to disable a single '
-                     'event, or as a notification group prefix to disable all '
-                     'events within a group. Example: if this config option '
-                     'is set to ["image.create", "metadef_namespace"], then '
-                     '"image.create" notification will not be sent after '
-                     'image is created and none of the notifications for '
-                     'metadefinition namespaces will be sent.'),
+    cfg.StrOpt('default_publisher_id',
+               default="image.localhost",
+               help=_("""
+Default publisher_id for outgoing Glance notifications.
+
+This is the value that the notification driver will use to identify
+messages for events originating from the Glance service. Typically,
+this is the hostname of the instance that generated the message.
+
+Possible values:
+    * Any reasonable instance identifier, for example: image.host1
+
+Related options:
+    * None
+
+""")),
+    cfg.ListOpt('disabled_notifications',
+                default=[],
+                help=_("""
+List of notifications to be disabled.
+
+Specify a list of notifications that should not be emitted.
+A notification can be given either as a notification type to
+disable a single event notification, or as a notification group
+prefix to disable all event notifications within a group.
+
+Possible values:
+    A comma-separated list of individual notification types or
+    notification groups to be disabled. Currently supported groups:
+
+    * image
+    * image.member
+    * task
+    * metadef_namespace
+    * metadef_object
+    * metadef_property
+    * metadef_resource_type
+    * metadef_tag
+
+    For a complete listing and description of each event refer to:
+    https://docs.openstack.org/glance/latest/admin/notifications.html
+
+    The values must be specified as: <group_name>.<event_name>
+    For example: image.create,task.success,metadef_tag
+
+Related options:
+    * None
+
+""")),
 ]
 
 CONF = cfg.CONF
@@ -50,19 +86,13 @@ CONF.register_opts(notifier_opts)
 
 LOG = logging.getLogger(__name__)
 
-_ALIASES = {
-    'glance.openstack.common.rpc.impl_kombu': 'rabbit',
-    'glance.openstack.common.rpc.impl_qpid': 'qpid',
-    'glance.openstack.common.rpc.impl_zmq': 'zmq',
-}
-
 
 def set_defaults(control_exchange='glance'):
     oslo_messaging.set_transport_defaults(control_exchange)
 
 
 def get_transport():
-    return oslo_messaging.get_transport(CONF, aliases=_ALIASES)
+    return oslo_messaging.get_notification_transport(CONF)
 
 
 class Notifier(object):
@@ -127,6 +157,7 @@ def format_image_notification(image):
         'size': image.size,
         'virtual_size': image.virtual_size,
         'is_public': image.visibility == 'public',
+        'visibility': image.visibility,
         'properties': dict(image.extra_properties),
         'tags': list(image.tags),
         'deleted': False,
@@ -135,8 +166,8 @@ def format_image_notification(image):
 
 
 def format_image_member_notification(image_member):
-    """Given a glance.domain.ImageMember object, return a dictionary of relevant
-    notification information.
+    """Given a glance.domain.ImageMember object, return a dictionary of
+    relevant notification information.
     """
     return {
         'image_id': image_member.image_id,
@@ -186,7 +217,7 @@ def format_metadef_namespace_notification(metadef_namespace):
 def format_metadef_object_notification(metadef_object):
     object_properties = metadef_object.properties or {}
     properties = []
-    for name, prop in six.iteritems(object_properties):
+    for name, prop in object_properties.items():
         object_property = _format_metadef_object_property(name, prop)
         properties.append(object_property)
 
@@ -284,16 +315,20 @@ class NotificationBase(object):
     def get_payload(self, obj):
         return {}
 
-    def send_notification(self, notification_id, obj, extra_payload=None):
+    def send_notification(self, notification_id, obj, extra_payload=None,
+                          backend=None):
         payload = self.get_payload(obj)
         if extra_payload is not None:
             payload.update(extra_payload)
 
+        # update backend information in the notification
+        if backend:
+            payload["backend"] = backend
+
         _send_notification(self.notifier.info, notification_id, payload)
 
 
-@six.add_metaclass(abc.ABCMeta)
-class NotificationProxy(NotificationBase):
+class NotificationProxy(NotificationBase, metaclass=abc.ABCMeta):
     def __init__(self, repo, context, notifier):
         self.repo = repo
         self.context = context
@@ -307,8 +342,7 @@ class NotificationProxy(NotificationBase):
         pass
 
 
-@six.add_metaclass(abc.ABCMeta)
-class NotificationRepoProxy(NotificationBase):
+class NotificationRepoProxy(NotificationBase, metaclass=abc.ABCMeta):
     def __init__(self, repo, context, notifier):
         self.repo = repo
         self.context = context
@@ -328,8 +362,7 @@ class NotificationRepoProxy(NotificationBase):
         pass
 
 
-@six.add_metaclass(abc.ABCMeta)
-class NotificationFactoryProxy(object):
+class NotificationFactoryProxy(metaclass=abc.ABCMeta):
     def __init__(self, factory, context, notifier):
         kwargs = {'context': context, 'notifier': notifier}
 
@@ -358,8 +391,19 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
             'bytes_sent': bytes_sent,
             'image_id': self.repo.image_id,
             'owner_id': self.repo.owner,
-            'receiver_tenant_id': self.context.tenant,
-            'receiver_user_id': self.context.user,
+            'receiver_tenant_id': self.context.project_id,
+            'receiver_user_id': self.context.user_id,
+        }
+
+    def _format_import_properties(self):
+        importing = self.repo.extra_properties.get(
+            'os_glance_importing_to_stores')
+        importing = importing.split(',') if importing else []
+        failed = self.repo.extra_properties.get('os_glance_failed_import')
+        failed = failed.split(',') if failed else []
+        return {
+            'os_glance_importing_to_stores': importing,
+            'os_glance_failed_import': failed
         }
 
     def _get_chunk_data_iterator(self, data, chunk_size=None):
@@ -388,68 +432,75 @@ class ImageProxy(NotificationProxy, domain_proxy.Image):
         data = self.repo.get_data(offset=offset, chunk_size=chunk_size)
         return self._get_chunk_data_iterator(data, chunk_size=chunk_size)
 
-    def set_data(self, data, size=None):
-        self.send_notification('image.prepare', self.repo)
+    def set_data(self, data, size=None, backend=None, set_active=True):
+        self.send_notification('image.prepare', self.repo, backend=backend,
+                               extra_payload=self._format_import_properties())
 
         notify_error = self.notifier.error
+        status = self.repo.status
         try:
-            self.repo.set_data(data, size)
+            self.repo.set_data(data, size, backend=backend,
+                               set_active=set_active)
         except glance_store.StorageFull as e:
-            msg = (_("Image storage media is full: %s") %
-                   encodeutils.exception_to_unicode(e))
+            msg = _("Image storage media is full: %s") % e
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg)
         except glance_store.StorageWriteDenied as e:
-            msg = (_("Insufficient permissions on image storage media: %s")
-                   % encodeutils.exception_to_unicode(e))
+            msg = _("Insufficient permissions on image storage media: %s") % e
+            _send_notification(notify_error, 'image.upload', msg)
+            raise webob.exc.HTTPServiceUnavailable(explanation=msg)
+        except glance_store.exceptions.TimeoutError as e:
+            msg = _("Filesystem store operation timed out: %s") % e.msg
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPServiceUnavailable(explanation=msg)
         except ValueError as e:
             msg = (_("Cannot save data for image %(image_id)s: %(error)s") %
                    {'image_id': self.repo.image_id,
-                    'error': encodeutils.exception_to_unicode(e)})
+                    'error': e})
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPBadRequest(
-                explanation=encodeutils.exception_to_unicode(e))
+                explanation=str(e))
         except exception.Duplicate as e:
-            msg = (_("Unable to upload duplicate image data for image"
+            msg = (_("Unable to upload duplicate image data for image "
                      "%(image_id)s: %(error)s") %
                    {'image_id': self.repo.image_id,
-                    'error': encodeutils.exception_to_unicode(e)})
+                    'error': e})
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPConflict(explanation=msg)
         except exception.Forbidden as e:
             msg = (_("Not allowed to upload image data for image %(image_id)s:"
                      " %(error)s")
                    % {'image_id': self.repo.image_id,
-                      'error': encodeutils.exception_to_unicode(e)})
+                      'error': e})
             _send_notification(notify_error, 'image.upload', msg)
             raise webob.exc.HTTPForbidden(explanation=msg)
         except exception.NotFound as e:
-            exc_str = encodeutils.exception_to_unicode(e)
             msg = (_("Image %(image_id)s could not be found after upload."
                      " The image may have been deleted during the upload:"
                      " %(error)s") % {'image_id': self.repo.image_id,
-                                      'error': exc_str})
+                                      'error': e})
             _send_notification(notify_error, 'image.upload', msg)
-            raise webob.exc.HTTPNotFound(explanation=exc_str)
+            raise webob.exc.HTTPNotFound(explanation=str(e))
         except webob.exc.HTTPError as e:
             with excutils.save_and_reraise_exception():
                 msg = (_("Failed to upload image data for image %(image_id)s"
                          " due to HTTP error: %(error)s") %
                        {'image_id': self.repo.image_id,
-                        'error': encodeutils.exception_to_unicode(e)})
+                        'error': e})
                 _send_notification(notify_error, 'image.upload', msg)
         except Exception as e:
             with excutils.save_and_reraise_exception():
                 msg = (_("Failed to upload image data for image %(image_id)s "
                          "due to internal error: %(error)s") %
                        {'image_id': self.repo.image_id,
-                        'error': encodeutils.exception_to_unicode(e)})
+                        'error': e})
                 _send_notification(notify_error, 'image.upload', msg)
         else:
-            self.send_notification('image.upload', self.repo)
-            self.send_notification('image.activate', self.repo)
+            extra_payload = self._format_import_properties()
+            self.send_notification('image.upload', self.repo,
+                                   extra_payload=extra_payload)
+            if set_active and status != 'active':
+                self.send_notification('image.activate', self.repo)
 
 
 class ImageMemberProxy(NotificationProxy, domain_proxy.ImageMember):
@@ -862,8 +913,9 @@ class MetadefTagRepoProxy(NotificationRepoProxy, domain_proxy.MetadefTagRepo):
         self.send_notification('metadef_tag.create', metadef_tag)
         return result
 
-    def add_tags(self, metadef_tags):
-        result = super(MetadefTagRepoProxy, self).add_tags(metadef_tags)
+    def add_tags(self, metadef_tags, can_append=False):
+        result = super(MetadefTagRepoProxy, self).add_tags(metadef_tags,
+                                                           can_append)
         for metadef_tag in metadef_tags:
             self.send_notification('metadef_tag.create', metadef_tag)
 

@@ -13,18 +13,49 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import glance.cmd as glance_cmd
+import atexit
+import builtins
+import logging
+
+from oslo_service.backend import BackendType
+from oslo_service.backend import register_backend_default_hook
+
+# NOTE(abhishekk): Ensure the threading backend is selected before tests
+# import dependencies that would otherwise default oslo.service to eventlet.
+register_backend_default_hook(lambda: BackendType.THREADING)
+
+from glance.api import common as api_common
+import glance.async_
+# NOTE(akekane): Use native threading in tests, same as uWSGI production.
+glance.async_.set_threadpool_model('native')
 
 
-glance_cmd.fix_greendns_ipv6()
+def _shutdown_cached_thread_pools():
+    """Shut down cached thread pools at process exit.
+
+    Replaces the futurist atexit hack removed in 992633. Functional tests use
+    load_paste_app() rather than init_app(), so tasks_pool is not drained
+    unless tearDown or this handler runs.
+    """
+    try:
+        for name in list(api_common._CACHED_THREAD_POOL):
+            pool_model = api_common._CACHED_THREAD_POOL.pop(name)
+            pool = pool_model.pool
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_cached_thread_pools)
 
 # See http://code.google.com/p/python-nose/issues/detail?id=373
 # The code below enables tests to work with i18n _() blocks
-import six.moves.builtins as __builtin__
-setattr(__builtin__, '_', lambda x: x)
+setattr(builtins, '_', lambda x: x)
 
 # Set up logging to output debugging
-import logging
 logger = logging.getLogger()
 hdlr = logging.FileHandler('run_tests.log', 'w')
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')

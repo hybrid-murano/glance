@@ -13,19 +13,22 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-# NOTE(jokke): simplified transition to py3, behaves like py2 xrange
-from six.moves import range
+from unittest import mock
+
+from oslo_config import cfg
 
 from glance import context
 from glance.tests.unit import utils as unit_utils
 from glance.tests import utils
+
+CONF = cfg.CONF
 
 
 def _fake_image(owner, is_public):
     return {
         'id': None,
         'owner': owner,
-        'is_public': is_public,
+        'visibility': 'public' if is_public else 'shared',
     }
 
 
@@ -113,7 +116,7 @@ class TestContext(utils.BaseTestCase):
         Tests that an authenticated context (with is_admin set to
         False) can access an image with is_public set to True.
         """
-        self.do_visible(True, None, True, tenant='froggy')
+        self.do_visible(True, None, True, project_id='froggy')
 
     def test_auth_public_unowned(self):
         """
@@ -121,7 +124,7 @@ class TestContext(utils.BaseTestCase):
         False) can access an image (which it does not own) with
         is_public set to True.
         """
-        self.do_visible(True, 'pattieblack', True, tenant='froggy')
+        self.do_visible(True, 'pattieblack', True, project_id='froggy')
 
     def test_auth_public_owned(self):
         """
@@ -129,14 +132,14 @@ class TestContext(utils.BaseTestCase):
         False) can access an image (which it does own) with is_public
         set to True.
         """
-        self.do_visible(True, 'pattieblack', True, tenant='pattieblack')
+        self.do_visible(True, 'pattieblack', True, project_id='pattieblack')
 
     def test_auth_private(self):
         """
         Tests that an authenticated context (with is_admin set to
         False) can access an image with is_public set to False.
         """
-        self.do_visible(True, None, False, tenant='froggy')
+        self.do_visible(True, None, False, project_id='froggy')
 
     def test_auth_private_unowned(self):
         """
@@ -144,7 +147,7 @@ class TestContext(utils.BaseTestCase):
         False) cannot access an image (which it does not own) with
         is_public set to False.
         """
-        self.do_visible(False, 'pattieblack', False, tenant='froggy')
+        self.do_visible(False, 'pattieblack', False, project_id='froggy')
 
     def test_auth_private_owned(self):
         """
@@ -152,7 +155,7 @@ class TestContext(utils.BaseTestCase):
         False) can access an image (which it does own) with is_public
         set to False.
         """
-        self.do_visible(True, 'pattieblack', False, tenant='pattieblack')
+        self.do_visible(True, 'pattieblack', False, project_id='pattieblack')
 
     def test_request_id(self):
         contexts = [context.RequestContext().request_id for _ in range(5)]
@@ -164,10 +167,70 @@ class TestContext(utils.BaseTestCase):
         self.assertEqual(['foo'], ctx.service_catalog)
 
     def test_user_identity(self):
-        ctx = context.RequestContext(user="user",
-                                     tenant="tenant",
-                                     domain="domain",
-                                     user_domain="user-domain",
-                                     project_domain="project-domain")
+        ctx = context.RequestContext(user_id="user",
+                                     project_id="tenant",
+                                     domain_id="domain",
+                                     user_domain_id="user-domain",
+                                     project_domain_id="project-domain")
         self.assertEqual('user tenant domain user-domain project-domain',
                          ctx.to_dict()["user_identity"])
+
+    def test_elevated(self):
+        """Make sure we get a whole admin-capable context from elevated()."""
+        ctx = context.RequestContext(service_catalog=['foo'],
+                                     user_id='dan',
+                                     project_id='openstack',
+                                     roles=['member'])
+        admin = ctx.elevated()
+        self.assertEqual('dan', admin.user_id)
+        self.assertEqual('openstack', admin.project_id)
+        self.assertEqual(sorted(['member', 'admin']),
+                         sorted(admin.roles))
+        self.assertEqual(['foo'], admin.service_catalog)
+        self.assertTrue(admin.is_admin)
+
+    def test_elevated_again(self):
+        """Make sure a second elevation looks the same."""
+        ctx = context.RequestContext(service_catalog=['foo'],
+                                     user_id='dan',
+                                     project_id='openstack',
+                                     roles=['member'])
+        admin = ctx.elevated()
+        admin = admin.elevated()
+        self.assertEqual('dan', admin.user_id)
+        self.assertEqual('openstack', admin.project_id)
+        self.assertEqual(sorted(['member', 'admin']),
+                         sorted(admin.roles))
+        self.assertEqual(['foo'], admin.service_catalog)
+        self.assertTrue(admin.is_admin)
+
+    @mock.patch('keystoneauth1.token_endpoint.Token')
+    @mock.patch('keystoneauth1.session.Session')
+    def test_get_ksa_client(self, mock_session, mock_token):
+        # Make sure we can get a keystoneauth1 client from our context
+        # with the token auth as expected.
+        ctx = context.RequestContext(auth_token='token')
+        # NOTE(danms): The auth config group and options are
+        # dynamically registered.  Tickling enough of the relevant
+        # code to make that happen would significantly inflate the
+        # amount of code here for no real gain, so we just mock the
+        # CONF object.
+        CONF.register_group(cfg.OptGroup('keystone_authtoken'))
+        with mock.patch.object(CONF, 'keystone_authtoken') as ksat:
+            ksat.auth_url = 'http://keystone'
+            client = context.get_ksa_client(ctx)
+        self.assertEqual(mock_session.return_value, client)
+        mock_session.assert_called_once_with(auth=mock_token.return_value)
+        mock_token.assert_called_once_with('http://keystone', 'token')
+
+    @mock.patch('keystoneauth1.token_endpoint.Token')
+    @mock.patch('keystoneauth1.session.Session')
+    def test_get_ksa_client_www_authenticate_uri_fallback(self, mock_session,
+                                                          mock_token):
+        ctx = context.RequestContext(auth_token='token')
+        CONF.register_group(cfg.OptGroup('keystone_authtoken'))
+        with mock.patch.object(CONF, 'keystone_authtoken') as ksat:
+            ksat.auth_url = None
+            ksat.www_authenticate_uri = 'http://keystone'
+            context.get_ksa_client(ctx)
+        mock_token.assert_called_once_with('http://keystone', 'token')

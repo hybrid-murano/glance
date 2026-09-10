@@ -13,6 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import http.client as http
+
 import webob
 
 import glance.api.v2.image_tags
@@ -96,9 +98,9 @@ class TestImagesSerializer(test_utils.BaseTestCase):
     def test_create_tag(self):
         response = webob.Response()
         self.serializer.update(response, None)
-        self.assertEqual(204, response.status_int)
+        self.assertEqual(http.NO_CONTENT, response.status_int)
 
     def test_delete_tag(self):
         response = webob.Response()
         self.serializer.delete(response, None)
-        self.assertEqual(204, response.status_int)
+        self.assertEqual(http.NO_CONTENT, response.status_int)

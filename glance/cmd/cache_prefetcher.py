@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # Copyright 2011-2012 OpenStack Foundation
 # All Rights Reserved.
@@ -36,21 +36,34 @@ if os.path.exists(os.path.join(possible_topdir, 'glance', '__init__.py')):
 import glance_store
 from oslo_log import log as logging
 
+import glance.async_
 from glance.common import config
 from glance.image_cache import prefetcher
 
 CONF = config.CONF
 logging.register_options(CONF)
+CONF.set_default(name='use_stderr', default=True)
 
 
 def main():
+    print('The Glance cache prefetcher has been deprecated since the Epoxy '
+          '(2025.1) release. It will be removed in the G (2026.1) release. '
+          'The Cache API should be used instead.',
+          file=sys.stderr)
     try:
         config.parse_cache_args()
         logging.setup(CONF, 'glance')
+        CONF.import_opt('enabled_backends', 'glance.common.config')
+        glance.async_.set_threadpool_model('eventlet')
 
-        glance_store.register_opts(config.CONF)
-        glance_store.create_stores(config.CONF)
-        glance_store.verify_default_store()
+        if CONF.enabled_backends:
+            glance_store.register_store_opts(CONF)
+            glance_store.create_multi_stores(CONF)
+            glance_store.verify_store()
+        else:
+            glance_store.register_opts(CONF)
+            glance_store.create_stores(CONF)
+            glance_store.verify_default_store()
 
         app = prefetcher.Prefetcher()
         app.run()

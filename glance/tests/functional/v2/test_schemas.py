@@ -13,30 +13,30 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from oslo_serialization import jsonutils
-import requests
+import http.client as http
 
 from glance.tests import functional
 
 
-class TestSchemas(functional.FunctionalTest):
+class TestSchemas(functional.SynchronousAPIBase):
 
     def setUp(self):
         super(TestSchemas, self).setUp()
-        self.cleanup()
-        self.start_servers(**self.__dict__.copy())
+        self.start_server()
 
     def test_resource(self):
         # Ensure the image link works and custom properties are loaded
-        path = 'http://%s:%d/v2/schemas/image' % ('127.0.0.1', self.api_port)
-        response = requests.get(path)
-        self.assertEqual(200, response.status_code)
-        image_schema = jsonutils.loads(response.text)
+        path = '/v2/schemas/image'
+        response = self.api_get(path)
+        self.assertEqual(http.OK, response.status_code)
+        image_schema = response.json
         expected = set([
             'id',
             'name',
             'visibility',
             'checksum',
+            'os_hash_algo',
+            'os_hash_value',
             'created_at',
             'updated_at',
             'tags',
@@ -54,15 +54,15 @@ class TestSchemas(functional.FunctionalTest):
             'min_ram',
             'min_disk',
             'protected',
+            'os_hidden',
+            'stores',
         ])
         self.assertEqual(expected, set(image_schema['properties'].keys()))
 
         # Ensure the images link works and agrees with the image schema
-        path = 'http://%s:%d/v2/schemas/images' % ('127.0.0.1', self.api_port)
-        response = requests.get(path)
-        self.assertEqual(200, response.status_code)
-        images_schema = jsonutils.loads(response.text)
+        path = '/v2/schemas/images'
+        response = self.api_get(path)
+        self.assertEqual(http.OK, response.status_code)
+        images_schema = response.json
         item_schema = images_schema['properties']['images']['items']
         self.assertEqual(item_schema, image_schema)
-
-        self.stop_servers()

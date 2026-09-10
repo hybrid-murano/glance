@@ -13,9 +13,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-# NOTE(jokke): simplified transition to py3, behaves like py2 xrange
-from six.moves import range
-
 from glance.api import policy
 from glance.common import exception
 from glance.common import property_utils
@@ -23,6 +20,7 @@ import glance.context
 from glance.tests.unit import base
 
 CONFIG_SECTIONS = [
+    'os_glance.*',  # Automatically injected at the top
     '^x_owner_.*',
     'spl_create_prop',
     'spl_read_prop',
@@ -50,15 +48,82 @@ def create_context(policy, roles=None):
                                          policy_enforcer=policy)
 
 
-class TestPropertyRulesWithRoles(base.IsolatedUnitTest):
+class TestPropertyRules():
+    def test_inject_os_glance(self):
+        '''Test that the os_glance.* section has been injected.'''
+        rules = {'x_foo': {'create': ['fake-role'],
+                           'read': ['member'],
+                           'update': ['fake-role'],
+                           'delete': ['fake-role']},
+                 'os_glance_store': {'create': '!',
+                                     'read': '!',
+                                     'update': '!',
+                                     'delete': '!'}}
+        self.set_property_protection_rules(rules)
+        self.rules_checker = property_utils.PropertyRules()
+
+        # The x_foo section should still be here
+        self.assertTrue(self.rules_checker.check_property_rules('x_foo',
+                        'read', create_context(self.policy, ['member'])))
+
+        # The os_glance_store section should not have been here (users must not
+        # specify any section that starts with 'os_glance'. Our 'os_glance.*'
+        # section should now be here.
+        self.assertIn('os_glance.*', property_utils.CONFIG.sections())
+        self.assertNotIn('os_glance_store', property_utils.CONFIG.sections())
+
+        # And we should have the right permissions for all operations in the
+        # os_glance.* section.
+        context = create_context(self.policy, [''])
+        for operation in ['create', 'read', 'update', 'delete']:
+            self.assertTrue(
+                self.rules_checker.check_property_rules(
+                    'os_glance.*', operation, context))
+
+    def test_inject_os_glance_with_wrong_values_reinjected(self):
+        '''Test that os_glance.* section with wrong values is removed and
+        re-injected.
+        '''
+        # First, inject os_glance.* with correct values
+        rules = {'x_foo': {'create': ['fake-role'],
+                           'read': ['member'],
+                           'update': ['fake-role'],
+                           'delete': ['fake-role']}}
+        self.set_property_protection_rules(rules)
+        property_utils.PropertyRules()
+
+        # Manually modify os_glance.* to have wrong values
+        property_utils.CONFIG.set('os_glance.*', 'create', '!')
+        property_utils.CONFIG.set('os_glance.*', 'read', '!')
+        property_utils.CONFIG.set('os_glance.*', 'update', '!')
+        property_utils.CONFIG.set('os_glance.*', 'delete', '!')
+
+        # Verify it has wrong values
+        section = property_utils.CONFIG['os_glance.*']
+        self.assertEqual('!', section.get('create'))
+        self.assertEqual('!', section.get('read'))
+        self.assertEqual('!', section.get('update'))
+        self.assertEqual('!', section.get('delete'))
+
+        # Create new PropertyRules instance - should detect wrong values
+        # and re-inject with correct values
+        property_utils.PropertyRules()
+
+        # Verify os_glance.* now has correct values
+        self.assertIn('os_glance.*', property_utils.CONFIG.sections())
+        section = property_utils.CONFIG['os_glance.*']
+        self.assertEqual('@', section.get('create'))
+        self.assertEqual('@', section.get('read'))
+        self.assertEqual('@', section.get('update'))
+        self.assertEqual('@', section.get('delete'))
+
+
+class TestPropertyRulesWithRoles(base.IsolatedUnitTest, TestPropertyRules):
 
     def setUp(self):
         super(TestPropertyRulesWithRoles, self).setUp()
         self.set_property_protections()
-        self.policy = policy.Enforcer()
-
-    def tearDown(self):
-        super(TestPropertyRulesWithRoles, self).tearDown()
+        self.policy = policy.Enforcer(suppress_deprecation_warnings=True)
 
     def test_is_property_protections_enabled_true(self):
         self.config(property_protection_file="property-protections.conf")
@@ -327,16 +392,13 @@ class TestPropertyRulesWithRoles(base.IsolatedUnitTest):
             create_context(self.policy, ['member'])))
 
 
-class TestPropertyRulesWithPolicies(base.IsolatedUnitTest):
+class TestPropertyRulesWithPolicies(base.IsolatedUnitTest, TestPropertyRules):
 
     def setUp(self):
         super(TestPropertyRulesWithPolicies, self).setUp()
         self.set_property_protections(use_policies=True)
-        self.policy = policy.Enforcer()
+        self.policy = policy.Enforcer(suppress_deprecation_warnings=True)
         self.rules_checker = property_utils.PropertyRules(self.policy)
-
-    def tearDown(self):
-        super(TestPropertyRulesWithPolicies, self).tearDown()
 
     def test_check_property_rules_create_permitted_specific_policy(self):
         self.assertTrue(self.rules_checker.check_property_rules(

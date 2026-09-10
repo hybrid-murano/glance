@@ -1,0 +1,10 @@
+---
+features:
+  - |
+    Added a new cache API endpoint, ``GET /v2/cache/nodes/{image_id}``,
+    to list the node reference URLs where an image is cached when using the
+    ``centralized_db`` cache driver.
+security:
+  - |
+    The new ``list_cached_nodes`` policy defaults to ``role:admin`` to avoid
+    exposing backend worker endpoints to non-admin users.

@@ -14,19 +14,307 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import os
+import io
+import ipaddress
+import socket
+import sqlite3
 import tempfile
+from unittest import mock
 
-import six
+import glance_store as store
+from glance_store._drivers import cinder
+from oslo_config import cfg
+from oslo_log import log as logging
+from sqlalchemy import exc as sqlalchemy_exc
 import webob
 
 from glance.common import exception
+from glance.common import store_utils
 from glance.common import utils
+import glance.location
+from glance.tests.unit import base
+import glance.tests.unit.utils as unit_test_utils
 from glance.tests import utils as test_utils
+
+CONF = cfg.CONF
+
+BASE_URI = unit_test_utils.BASE_URI
+
+
+class TestStoreUtils(test_utils.BaseTestCase):
+    """Test glance.common.store_utils module"""
+
+    def _test_update_store_in_location(self, metadata, store_id, expected,
+                                       store_id_call_count=1,
+                                       save_call_count=1):
+        image = mock.Mock()
+        image_repo = mock.Mock()
+        image_repo.save = mock.Mock()
+        context = mock.Mock()
+        locations = [{
+            'url': 'rbd://aaaaaaaa/images/id',
+            'metadata': metadata
+        }]
+        image.locations = locations
+        with mock.patch.object(
+                store_utils, '_get_store_id_from_uri') as mock_get_store_id:
+            mock_get_store_id.return_value = store_id
+            store_utils.update_store_in_locations(context, image, image_repo)
+            self.assertEqual(image.locations[0]['metadata'].get(
+                'store'), expected)
+            self.assertEqual(store_id_call_count, mock_get_store_id.call_count)
+            self.assertEqual(save_call_count, image_repo.save.call_count)
+
+    def test_update_store_location_with_no_store(self):
+        enabled_backends = {
+            "rbd1": "rbd",
+            "rbd2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        self._test_update_store_in_location({}, 'rbd1', 'rbd1')
+
+    def test_update_store_location_with_different_store(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        self._test_update_store_in_location(
+            {'store': 'rbd2'}, 'ceph1', 'ceph1')
+
+    def test_update_store_location_with_same_store(self):
+        enabled_backends = {
+            "rbd1": "rbd",
+            "rbd2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        self._test_update_store_in_location({'store': 'rbd1'}, 'rbd1', 'rbd1',
+                                            store_id_call_count=0,
+                                            save_call_count=0)
+
+    def test_update_store_location_with_store_none(self):
+        enabled_backends = {
+            "rbd1": "rbd",
+            "rbd2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        self._test_update_store_in_location({}, None, None,
+                                            save_call_count=0)
+
+
+class TestCinderStoreUtils(base.MultiStoreClearingUnitTest):
+    """Test glance.common.store_utils module for cinder multistore"""
+
+    @mock.patch.object(cinder.Store, 'is_image_associated_with_store')
+    @mock.patch.object(cinder.Store, 'url_prefix',
+                       new_callable=mock.PropertyMock)
+    def _test_update_cinder_store_in_location(self, mock_url_prefix,
+                                              mock_associate_store,
+                                              is_valid=True,
+                                              modify_source_url=False):
+        volume_id = 'db457a25-8f16-4b2c-a644-eae8d17fe224'
+        store_id = 'fast-cinder'
+        expected = 'fast-cinder'
+        image = mock.Mock()
+        image_repo = mock.Mock()
+        image_repo.save = mock.Mock()
+        context = mock.Mock()
+        mock_associate_store.return_value = is_valid
+        locations = [{
+            'url': 'cinder://%s' % volume_id,
+            'metadata': {}
+        }]
+        mock_url_prefix.return_value = 'cinder://%s' % store_id
+        image.locations = locations
+        if modify_source_url:
+            updated_location = store_utils.get_updated_store_location(
+                locations, context=context)
+        else:
+            store_utils.update_store_in_locations(context, image, image_repo)
+
+        if is_valid:
+            # This is the case where we found an image that has an
+            # old-style URL which does not include the store name,
+            # but for which we know the corresponding store that
+            # refers to the volume type that backs it. We expect that
+            # the URL should be updated to point to the store/volume from
+            # just a naked pointer to the volume, as was the old
+            # format i.e. this is the case when store is valid and location
+            # url, metadata are updated and image_repo.save is called
+            expected_url = mock_url_prefix.return_value + '/' + volume_id
+            if modify_source_url:
+                # This is the case where location url is modified to be
+                # compatible with multistore as below,
+                # `cinder://store_id/volume_id` to avoid InvalidLocation error
+                self.assertEqual(expected_url, updated_location[0].get('url'))
+                self.assertEqual(expected,
+                                 updated_location[0]['metadata'].get('store'))
+            else:
+                self.assertEqual(expected_url, image.locations[0].get('url'))
+                self.assertEqual(expected, image.locations[0]['metadata'].get(
+                    'store'))
+                self.assertEqual(1, image_repo.save.call_count)
+        else:
+            # Here, we've got an image backed by a volume which does
+            # not have a corresponding store specifying the volume_type.
+            # Expect that we leave these alone and do not touch the
+            # location URL since we cannot update it with a valid store i.e.
+            # this is the case when store is invalid and location url,
+            # metadata are not updated and image_repo.save is not called
+            self.assertEqual(locations[0]['url'],
+                             image.locations[0].get('url'))
+            self.assertEqual({}, image.locations[0]['metadata'])
+            self.assertEqual(0, image_repo.save.call_count)
+
+    def test_update_cinder_store_location_valid_type(self):
+        self._test_update_cinder_store_in_location()
+
+    def test_update_cinder_store_location_invalid_type(self):
+        self._test_update_cinder_store_in_location(is_valid=False)
+
+    def test_get_updated_cinder_store_location(self):
+        """
+        Test if location url is modified to be compatible
+        with multistore.
+        """
+
+        self._test_update_cinder_store_in_location(
+            modify_source_url=True)
 
 
 class TestUtils(test_utils.BaseTestCase):
     """Test routines in glance.utils"""
+
+    def test_sort_image_locations_multistore_disabled(self):
+        self.config(enabled_backends=None)
+        locations = [{
+            'url': 'rbd://aaaaaaaa/images/id',
+            'metadata': {'store': 'rbd1'}
+        }, {
+            'url': 'rbd://bbbbbbbb/images/id',
+            'metadata': {'store': 'rbd2'}
+        }, {
+            'url': 'rbd://cccccccc/images/id',
+            'metadata': {'store': 'rbd3'}
+        }]
+        mp = "glance.common.utils.glance_store.get_store_weight"
+        with mock.patch(mp) as mock_get_store:
+            utils.sort_image_locations(locations)
+
+        # Since multistore is not enabled, it will not sort the locations
+        self.assertEqual(0, mock_get_store.call_count)
+
+    def test_sort_image_locations(self):
+        enabled_backends = {
+            "rbd1": "rbd",
+            "rbd2": "rbd",
+            "rbd3": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="rbd1", group="glance_store")
+        locations = [{
+            'url': 'rbd://aaaaaaaa/images/id',
+            'metadata': {'store': 'rbd1'}
+        }, {
+            'url': 'rbd://bbbbbbbb/images/id',
+            'metadata': {'store': 'rbd2'}
+        }, {
+            'url': 'rbd://cccccccc/images/id',
+            'metadata': {'store': 'rbd3'}
+        }]
+        mp = "glance.common.utils.glance_store.get_store_weight"
+        with mock.patch(mp) as mock_get_store:
+            mock_get_store.return_value = 100
+            utils.sort_image_locations(locations)
+
+        # Since 3 stores are configured, internal method will be called 3 times
+        self.assertEqual(3, mock_get_store.call_count)
+
+    def test_sort_image_locations_without_metadata(self):
+        enabled_backends = {
+            "rbd1": "rbd",
+            "rbd2": "rbd",
+            "rbd3": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="rbd1", group="glance_store")
+        locations = [{
+            'url': 'rbd://aaaaaaaa/images/id',
+            'metadata': {}
+        }, {
+            'url': 'rbd://bbbbbbbb/images/id',
+            'metadata': {}
+        }, {
+            'url': 'rbd://cccccccc/images/id',
+            'metadata': {}
+        }]
+        mp = "glance.common.utils.glance_store.get_store_weight"
+        with mock.patch(mp) as mock_get_store:
+            utils.sort_image_locations(locations)
+
+        # Since 3 stores are configured, without store in metadata the internal
+        # method will be called 0 times
+        self.assertEqual(0, mock_get_store.call_count)
+
+    def test_sort_image_locations_with_partial_metadata(self):
+        enabled_backends = {
+            "rbd1": "rbd",
+            "rbd2": "rbd",
+            "rbd3": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="rbd1", group="glance_store")
+        locations = [{
+            'url': 'rbd://aaaaaaaa/images/id',
+            'metadata': {'store': 'rbd1'}
+        }, {
+            'url': 'rbd://bbbbbbbb/images/id',
+            'metadata': {}
+        }, {
+            'url': 'rbd://cccccccc/images/id',
+            'metadata': {}
+        }]
+        mp = "glance.common.utils.glance_store.get_store_weight"
+        with mock.patch(mp) as mock_get_store:
+            mock_get_store.return_value = 100
+            utils.sort_image_locations(locations)
+
+        # Since 3 stores are configured, but only one location has
+        # store in metadata the internal
+        # method will be called 1 time only
+        self.assertEqual(1, mock_get_store.call_count)
+
+    def test_sort_image_locations_unknownscheme(self):
+        enabled_backends = {
+            "rbd1": "rbd",
+            "rbd2": "rbd",
+            "rbd3": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="rbd1", group="glance_store")
+        locations = [{
+            'url': 'rbd://aaaaaaaa/images/id',
+            'metadata': {'store': 'rbd1'}
+        }, {
+            'url': 'rbd://bbbbbbbb/images/id',
+            'metadata': {'store': 'rbd2'}
+        }, {
+            'url': 'rbd://cccccccc/images/id',
+            'metadata': {'store': 'rbd3'}
+        }]
+        mp = "glance.common.utils.glance_store.get_store_weight"
+        with mock.patch(mp) as mock_get_store:
+            mock_get_store.side_effect = store.UnknownScheme()
+            sorted_locations = utils.sort_image_locations(locations)
+
+        # Even though UnknownScheme exception is raised, processing continues
+        self.assertEqual(3, mock_get_store.call_count)
+        # Since we return 0 weight, original location order should be preserved
+        self.assertEqual(locations, sorted_locations)
 
     def test_cooperative_reader(self):
         """Ensure cooperative reader class accesses all bytes of file"""
@@ -65,16 +353,34 @@ class TestUtils(test_utils.BaseTestCase):
         meat = b''.join(chunks)
         self.assertEqual(b'aaabbbcccdddeeefffggghhh', meat)
 
-    def test_cooperative_reader_of_iterator_stop_iteration_err(self):
-        """Ensure cooperative reader supports iterator backends too"""
-        reader = utils.CooperativeReader([l * 3 for l in ''])
-        chunks = []
-        while True:
-            chunks.append(reader.read(3))
-            if chunks[-1] == b'':
-                break
-        meat = b''.join(chunks)
-        self.assertEqual(b'', meat)
+    def test_cooperative_reader_unbounded_read_on_iterator(self):
+        """Ensure cooperative reader is happy with empty iterators"""
+        data = b'abcdefgh'
+        data_list = [data[i:i + 1] * 3 for i in range(len(data))]
+        reader = utils.CooperativeReader(data_list)
+        self.assertEqual(
+            [chunk for chunk in iter(lambda: reader.read(), b'')],
+            [b'aaa', b'bbb', b'ccc', b'ddd', b'eee', b'fff', b'ggg', b'hhh'])
+
+    def test_cooperative_reader_on_iterator_with_buffer(self):
+        """Ensure cooperative reader is happy with empty iterators"""
+        data_list = [b'abcd', b'efgh']
+        reader = utils.CooperativeReader(data_list)
+        # read from part of a chunk, get the first item into the buffer
+        self.assertEqual(b'ab', reader.read(2))
+        # read purely from buffer
+        self.assertEqual(b'c', reader.read(1))
+        # unbounded read grabs the rest of the buffer
+        self.assertEqual(b'd', reader.read())
+        # then the whole next chunk
+        self.assertEqual(b'efgh', reader.read())
+        # past that, it's always empty
+        self.assertEqual(b'', reader.read())
+
+    def test_cooperative_reader_unbounded_read_on_empty_iterator(self):
+        """Ensure cooperative reader is happy with empty iterators"""
+        reader = utils.CooperativeReader([])
+        self.assertEqual(b'', reader.read())
 
     def _create_generator(self, chunk_size, max_iterations):
         chars = b'abc'
@@ -85,7 +391,7 @@ class TestUtils(test_utils.BaseTestCase):
             yield chunk
             iteration += 1
             if iteration >= max_iterations:
-                raise StopIteration()
+                return
 
     def _test_reader_chunked(self, chunk_size, read_size, max_iterations=5):
         generator = self._create_generator(chunk_size, max_iterations)
@@ -119,14 +425,14 @@ class TestUtils(test_utils.BaseTestCase):
         """Ensure limiting reader class accesses all bytes of file"""
         BYTES = 1024
         bytes_read = 0
-        data = six.StringIO("*" * BYTES)
+        data = io.StringIO("*" * BYTES)
         for chunk in utils.LimitingReader(data, BYTES):
             bytes_read += len(chunk)
 
         self.assertEqual(BYTES, bytes_read)
 
         bytes_read = 0
-        data = six.StringIO("*" * BYTES)
+        data = io.StringIO("*" * BYTES)
         reader = utils.LimitingReader(data, BYTES)
         byte = reader.read(1)
         while len(byte) != 0:
@@ -141,7 +447,7 @@ class TestUtils(test_utils.BaseTestCase):
 
         def _consume_all_iter():
             bytes_read = 0
-            data = six.StringIO("*" * BYTES)
+            data = io.StringIO("*" * BYTES)
             for chunk in utils.LimitingReader(data, BYTES - 1):
                 bytes_read += len(chunk)
 
@@ -149,7 +455,7 @@ class TestUtils(test_utils.BaseTestCase):
 
         def _consume_all_read():
             bytes_read = 0
-            data = six.StringIO("*" * BYTES)
+            data = io.StringIO("*" * BYTES)
             reader = utils.LimitingReader(data, BYTES - 1)
             byte = reader.read(1)
             while len(byte) != 0:
@@ -192,8 +498,8 @@ class TestUtils(test_utils.BaseTestCase):
         actual = utils.image_meta_to_http_headers(image_meta)
         actual_test2 = utils.image_meta_to_http_headers(
             image_meta_properties)
-        self.assertEqual({'x-image-meta-x-image-meta-size': u'test'}, actual)
-        self.assertEqual({'x-image-meta-property-test': u'test'},
+        self.assertEqual({'x-image-meta-x-image-meta-size': 'test'}, actual)
+        self.assertEqual({'x-image-meta-property-test': 'test'},
                          actual_test2)
 
     def test_create_mashup_dict_with_different_core_custom_properties(self):
@@ -267,46 +573,6 @@ class TestUtils(test_utils.BaseTestCase):
         result = utils.mutating(fake_function)
         self.assertEqual("test passed", result(req, Fake()))
 
-    def test_validate_key_cert_key(self):
-        self.config(digest_algorithm='sha256')
-        var_dir = os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                               '../../', 'var'))
-        keyfile = os.path.join(var_dir, 'privatekey.key')
-        certfile = os.path.join(var_dir, 'certificate.crt')
-        utils.validate_key_cert(keyfile, certfile)
-
-    def test_validate_key_cert_no_private_key(self):
-        with tempfile.NamedTemporaryFile('w+') as tmpf:
-            self.assertRaises(RuntimeError,
-                              utils.validate_key_cert,
-                              "/not/a/file", tmpf.name)
-
-    def test_validate_key_cert_cert_cant_read(self):
-        with tempfile.NamedTemporaryFile('w+') as keyf:
-            with tempfile.NamedTemporaryFile('w+') as certf:
-                os.chmod(certf.name, 0)
-                self.assertRaises(RuntimeError,
-                                  utils.validate_key_cert,
-                                  keyf.name, certf.name)
-
-    def test_validate_key_cert_key_cant_read(self):
-        with tempfile.NamedTemporaryFile('w+') as keyf:
-            with tempfile.NamedTemporaryFile('w+') as certf:
-                os.chmod(keyf.name, 0)
-                self.assertRaises(RuntimeError,
-                                  utils.validate_key_cert,
-                                  keyf.name, certf.name)
-
-    def test_invalid_digest_algorithm(self):
-        self.config(digest_algorithm='fake_algorithm')
-        var_dir = os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                               '../../', 'var'))
-        keyfile = os.path.join(var_dir, 'privatekey.key')
-        certfile = os.path.join(var_dir, 'certificate.crt')
-        self.assertRaises(ValueError,
-                          utils.validate_key_cert,
-                          keyfile, certfile)
-
     def test_valid_hostname(self):
         valid_inputs = ['localhost',
                         'glance04-a'
@@ -319,7 +585,7 @@ class TestUtils(test_utils.BaseTestCase):
     def test_valid_hostname_fail(self):
         invalid_inputs = ['localhost.localdomain',
                           '192.168.0.1',
-                          u'\u2603',
+                          '\u2603',
                           'glance02.stack42.local']
 
         for input_str in invalid_inputs:
@@ -338,7 +604,7 @@ class TestUtils(test_utils.BaseTestCase):
         invalid_inputs = ['localhost',
                           '192.168.0.1',
                           '999.88.77.6',
-                          u'\u2603.local',
+                          '\u2603.local',
                           'glance02.stack42']
 
         for input_str in invalid_inputs:
@@ -362,7 +628,7 @@ class TestUtils(test_utils.BaseTestCase):
                                         ']' if escaped else '')
 
             self.assertTrue(pair_str.startswith(expected_host))
-            self.assertTrue(port > 0)
+            self.assertGreater(port, 0)
 
             expected_pair = '%s:%d' % (expected_host, port)
             self.assertEqual(expected_pair, pair_str)
@@ -373,8 +639,8 @@ class TestUtils(test_utils.BaseTestCase):
                          '172.17.17.1:99999',
                          '290.12.52.80:5673',
                          'absurd inputs happen',
-                         u'\u2601',
-                         u'\u2603:8080',
+                         '\u2601',
+                         '\u2603:8080',
                          'fe80::1',
                          '[fe80::2]',
                          '<fe80::3>:5673',
@@ -389,6 +655,201 @@ class TestUtils(test_utils.BaseTestCase):
             self.assertRaises(ValueError,
                               utils.parse_valid_host_port,
                               pair)
+
+    def test_get_stores_from_request_returns_default(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="ceph1", group="glance_store")
+
+        req = webob.Request.blank('/some_request')
+        mp = "glance.common.utils.glance_store.get_store_from_store_identifier"
+        with mock.patch(mp) as mock_get_store:
+            result = utils.get_stores_from_request(req, {})
+            self.assertEqual(["ceph1"], result)
+            mock_get_store.assert_called_once_with("ceph1")
+
+    def test_get_stores_from_request_returns_stores_from_body(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="ceph1", group="glance_store")
+
+        body = {"stores": ["ceph1", "ceph2"]}
+        req = webob.Request.blank("/some_request")
+        mp = "glance.common.utils.glance_store.get_store_from_store_identifier"
+        with mock.patch(mp) as mock_get_store:
+            result = utils.get_stores_from_request(req, body)
+            self.assertEqual(["ceph1", "ceph2"], result)
+            mock_get_store.assert_any_call("ceph1")
+            mock_get_store.assert_any_call("ceph2")
+            self.assertEqual(mock_get_store.call_count, 2)
+
+    def test_get_stores_from_request_returns_store_from_headers(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="ceph1", group="glance_store")
+
+        headers = {"x-image-meta-store": "ceph2"}
+        req = webob.Request.blank("/some_request", headers=headers)
+        mp = "glance.common.utils.glance_store.get_store_from_store_identifier"
+        with mock.patch(mp) as mock_get_store:
+            result = utils.get_stores_from_request(req, {})
+            self.assertEqual(["ceph2"], result)
+            mock_get_store.assert_called_once_with("ceph2")
+
+    def test_get_stores_from_request_raises_bad_request(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="ceph1", group="glance_store")
+        headers = {"x-image-meta-store": "ceph2"}
+        body = {"stores": ["ceph1"]}
+        req = webob.Request.blank("/some_request", headers=headers)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          utils.get_stores_from_request, req, body)
+
+    def test_get_stores_from_request_returns_all_stores(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd"
+        }
+        reserved_stores = {
+            'os_glance_staging_store': 'file',
+            'os_glance_tasks_store': 'file'
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF, reserved_stores=reserved_stores)
+        self.config(default_backend="ceph1", group="glance_store")
+        body = {"all_stores": True}
+        req = webob.Request.blank("/some_request")
+        mp = "glance.common.utils.glance_store.get_store_from_store_identifier"
+        with mock.patch(mp) as mock_get_store:
+            result = sorted(utils.get_stores_from_request(req, body))
+            self.assertEqual(["ceph1", "ceph2"], result)
+            mock_get_store.assert_any_call("ceph1")
+            mock_get_store.assert_any_call("ceph2")
+            self.assertEqual(mock_get_store.call_count, 2)
+            self.assertNotIn('os_glance_staging_store', result)
+            self.assertNotIn('os_glance_tasks_store', result)
+
+    def test_get_stores_from_request_excludes_reserved_stores(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="ceph1", group="glance_store")
+        body = {"all_stores": True}
+        req = webob.Request.blank("/some_request")
+        mp = "glance.common.utils.glance_store.get_store_from_store_identifier"
+        with mock.patch(mp) as mock_get_store:
+            result = sorted(utils.get_stores_from_request(req, body))
+            self.assertEqual(["ceph1", "ceph2"], result)
+            mock_get_store.assert_any_call("ceph1")
+            mock_get_store.assert_any_call("ceph2")
+            self.assertEqual(mock_get_store.call_count, 2)
+
+    def test_get_stores_from_request_excludes_readonly_store(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd",
+            "http": "http"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="ceph1", group="glance_store")
+        body = {"all_stores": True}
+        req = webob.Request.blank("/some_request")
+        mp = "glance.common.utils.glance_store.get_store_from_store_identifier"
+        with mock.patch(mp) as mock_get_store:
+            result = sorted(utils.get_stores_from_request(req, body))
+            self.assertNotIn("http", result)
+            self.assertEqual(["ceph1", "ceph2"], result)
+            mock_get_store.assert_any_call("ceph1")
+            mock_get_store.assert_any_call("ceph2")
+            self.assertEqual(mock_get_store.call_count, 2)
+
+    def test_get_stores_from_request_raises_bad_request_with_all_stores(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="ceph1", group="glance_store")
+        headers = {"x-image-meta-store": "ceph2"}
+        body = {"stores": ["ceph1"], "all_stores": True}
+        req = webob.Request.blank("/some_request", headers=headers)
+        self.assertRaises(webob.exc.HTTPBadRequest,
+                          utils.get_stores_from_request, req, body)
+
+    def test_single_store_http_enabled_and_http_not_in_url(self):
+        store.register_opts(CONF)
+        self.config(stores="http,file", group="glance_store")
+        loc_url = "rbd://aaaaaaaa/images/id"
+        self.assertFalse(utils.is_http_store_configured(loc_url))
+
+    def test_single_store_http_disabled_and_http_in_url(self):
+        store.register_opts(CONF)
+        self.config(stores="rbd,file", group="glance_store")
+        loc_url = BASE_URI
+        self.assertFalse(utils.is_http_store_configured(loc_url))
+
+    def test_single_store_http_enabled_and_http_in_url(self):
+        store.register_opts(CONF)
+        self.config(stores="http,file", group="glance_store")
+        loc_url = BASE_URI
+        self.assertTrue(utils.is_http_store_configured(loc_url))
+
+    def test_multiple_store_http_enabled_and_http_not_in_url(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd",
+            "http": "http"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="http", group="glance_store")
+        loc_url = "rbd://aaaaaaaa/images/id"
+        self.assertFalse(utils.is_http_store_configured(loc_url))
+
+    def test_multiple_store_http_disabled_and_http_in_url(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd",
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="ceph1", group="glance_store")
+        loc_url = BASE_URI
+        self.assertFalse(utils.is_http_store_configured(loc_url))
+
+    def test_multiple_store_http_enabled_and_http_in_url(self):
+        enabled_backends = {
+            "ceph1": "rbd",
+            "ceph2": "rbd",
+            "http": "http"
+        }
+        self.config(enabled_backends=enabled_backends)
+        store.register_store_opts(CONF)
+        self.config(default_backend="http", group="glance_store")
+        loc_url = BASE_URI
+        self.assertTrue(utils.is_http_store_configured(loc_url))
 
 
 class SplitFilterOpTestCase(test_utils.BaseTestCase):
@@ -450,6 +911,16 @@ class SplitFilterOpTestCase(test_utils.BaseTestCase):
         returned = utils.split_filter_op(expr)
         self.assertEqual(('eq', expr), returned)
 
+    def test_default_operator_with_datetime(self):
+        expr = '2015-08-27T09:49:58Z'
+        returned = utils.split_filter_op(expr)
+        self.assertEqual(('eq', expr), returned)
+
+    def test_operator_with_datetime(self):
+        expr = 'lt:2015-08-27T09:49:58Z'
+        returned = utils.split_filter_op(expr)
+        self.assertEqual(('lt', '2015-08-27T09:49:58Z'), returned)
+
 
 class EvaluateFilterOpTestCase(test_utils.BaseTestCase):
 
@@ -486,3 +957,633 @@ class EvaluateFilterOpTestCase(test_utils.BaseTestCase):
     def test_invalid_operator(self):
         self.assertRaises(exception.InvalidFilterOperatorValue,
                           utils.evaluate_filter_op, '10', 'bar', '8')
+
+
+class ImportURITestCase(test_utils.BaseTestCase):
+
+    @mock.patch("glance.common.utils.socket.getaddrinfo")
+    def test_validate_uri(self, mock_getaddrinfo):
+        # This avoid internet access in validate_uri()
+        # (ie: DNS resolution of foo.com)
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '',
+             ('93.184.216.34', 80))
+        ]
+
+        self.assertTrue(utils.validate_uri("http://foo.com"))
+
+        self.config(allowed_schemes=['http'],
+                    group='import_filtering_opts')
+        self.config(allowed_hosts=['example.com'],
+                    group='import_filtering_opts')
+        self.assertTrue(utils.validate_uri("http://example.com"))
+
+        self.config(allowed_ports=['8080'],
+                    group='import_filtering_opts')
+        self.assertTrue(utils.validate_uri("http://example.com:8080"))
+
+    # No mock for getaddrinfo: ftp:// cases fail on disallowed scheme before
+    # host normalization; localhost typically resolves from /etc/hosts.
+    def test_invalid_import_uri(self):
+        self.assertFalse(utils.validate_uri(""))
+
+        self.assertFalse(utils.validate_uri("fake_uri"))
+        self.config(disallowed_schemes=['ftp'],
+                    group='import_filtering_opts')
+        self.assertFalse(utils.validate_uri("ftp://example.com"))
+
+        self.config(disallowed_hosts=['foo.com'],
+                    group='import_filtering_opts')
+        self.assertFalse(utils.validate_uri("ftp://foo.com"))
+
+        self.config(disallowed_ports=['8484'],
+                    group='import_filtering_opts')
+        self.assertFalse(utils.validate_uri("http://localhost:8484"))
+
+    @mock.patch("glance.common.utils.socket.getaddrinfo")
+    def test_ignored_filtering_options(self, mock_getaddrinfo):
+        # This avoid internet access in validate_uri()
+        # (ie: DNS resolution of foo.com)
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '',
+             ('93.184.216.34', 80))
+        ]
+
+        LOG = logging.getLogger('glance.common.utils')
+        with mock.patch.object(LOG, 'debug') as mock_run:
+            self.config(allowed_schemes=['https', 'ftp'],
+                        group='import_filtering_opts')
+            self.config(disallowed_schemes=['ftp'],
+                        group='import_filtering_opts')
+            self.assertTrue(utils.validate_uri("ftp://foo.com"))
+            mock_run.assert_called_once()
+        with mock.patch.object(LOG, 'debug') as mock_run:
+            self.config(allowed_schemes=[],
+                        group='import_filtering_opts')
+            self.config(disallowed_schemes=[],
+                        group='import_filtering_opts')
+            self.config(allowed_hosts=['example.com', 'foo.com'],
+                        group='import_filtering_opts')
+            self.config(disallowed_hosts=['foo.com'],
+                        group='import_filtering_opts')
+            self.assertTrue(utils.validate_uri("ftp://foo.com"))
+            mock_run.assert_called_once()
+        with mock.patch.object(LOG, 'debug') as mock_run:
+            self.config(allowed_hosts=[],
+                        group='import_filtering_opts')
+            self.config(disallowed_hosts=[],
+                        group='import_filtering_opts')
+            self.config(allowed_ports=[8080, 8484],
+                        group='import_filtering_opts')
+            self.config(disallowed_ports=[8484],
+                        group='import_filtering_opts')
+            self.assertTrue(utils.validate_uri("ftp://foo.com:8484"))
+            mock_run.assert_called_once()
+
+    def test_validate_uri_ip_rejection(self):
+        """Test that encoded IP addresses are rejected (not normalized)."""
+        self.config(allowed_ports=[80], group='import_filtering_opts')
+        # Loopback and link-local addresses are blocked by default
+        self.assertFalse(utils.validate_uri("http://127.0.0.1:80/"))
+        self.assertFalse(
+            utils.validate_uri("http://169.254.169.254/"))
+        # Private RFC1918 addresses are allowed by default
+        self.assertTrue(utils.validate_uri("http://10.0.0.1/"))
+        self.assertTrue(utils.validate_uri("http://192.168.1.1/"))
+
+        # Test that encoded IP (decimal) is rejected
+        result = utils.validate_uri("http://2130706433:80/")
+        self.assertFalse(result)
+
+        # Test that shorthand IP addresses are rejected
+        self.assertFalse(utils.validate_uri("http://127.1:80/"))
+        self.assertFalse(utils.validate_uri("http://10.1:80/"))
+        self.assertFalse(utils.validate_uri("http://192.168.1:80/"))
+
+        # Test with allowed host - loopback may be allowed via whitelist
+        self.config(disallowed_hosts=[],
+                    group='import_filtering_opts')
+        self.config(allowed_hosts=['127.0.0.1'],
+                    group='import_filtering_opts')
+        self.assertTrue(utils.validate_uri("http://127.0.0.1:80/"))
+        self.assertFalse(utils.validate_uri("http://2130706433:80/"))
+
+    @mock.patch('glance.common.utils.socket.getaddrinfo')
+    def test_normalize_hostname(self, mock_getaddrinfo):
+        """Test the normalize_hostname function."""
+        # Test standard IPv4 - should return normalized
+        result = utils.normalize_hostname("127.0.0.1")
+        self.assertEqual(result, "127.0.0.1")
+        mock_getaddrinfo.assert_not_called()
+
+        # Test standard IPv4 with different format - should normalize
+        result = utils.normalize_hostname("192.168.1.1")
+        self.assertEqual(result, "192.168.1.1")
+        mock_getaddrinfo.assert_not_called()
+
+        # Test encoded IP (decimal) - should be rejected (fails isdigit check)
+        result = utils.normalize_hostname("2130706433")
+        self.assertIsNone(result)
+        mock_getaddrinfo.assert_not_called()
+
+        # Test hex encoded IP - should be rejected (DNS resolution fails)
+        mock_getaddrinfo.reset_mock()
+        mock_getaddrinfo.side_effect = socket.gaierror(
+            "Name or service not known")
+        result = utils.normalize_hostname("0x7f000001")
+        self.assertIsNone(result)
+        mock_getaddrinfo.assert_called_once_with("0x7f000001.", 80)
+
+        # Test octal integer encoded IP - should be rejected
+        # (fails isdigit check)
+        mock_getaddrinfo.reset_mock()
+        result = utils.normalize_hostname("017700000001")
+        self.assertIsNone(result)
+        mock_getaddrinfo.assert_not_called()
+
+        # Test octal dotted-decimal encoded IP - should be rejected
+        # (all digits/dots)
+        mock_getaddrinfo.reset_mock()
+        result = utils.normalize_hostname("0177.0.0.01")
+        self.assertIsNone(result)
+        mock_getaddrinfo.assert_not_called()
+
+        # Test mixed octal/decimal dotted-decimal - should be rejected
+        # (all digits/dots)
+        mock_getaddrinfo.reset_mock()
+        result = utils.normalize_hostname("0177.0.0.1")
+        self.assertIsNone(result)
+        mock_getaddrinfo.assert_not_called()
+
+        # Test IPv6 address - should normalize to standard format
+        mock_getaddrinfo.reset_mock()
+        result = utils.normalize_hostname("::1")
+        self.assertEqual(result, "::1")
+        mock_getaddrinfo.assert_not_called()
+
+        result = utils.normalize_hostname("2001:db8::1")
+        self.assertEqual(result, "2001:db8::1")
+        mock_getaddrinfo.assert_not_called()
+
+        # Test IPv6-mapped IPv4 - should normalize
+        result = utils.normalize_hostname("::ffff:127.0.0.1")
+        ipv6 = ipaddress.IPv6Address(result)
+        expected = ipaddress.IPv6Address("::ffff:127.0.0.1")
+        self.assertEqual(ipv6, expected)
+        mock_getaddrinfo.assert_not_called()
+
+        # Test shorthand IP addresses - should be rejected
+        mock_getaddrinfo.reset_mock()
+        result = utils.normalize_hostname("127.1")
+        self.assertIsNone(result)
+        mock_getaddrinfo.assert_not_called()
+
+        result = utils.normalize_hostname("10.1")
+        self.assertIsNone(result)
+
+        result = utils.normalize_hostname("192.168.1")
+        self.assertIsNone(result)
+
+        # Test valid hostname - should return unchanged
+        mock_getaddrinfo.reset_mock()
+        mock_getaddrinfo.side_effect = None
+        mock_getaddrinfo.return_value = [('', '', '', '', ('', 80))]
+        result = utils.normalize_hostname("example.com")
+        self.assertEqual(result, "example.com")
+        mock_getaddrinfo.assert_called_once_with("example.com.", 80)
+
+        # Test valid domain starting with digit (3m.com)
+        mock_getaddrinfo.reset_mock()
+        mock_getaddrinfo.side_effect = None
+        mock_getaddrinfo.return_value = [('', '', '', '', ('', 80))]
+        result = utils.normalize_hostname("3m.com")
+        self.assertEqual(result, "3m.com")
+        mock_getaddrinfo.assert_called_once_with("3m.com.", 80)
+
+        # Test valid domain starting with 0x (0xdeadbeef.com)
+        mock_getaddrinfo.reset_mock()
+        mock_getaddrinfo.side_effect = None
+        mock_getaddrinfo.return_value = [('', '', '', '', ('', 80))]
+        result = utils.normalize_hostname("0xdeadbeef.com")
+        self.assertEqual(result, "0xdeadbeef.com")
+        mock_getaddrinfo.assert_called_once_with(
+            "0xdeadbeef.com.", 80)
+
+        # Test invalid/unresolvable hostname - should be rejected
+        mock_getaddrinfo.reset_mock()
+        mock_getaddrinfo.side_effect = socket.gaierror(
+            "Name or service not known")
+        result = utils.normalize_hostname("invalid-hostname-12345")
+        self.assertIsNone(result)
+        mock_getaddrinfo.assert_called_once_with(
+            "invalid-hostname-12345.", 80)
+
+    def test_validate_uri_ipv6_validation(self):
+        """Test IPv6 addresses are properly validated against blacklist."""
+        # Test that IPv6 localhost is blocked when in blacklist
+        self.config(disallowed_hosts=['::1'],
+                    group='import_filtering_opts')
+        self.config(allowed_ports=[80],
+                    group='import_filtering_opts')
+        # IPv6 addresses in URLs are in brackets, but urlparse removes them
+        # So we test with the hostname directly
+        self.assertFalse(
+            utils.validate_uri("http://[::1]:80/"))
+
+        # Test that IPv6 localhost is blocked by default
+        self.config(disallowed_hosts=[],
+                    group='import_filtering_opts')
+        self.config(allowed_hosts=[],
+                    group='import_filtering_opts')
+        self.config(allowed_ports=[80],
+                    group='import_filtering_opts')
+        self.assertFalse(utils.validate_uri("http://[::1]:80/"))
+
+        # Test that IPv6 address not in blacklist is allowed when whitelisted
+        self.config(disallowed_hosts=[],
+                    group='import_filtering_opts')
+        self.config(allowed_hosts=['2001:db8::1'],
+                    group='import_filtering_opts')
+        self.assertTrue(
+            utils.validate_uri("http://[2001:db8::1]:80/"))
+
+        # Test that IPv6 localhost can be blocked separately from IPv4
+        # This ensures IPv6 addresses are properly normalized and can be
+        # blacklisted
+        self.config(disallowed_hosts=['127.0.0.1'],
+                    group='import_filtering_opts')
+        self.config(allowed_hosts=[],  # Explicitly clear whitelist
+                    group='import_filtering_opts')
+        self.config(allowed_ports=[80],
+                    group='import_filtering_opts')
+        # IPv6 localhost is blocked by default even when only IPv4 is listed
+        # in disallowed_hosts
+        result = utils.validate_uri("http://[::1]:80/")
+        self.assertFalse(result)
+
+        # Test that IPv6 can be blacklisted separately
+        self.config(disallowed_hosts=['127.0.0.1', '::1'],
+                    group='import_filtering_opts')
+        self.assertFalse(utils.validate_uri("http://[::1]:80/"))
+
+    @mock.patch("glance.common.utils.socket.getaddrinfo")
+    def test_validate_uri_blocks_dns_rebinding(
+            self, mock_getaddrinfo):
+        """Hostnames resolving to restricted addresses are rejected."""
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '',
+             ('169.254.169.254', 80))
+        ]
+        self.assertFalse(
+            utils.validate_uri("http://metadata.example/"))
+
+    @mock.patch("glance.common.utils.socket.getaddrinfo")
+    def test_validate_uri_blocks_disallowed_resolved_ip(
+            self, mock_getaddrinfo):
+        """Hostnames resolving to disallowed public IPs are rejected."""
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '',
+             ('93.184.216.34', 80))
+        ]
+        self.config(disallowed_hosts=['93.184.216.34'],
+                    group='import_filtering_opts')
+        self.config(allowed_ports=[80], group='import_filtering_opts')
+        self.assertFalse(
+            utils.validate_uri("http://blocked.example/"))
+
+    @mock.patch("glance.common.utils.socket.getaddrinfo")
+    def test_resolve_pinned_address(self, mock_getaddrinfo):
+        """Pinned address comes from validated DNS resolution."""
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '',
+             ('93.184.216.34', 80))
+        ]
+        pinned = utils.resolve_pinned_address('example.com', 80)
+        self.assertEqual(pinned, ['93.184.216.34'])
+
+    @mock.patch("glance.common.utils.socket.getaddrinfo")
+    def test_resolve_pinned_address_dualstack(self, mock_getaddrinfo):
+        """Pinned address comes from validated DNS resolution."""
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '',
+             ('93.184.216.34', 80)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '',
+             ('2607:f298:6:a014::c3e:9bd6', 80, 0, 0)),
+        ]
+        pinned = utils.resolve_pinned_address('example.com', 80)
+        self.assertEqual(
+            ['93.184.216.34', '2607:f298:6:a014::c3e:9bd6'],
+            pinned,
+        )
+
+
+class S3MigrationTestCase(test_utils.BaseTestCase):
+    """Tests for S3 credential-free URL migration logic."""
+
+    def setUp(self):
+        super(S3MigrationTestCase, self).setUp()
+        self.context = mock.Mock()
+        self.image_repo = mock.Mock()
+        self.image = mock.Mock()
+        self.image.locations = []
+        self.image.image_id = 'test-image-id'
+
+    def _make_loc(self, url, store=None):
+        metadata = {'store': store} if store else {}
+        return {'url': url, 'metadata': metadata}
+
+    def test_update_s3_location_strips_credentials(self):
+        """Legacy URL with KEY:SECRET@ is rewritten to credential-free."""
+        loc = self._make_loc(
+            's3://AKIAIOSFODNN7:wJalrXUt@s3.example.com/bucket/image-123')
+        result = store_utils._update_s3_location_credentials(loc)
+        self.assertTrue(result)
+        self.assertEqual('s3://s3.example.com/bucket/image-123', loc['url'])
+        self.assertNotIn('@', loc['url'])
+
+    def test_update_s3_location_clean_url_no_op(self):
+        """Clean URL with no credentials returns False and is unchanged."""
+        original = 's3://s3.example.com/bucket/image-123'
+        loc = self._make_loc(original)
+        result = store_utils._update_s3_location_credentials(loc)
+        self.assertFalse(result)
+        self.assertEqual(original, loc['url'])
+
+    def test_update_s3_location_secret_key_with_slash(self):
+        """Secret key containing '/' is stripped correctly via rfind('@')."""
+        loc = self._make_loc(
+            's3://KEY:sec/ret@s3.example.com/bucket/image-123')
+        result = store_utils._update_s3_location_credentials(loc)
+        self.assertTrue(result)
+        self.assertEqual('s3://s3.example.com/bucket/image-123', loc['url'])
+
+    def test_update_s3_location_s3_http_schemes(self):
+        """Credential stripping works for s3+http:// and s3+https:// too."""
+        for scheme in ('s3+http', 's3+https'):
+            with self.subTest(scheme=scheme):
+                loc = self._make_loc(
+                    '%s://KEY:SECRET@host.com/bucket/img' % scheme)
+                result = store_utils._update_s3_location_credentials(loc)
+                self.assertTrue(result)
+                self.assertEqual(
+                    '%s://host.com/bucket/img' % scheme, loc['url'])
+
+    @mock.patch('glance.common.store_utils._get_store_id_from_uri')
+    @mock.patch('glance.common.store_utils.CONF')
+    def test_update_store_s3_legacy_url_migrated(self, mock_conf,
+                                                 mock_get_store):
+        """update_store_in_locations strips credentials and saves the image."""
+        mock_conf.enabled_backends = None
+        mock_get_store.return_value = None
+        self.image.locations = [self._make_loc(
+            's3://KEY:SECRET@s3.example.com/bucket/image-123')]
+        store_utils.update_store_in_locations(
+            self.context, self.image, self.image_repo)
+        self.assertEqual('s3://s3.example.com/bucket/image-123',
+                         self.image.locations[0]['url'])
+        self.image_repo.save.assert_called_once_with(self.image)
+
+    @mock.patch('glance.common.store_utils._get_store_id_from_uri')
+    @mock.patch('glance.common.store_utils.CONF')
+    def test_update_store_s3_clean_url_no_save(self, mock_conf,
+                                               mock_get_store):
+        """No save is triggered when the S3 URL is already credential-free."""
+        mock_conf.enabled_backends = None
+        mock_get_store.return_value = None
+        self.image.locations = [self._make_loc(
+            's3://s3.example.com/bucket/image-123')]
+        store_utils.update_store_in_locations(
+            self.context, self.image, self.image_repo)
+        self.image_repo.save.assert_not_called()
+
+    @mock.patch('glance.common.store_utils._get_store_id_from_uri')
+    @mock.patch('glance.common.store_utils.CONF')
+    def test_update_store_non_s3_location_unaffected_by_s3_strip(
+            self, mock_conf, mock_get_store):
+        """Non-S3 locations are not touched by the S3 credential-strip path."""
+        mock_conf.enabled_backends = None
+        mock_get_store.return_value = None
+        self.image.locations = [
+            self._make_loc('s3://KEY:SECRET@s3.example.com/bucket/img'),
+            self._make_loc('rbd://pool/images/image-id'),
+        ]
+        store_utils.update_store_in_locations(
+            self.context, self.image, self.image_repo)
+        self.assertEqual('s3://s3.example.com/bucket/img',
+                         self.image.locations[0]['url'])
+        self.assertEqual('rbd://pool/images/image-id',
+                         self.image.locations[1]['url'])
+        self.image_repo.save.assert_called_once_with(self.image)
+
+    @mock.patch('glance.common.store_utils._get_store_id_from_uri')
+    @mock.patch('glance.common.store_utils.CONF')
+    def test_update_store_s3_multiple_legacy_locations(self, mock_conf,
+                                                       mock_get_store):
+        """Multiple legacy S3 locations are all migrated, save called once."""
+        mock_conf.enabled_backends = None
+        mock_get_store.return_value = None
+        self.image.locations = [
+            self._make_loc('s3://K1:S1@host.com/bucket/img1'),
+            self._make_loc('s3://K2:S2@host.com/bucket/img2'),
+        ]
+        store_utils.update_store_in_locations(
+            self.context, self.image, self.image_repo)
+        self.assertEqual('s3://host.com/bucket/img1',
+                         self.image.locations[0]['url'])
+        self.assertEqual('s3://host.com/bucket/img2',
+                         self.image.locations[1]['url'])
+        self.image_repo.save.assert_called_once_with(self.image)
+
+    @mock.patch('glance.common.store_utils._get_store_id_from_uri')
+    @mock.patch('glance.common.store_utils.CONF')
+    def test_update_store_migrates_s3_before_store_lookup(
+            self, mock_conf, mock_get_store):
+        """S3 credentials are stripped before store metadata lookup."""
+        mock_conf.enabled_backends = {'s3-store': 's3'}
+        original_url = 's3://KEY:SECRET@s3.example.com/bucket/image-123'
+        cleaned_url = 's3://s3.example.com/bucket/image-123'
+        self.image.locations = [self._make_loc(original_url)]
+
+        def assert_url_already_cleaned(uri):
+            self.assertEqual(cleaned_url, uri)
+            return 's3-store'
+
+        mock_get_store.side_effect = assert_url_already_cleaned
+        store_utils.update_store_in_locations(
+            self.context, self.image, self.image_repo)
+        self.assertEqual(cleaned_url,
+                         self.image.locations[0]['url'])
+        mock_get_store.assert_called_once_with(cleaned_url)
+        self.assertEqual('s3-store',
+                         self.image.locations[0]['metadata']['store'])
+        self.image_repo.save.assert_called_once_with(self.image)
+
+
+class TestRetryOnDbLock(test_utils.BaseTestCase):
+
+    def _sqlalchemy_lock_error(self):
+        return sqlalchemy_exc.OperationalError(
+            'statement', {},
+            sqlite3.OperationalError('database is locked'))
+
+    def test_retry_on_db_lock_succeeds_after_lock(self):
+        calls = {'count': 0}
+
+        def func():
+            calls['count'] += 1
+            if calls['count'] == 1:
+                raise sqlite3.OperationalError('database is locked')
+            return 'ok'
+
+        self.assertEqual('ok', utils.retry_on_db_lock(func, timeout=1.0))
+        self.assertEqual(2, calls['count'])
+
+    def test_retry_on_db_lock_succeeds_after_sqlalchemy_lock(self):
+        calls = {'count': 0}
+
+        def func():
+            calls['count'] += 1
+            if calls['count'] == 1:
+                raise self._sqlalchemy_lock_error()
+            return 'ok'
+
+        self.assertEqual('ok', utils.retry_on_db_lock(func, timeout=1.0))
+        self.assertEqual(2, calls['count'])
+
+    def test_retry_on_db_lock_reraises_other_errors(self):
+        def func():
+            raise ValueError('bad value')
+
+        self.assertRaises(ValueError, utils.retry_on_db_lock, func)
+
+    def test_retry_on_db_lock_reraises_other_sqlalchemy_errors(self):
+        def func():
+            raise sqlalchemy_exc.OperationalError(
+                'statement', {},
+                sqlite3.OperationalError('no such table: missing'))
+
+        self.assertRaises(sqlalchemy_exc.OperationalError,
+                          utils.retry_on_db_lock, func)
+
+
+class SingleStoreS3MigrationTestCase(test_utils.BaseTestCase):
+    """Tests for single-store S3 credential stripping in glance.location."""
+
+    def setUp(self):
+        super(SingleStoreS3MigrationTestCase, self).setUp()
+        self.image_repo = mock.Mock()
+
+    def _make_image(self, url):
+        image = mock.Mock()
+        image.locations = [{'url': url, 'metadata': {}}]
+        return image
+
+    def test_update_s3_locations_for_single_store_strips_credentials(self):
+        """Legacy S3 URL is rewritten to credential-free form."""
+        image = self._make_image(
+            's3://KEY:SECRET@s3.example.com/bucket/image-123')
+        glance.location._update_s3_locations_for_single_store(
+            image, self.image_repo)
+        self.assertEqual('s3://s3.example.com/bucket/image-123',
+                         image.locations[0]['url'])
+        self.image_repo.save.assert_called_once_with(image)
+
+    def test_update_s3_locations_for_single_store_clean_url_no_save(self):
+        """Credential-free S3 URL is unchanged and image is not saved."""
+        original = 's3://s3.example.com/bucket/image-123'
+        image = self._make_image(original)
+        glance.location._update_s3_locations_for_single_store(
+            image, self.image_repo)
+        self.assertEqual(original, image.locations[0]['url'])
+        self.image_repo.save.assert_not_called()
+
+    def test_update_s3_locations_for_single_store_non_s3_untouched(self):
+        """Non-S3 locations remain unchanged in single-store migration."""
+        image = mock.Mock()
+        image.locations = [
+            {'url': 'rbd://pool/images/image-id', 'metadata': {}},
+            {'url': 's3://KEY:SECRET@host.com/bucket/img', 'metadata': {}},
+        ]
+        glance.location._update_s3_locations_for_single_store(
+            image, self.image_repo)
+        self.assertEqual('rbd://pool/images/image-id',
+                         image.locations[0]['url'])
+        self.assertEqual('s3://host.com/bucket/img',
+                         image.locations[1]['url'])
+        self.image_repo.save.assert_called_once_with(image)
+
+
+class ImageRepoProxyS3MigrationTestCase(test_utils.BaseTestCase):
+    """Tests for ImageRepoProxy.get S3 migration dispatch."""
+
+    class _ImageStub(object):
+        def __init__(self, locations=None, image_id='test-image-id'):
+            self.locations = locations or []
+            self.image_id = image_id
+
+    class _ImageRepoStub(object):
+        def __init__(self, image):
+            self._image = image
+            self.save = mock.Mock()
+
+        def get(self, image_id):
+            return self._image
+
+    def setUp(self):
+        super(ImageRepoProxyS3MigrationTestCase, self).setUp()
+        self.context = mock.Mock()
+        self.store_api = mock.Mock()
+        self.image_stub = self._ImageStub()
+        self.image_repo_stub = self._ImageRepoStub(self.image_stub)
+        self.proxy = glance.location.ImageRepoProxy(
+            self.image_repo_stub, self.context,
+            self.store_api, store_utils)
+
+    @mock.patch('glance.location.CONF')
+    @mock.patch('glance.location.store_utils.update_store_in_locations')
+    def test_get_multistore_calls_update_store_in_locations(
+            self, mock_update, mock_conf):
+        """Multistore GET migrates locations via store_utils."""
+        mock_conf.enabled_backends = {'s3-store': 's3'}
+        result = self.proxy.get('test-image-id')
+        mock_update.assert_called_once_with(
+            self.context, result, self.image_repo_stub)
+        self.assertIsInstance(result, glance.location.ImageProxy)
+        self.assertIs(self.image_stub, result.image)
+
+    @mock.patch('glance.location.CONF')
+    @mock.patch('glance.location.store_utils.update_store_in_locations')
+    def test_get_multistore_swallows_forbidden(self, mock_update, mock_conf):
+        """Forbidden during store update does not fail the GET."""
+        mock_conf.enabled_backends = {'s3-store': 's3'}
+        mock_update.side_effect = exception.Forbidden
+        result = self.proxy.get('test-image-id')
+        self.assertIsInstance(result, glance.location.ImageProxy)
+        self.assertIs(self.image_stub, result.image)
+
+    @mock.patch('glance.location.CONF')
+    @mock.patch('glance.location._update_s3_locations_for_single_store')
+    def test_get_single_store_calls_single_store_helper(
+            self, mock_single_update, mock_conf):
+        """Single-store GET uses the single-store S3 migration path."""
+        mock_conf.enabled_backends = None
+        result = self.proxy.get('test-image-id')
+        mock_single_update.assert_called_once_with(
+            result, self.image_repo_stub)
+        self.assertIsInstance(result, glance.location.ImageProxy)
+
+    @mock.patch('glance.location.CONF')
+    def test_get_single_store_migrates_legacy_s3_url(self, mock_conf):
+        """Single-store GET strips credentials from legacy S3 locations."""
+        mock_conf.enabled_backends = None
+        self.image_stub.locations = [{
+            'url': 's3://KEY:SECRET@host.com/bucket/img',
+            'metadata': {},
+        }]
+        self.proxy.get('test-image-id')
+        self.assertEqual('s3://host.com/bucket/img',
+                         self.image_stub.locations[0]['url'])
+        self.image_repo_stub.save.assert_called_once()
+        saved_image = self.image_repo_stub.save.call_args[0][0]
+        self.assertIsInstance(saved_image, glance.location.ImageProxy)
+        self.assertIs(self.image_stub, saved_image.image)

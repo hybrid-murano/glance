@@ -22,15 +22,15 @@ When subsequent requests for the same image file are received,
 the local cached copy of the image file is returned.
 """
 
+import http.client as http
 import re
-import six
 
 from oslo_log import log as logging
 import webob
 
 from glance.api.common import size_checked_iter
 from glance.api import policy
-from glance.api.v1 import images
+from glance.api.v2 import policy as api_policy
 from glance.common import exception
 from glance.common import utils
 from glance.common import wsgi
@@ -38,7 +38,6 @@ import glance.db
 from glance.i18n import _LE, _LI
 from glance import image_cache
 from glance import notifier
-import glance.registry.client.v1.api as registry
 
 LOG = logging.getLogger(__name__)
 
@@ -54,7 +53,6 @@ class CacheFilter(wsgi.Middleware):
 
     def __init__(self, app):
         self.cache = image_cache.ImageCache()
-        self.serializer = images.ImageSerializer()
         self.policy = policy.Enforcer()
         LOG.info(_LI("Initialized image cache middleware"))
         super(CacheFilter, self).__init__(app)
@@ -71,7 +69,12 @@ class CacheFilter(wsgi.Middleware):
         if not image_meta['size']:
             # override image size metadata with the actual cached
             # file size, see LP Bug #900959
-            image_meta['size'] = self.cache.get_image_size(image_meta['id'])
+            if not isinstance(image_meta, policy.ImageTarget):
+                image_meta['size'] = self.cache.get_image_size(
+                    image_meta['id'])
+            else:
+                image_meta.target.size = self.cache.get_image_size(
+                    image_meta['id'])
 
     @staticmethod
     def _match_request(request):
@@ -92,28 +95,11 @@ class CacheFilter(wsgi.Middleware):
             if image_id != 'detail':
                 return (version, method, image_id)
 
-    def _enforce(self, req, action, target=None):
+    def _enforce(self, req, image):
         """Authorize an action against our policies"""
-        if target is None:
-            target = {}
-        try:
-            self.policy.enforce(req.context, action, target)
-        except exception.Forbidden as e:
-            LOG.debug("User not permitted to perform '%s' action", action)
-            raise webob.exc.HTTPForbidden(explanation=e.msg, request=req)
-
-    def _get_v1_image_metadata(self, request, image_id):
-        """
-        Retrieves image metadata using registry for v1 api and creates
-        dictionary-like mash-up of image core and custom properties.
-        """
-        try:
-            image_metadata = registry.get_image_metadata(request.context,
-                                                         image_id)
-            return utils.create_mashup_dict(image_metadata)
-        except exception.NotFound as e:
-            LOG.debug("No metadata found for image '%s'", image_id)
-            raise webob.exc.HTTPNotFound(explanation=e.msg, request=request)
+        api_pol = api_policy.ImageAPIPolicy(req.context, image,
+                                            self.policy)
+        api_pol.download_image()
 
     def _get_v2_image_metadata(self, request, image_id):
         """
@@ -128,7 +114,7 @@ class CacheFilter(wsgi.Middleware):
             # _process_v2_request call.
             request.environ['api.cache.image'] = image
 
-            return policy.ImageTarget(image)
+            return (image, policy.ImageTarget(image))
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg, request=request)
 
@@ -148,29 +134,38 @@ class CacheFilter(wsgi.Middleware):
 
         self._stash_request_info(request, image_id, method, version)
 
+        # Partial image download requests shall not be served from cache
+        # Bug: 1664709
+        # TODO(dharinic): If an image is already cached, add support to serve
+        # only the requested bytes (partial image download) from the cache.
+        if (request.headers.get('Content-Range') or
+                request.headers.get('Range')):
+            return None
+
         if request.method != 'GET' or not self.cache.is_cached(image_id):
             return None
+
         method = getattr(self, '_get_%s_image_metadata' % version)
-        image_metadata = method(request, image_id)
+        image, metadata = method(request, image_id)
 
         # Deactivated images shall not be served from cache
-        if image_metadata['status'] == 'deactivated':
+        if metadata['status'] == 'deactivated':
             return None
 
-        try:
-            self._enforce(request, 'download_image', target=image_metadata)
-        except exception.Forbidden:
-            return None
+        # NOTE(abhishekk): This means image is present in cache and before
+        # request is coming to API we are enforcing this check in the
+        # middleware
+        self._enforce(request, image)
 
         LOG.debug("Cache hit for image '%s'", image_id)
         image_iterator = self.get_from_cache(image_id)
         method = getattr(self, '_process_%s_request' % version)
 
         try:
-            return method(request, image_id, image_iterator, image_metadata)
+            return method(request, image_id, image_iterator, metadata)
         except exception.ImageNotFound:
             msg = _LE("Image cache contained image file for image '%s', "
-                      "however the registry did not contain metadata for "
+                      "however the database did not contain metadata for "
                       "that image!") % image_id
             LOG.error(msg)
             self.cache.delete_cached_image(image_id)
@@ -199,21 +194,6 @@ class CacheFilter(wsgi.Middleware):
         else:
             return (image_id, method, version)
 
-    def _process_v1_request(self, request, image_id, image_iterator,
-                            image_meta):
-        # Don't display location
-        if 'location' in image_meta:
-            del image_meta['location']
-        image_meta.pop('location_data', None)
-        self._verify_metadata(image_meta)
-
-        response = webob.Response(request=request)
-        raw_response = {
-            'image_iterator': image_iterator,
-            'image_meta': image_meta,
-        }
-        return self.serializer.show(response, raw_response)
-
     def _process_v2_request(self, request, image_id, image_iterator,
                             image_meta):
         # We do some contortions to get the image_metadata so
@@ -238,8 +218,8 @@ class CacheFilter(wsgi.Middleware):
         # content-length got by the method "download" because of this issue:
         # https://github.com/Pylons/webob/issues/86
         response.headers['Content-Type'] = 'application/octet-stream'
-        response.headers['Content-MD5'] = (image.checksum.encode('utf-8')
-                                           if six.PY2 else image.checksum)
+        if image.checksum:
+            response.headers['Content-MD5'] = image.checksum
         response.headers['Content-Length'] = str(image.size)
         return response
 
@@ -253,13 +233,17 @@ class CacheFilter(wsgi.Middleware):
         if not 200 <= status_code < 300:
             return resp
 
+        # Note(dharinic): Bug: 1664709: Do not cache partial images.
+        if status_code == http.PARTIAL_CONTENT:
+            return resp
+
         try:
             (image_id, method, version) = self._fetch_request_info(
                 resp.request)
         except TypeError:
             return resp
 
-        if method == 'GET' and status_code == 204:
+        if method == 'GET' and status_code == http.NO_CONTENT:
             # Bugfix:1251055 - Don't cache non-existent image files.
             # NOTE: Both GET for an image without locations and DELETE return
             # 204 but DELETE should be processed.
@@ -269,7 +253,7 @@ class CacheFilter(wsgi.Middleware):
         try:
             process_response_method = getattr(self, method_str)
         except AttributeError:
-            LOG.error(_LE('could not find %s') % method_str)
+            LOG.error(_LE('could not find %s'), method_str)
             # Nothing to do here, move along
             return resp
         else:
@@ -291,16 +275,20 @@ class CacheFilter(wsgi.Middleware):
             LOG.error(_LE("Checksum header is missing."))
 
         # fetch image_meta on the basis of version
-        image_metadata = None
+        image = None
         if version:
             method = getattr(self, '_get_%s_image_metadata' % version)
-            image_metadata = method(resp.request, image_id)
-        # NOTE(zhiyan): image_cache return a generator object and set to
-        # response.app_iter, it will be called by eventlet.wsgi later.
-        # So we need enforce policy firstly but do it by application
-        # since eventlet.wsgi could not catch webob.exc.HTTPForbidden and
-        # return 403 error to client then.
-        self._enforce(resp.request, 'download_image', target=image_metadata)
+            image, metadata = method(resp.request, image_id)
+        # NOTE(zhiyan): image_cache returns a generator set on
+        # response.app_iter, which the WSGI server iterates when sending
+        # the response body. Enforce policy here in application code because
+        # exceptions raised while iterating app_iter may not be converted to
+        # HTTP error responses.
+        # FIXME(abhishekk): This policy check here is not necessary as this
+        # will hit only during first image download i.e. while image is not
+        # present in cache. We already enforced same check in API layer and
+        # enforcing same check here again makes no sense.
+        self._enforce(resp.request, image)
 
         resp.app_iter = self.cache.get_caching_iter(image_id, image_checksum,
                                                     resp.app_iter)

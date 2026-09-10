@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # Copyright 2010-2011 OpenStack Foundation
 # Copyright 2014 IBM Corp.
 # All Rights Reserved.
@@ -16,20 +17,13 @@
 
 import datetime
 import gettext
-import os
-import socket
+import http.client as http
+from unittest import mock
 
-from babel import localedata
-import eventlet.patcher
-import fixtures
-import mock
-from oslo_concurrency import processutils
 from oslo_serialization import jsonutils
 import routes
-import six
 import webob
 
-from glance.api.v1 import router as router_v1
 from glance.api.v2 import router as router_v2
 from glance.common import exception
 from glance.common import utils
@@ -44,12 +38,6 @@ class RequestTest(test_utils.BaseTestCase):
         if all_locales is None:
             all_locales = []
 
-        # Override localedata.locale_identifiers to return some locales.
-        def returns_some_locales(*args, **kwargs):
-            return all_locales
-
-        self.stubs.Set(localedata, 'locale_identifiers', returns_some_locales)
-
         # Override gettext.find to return other than None for some languages.
         def fake_gettext_find(lang_id, *args, **kwargs):
             found_ret = '/glance/%s/LC_MESSAGES/glance.mo' % lang_id
@@ -61,12 +49,12 @@ class RequestTest(test_utils.BaseTestCase):
                 return found_ret
             return None
 
-        self.stubs.Set(gettext, 'find', fake_gettext_find)
+        self.mock_object(gettext, 'find', fake_gettext_find)
 
     def test_content_range(self):
         request = wsgi.Request.blank('/tests/123')
         request.headers["Content-Range"] = 'bytes 10-99/*'
-        range_ = request.get_content_range()
+        range_ = request.get_range_from_request(120)
         self.assertEqual(10, range_.start)
         self.assertEqual(100, range_.stop)  # non-inclusive
         self.assertIsNone(range_.length)
@@ -74,8 +62,21 @@ class RequestTest(test_utils.BaseTestCase):
     def test_content_range_invalid(self):
         request = wsgi.Request.blank('/tests/123')
         request.headers["Content-Range"] = 'bytes=0-99'
-        self.assertRaises(webob.exc.HTTPBadRequest,
-                          request.get_content_range)
+        self.assertRaises(webob.exc.HTTPRequestRangeNotSatisfiable,
+                          request.get_range_from_request, 120)
+
+    def test_range(self):
+        request = wsgi.Request.blank('/tests/123')
+        request.headers["Range"] = 'bytes=10-99'
+        range_ = request.get_range_from_request(120)
+        self.assertEqual(10, range_.start)
+        self.assertEqual(100, range_.end)  # non-inclusive
+
+    def test_range_invalid(self):
+        request = wsgi.Request.blank('/tests/123')
+        request.headers["Range"] = 'bytes=150-'
+        self.assertRaises(webob.exc.HTTPRequestRangeNotSatisfiable,
+                          request.get_range_from_request, 120)
 
     def test_content_type_missing(self):
         request = wsgi.Request.blank('/tests/123')
@@ -93,6 +94,17 @@ class RequestTest(test_utils.BaseTestCase):
         request.headers["Content-Type"] = "application/json; charset=UTF-8"
         result = request.get_content_type(('application/json',))
         self.assertEqual("application/json", result)
+
+    def test_params(self):
+        expected = webob.multidict.NestedMultiDict({
+            'limit': '20', 'name': 'Привет', 'sort_key': 'name',
+            'sort_dir': 'asc'})
+
+        request = wsgi.Request.blank("/?limit=20&name=%D0%9F%D1%80%D0%B8"
+                                     "%D0%B2%D0%B5%D1%82&sort_key=name"
+                                     "&sort_dir=asc")
+        actual = request.params
+        self.assertEqual(expected, actual)
 
     def test_content_type_from_accept_xml(self):
         request = wsgi.Request.blank('/tests/123')
@@ -149,19 +161,23 @@ class RequestTest(test_utils.BaseTestCase):
         # best_match_language() returns None.
         self._set_expected_languages(all_locales=['it'])
 
-        req = wsgi.Request.blank('/', headers={'Accept-Language': 'zh'})
+        req = wsgi.Request.blank('/', headers={'Accept-Language': 'unknown'})
         self.assertIsNone(req.best_match_language())
 
-    @mock.patch.object(webob.acceptparse.AcceptLanguage, 'best_match')
-    def test_best_match_language_unknown(self, mock_best_match):
-        # Test that we are actually invoking language negotiation by webop
+    @mock.patch.object(webob.acceptparse.AcceptLanguageValidHeader, 'lookup')
+    def test_best_match_language_unknown(self, mock_lookup):
+        # Test that we are actually invoking language negotiation by WebOb
         request = wsgi.Request.blank('/')
         accepted = 'unknown-lang'
         request.headers = {'Accept-Language': accepted}
 
-        mock_best_match.return_value = None
+        # Bug #1765748: see comment in code in the function under test
+        # to understand why this is the correct return value for the
+        # webob 1.8.x mock
+        mock_lookup.return_value = 'fake_LANG'
 
         self.assertIsNone(request.best_match_language())
+        mock_lookup.assert_called_once()
 
         # If Accept-Language is missing or empty, match should be None
         request.headers = {'Accept-Language': ''}
@@ -171,24 +187,6 @@ class RequestTest(test_utils.BaseTestCase):
 
     def test_http_error_response_codes(self):
         sample_id, member_id, tag_val, task_id = 'abc', '123', '1', '2'
-
-        """Makes sure v1 unallowed methods return 405"""
-        unallowed_methods = [
-            ('/images', ['PUT', 'DELETE', 'HEAD', 'PATCH']),
-            ('/images/detail', ['POST', 'PUT', 'DELETE', 'PATCH']),
-            ('/images/%s' % sample_id, ['POST', 'PATCH']),
-            ('/images/%s/members' % sample_id,
-                ['POST', 'DELETE', 'HEAD', 'PATCH']),
-            ('/images/%s/members/%s' % (sample_id, member_id),
-                ['POST', 'HEAD', 'PATCH']),
-        ]
-        api = test_utils.FakeAuthMiddleware(router_v1.API(routes.Mapper()))
-        for uri, methods in unallowed_methods:
-            for method in methods:
-                req = webob.Request.blank(uri)
-                req.method = method
-                res = req.get_response(api)
-                self.assertEqual(405, res.status_int)
 
         """Makes sure v2 unallowed methods return 405"""
         unallowed_methods = [
@@ -217,13 +215,13 @@ class RequestTest(test_utils.BaseTestCase):
                 req = webob.Request.blank(uri)
                 req.method = method
                 res = req.get_response(api)
-                self.assertEqual(405, res.status_int)
+                self.assertEqual(http.METHOD_NOT_ALLOWED, res.status_int)
 
         # Makes sure not implemented methods return 405
         req = webob.Request.blank('/schemas/image')
         req.method = 'NonexistentMethod'
         res = req.get_response(api)
-        self.assertEqual(405, res.status_int)
+        self.assertEqual(http.METHOD_NOT_ALLOWED, res.status_int)
 
 
 class ResourceTest(test_utils.BaseTestCase):
@@ -297,6 +295,19 @@ class ResourceTest(test_utils.BaseTestCase):
         self.assertRaises(AttributeError, resource.dispatch, Controller(),
                           'index', 'on', pants='off')
 
+    def test_dispatch_raises_bad_request(self):
+        class FakeController(object):
+            def index(self, shirt, pants=None):
+                return (shirt, pants)
+        resource = wsgi.Resource(FakeController(), None, None)
+
+        def dispatch(self, obj, action, *args, **kwargs):
+            raise exception.InvalidPropertyProtectionConfiguration()
+        self.mock_object(wsgi.Resource, 'dispatch', dispatch)
+        request = wsgi.Request.blank('/')
+        self.assertRaises(webob.exc.HTTPBadRequest, resource.__call__,
+                          request)
+
     def test_call(self):
         class FakeController(object):
             def index(self, shirt, pants=None):
@@ -310,14 +321,14 @@ class ResourceTest(test_utils.BaseTestCase):
             if isinstance(obj, wsgi.JSONResponseSerializer):
                 raise webob.exc.HTTPForbidden()
 
-        self.stubs.Set(wsgi.Resource, 'dispatch', dispatch)
+        self.mock_object(wsgi.Resource, 'dispatch', dispatch)
 
         request = wsgi.Request.blank('/')
 
         response = resource.__call__(request)
 
         self.assertIsInstance(response, webob.exc.HTTPForbidden)
-        self.assertEqual(403, response.status_code)
+        self.assertEqual(http.FORBIDDEN, response.status_code)
 
     def test_call_raises_exception(self):
         class FakeController(object):
@@ -329,14 +340,14 @@ class ResourceTest(test_utils.BaseTestCase):
         def dispatch(self, obj, action, *args, **kwargs):
             raise Exception("test exception")
 
-        self.stubs.Set(wsgi.Resource, 'dispatch', dispatch)
+        self.mock_object(wsgi.Resource, 'dispatch', dispatch)
 
         request = wsgi.Request.blank('/')
 
         response = resource.__call__(request)
 
         self.assertIsInstance(response, webob.exc.HTTPInternalServerError)
-        self.assertEqual(500, response.status_code)
+        self.assertEqual(http.INTERNAL_SERVER_ERROR, response.status_code)
 
     @mock.patch.object(wsgi, 'translate_exception')
     def test_resource_call_error_handle_localized(self,
@@ -360,12 +371,11 @@ class ResourceTest(test_utils.BaseTestCase):
                               resource, request)
         self.assertEqual(message_es, str(e))
 
-    @mock.patch.object(webob.acceptparse.AcceptLanguage, 'best_match')
+    @mock.patch.object(webob.acceptparse.AcceptLanguageValidHeader, 'lookup')
     @mock.patch.object(i18n, 'translate')
-    def test_translate_exception(self, mock_translate, mock_best_match):
-
+    def test_translate_exception(self, mock_translate, mock_lookup):
         mock_translate.return_value = 'No Encontrado'
-        mock_best_match.return_value = 'de'
+        mock_lookup.return_value = 'de'
 
         req = wsgi.Request.blank('/tests/123')
         req.headers["Accept-Language"] = "de"
@@ -376,9 +386,9 @@ class ResourceTest(test_utils.BaseTestCase):
 
     def test_response_headers_encoded(self):
         # prepare environment
-        for_openstack_comrades =  \
-            u'\u0417\u0430 \u043e\u043f\u0435\u043d\u0441\u0442\u0435\u043a, ' \
-            u'\u0442\u043e\u0432\u0430\u0440\u0438\u0449\u0438'
+        for_openstack_comrades = (
+            '\u0417\u0430 \u043e\u043f\u0435\u043d\u0441\u0442\u0435\u043a, '
+            '\u0442\u043e\u0432\u0430\u0440\u0438\u0449\u0438')
 
         class FakeController(object):
             def index(self, shirt, pants=None):
@@ -396,8 +406,7 @@ class ResourceTest(test_utils.BaseTestCase):
         response = resource.__call__(request)
 
         # ensure it has been encoded correctly
-        value = (response.headers['unicode_test'].decode('utf-8')
-                 if six.PY2 else response.headers['unicode_test'])
+        value = response.headers['unicode_test']
         self.assertEqual(for_openstack_comrades, value)
 
 
@@ -433,7 +442,7 @@ class JSONResponseSerializerTest(test_utils.BaseTestCase):
         fixture = {"key": "value"}
         response = webob.Response()
         wsgi.JSONResponseSerializer().default(response, fixture)
-        self.assertEqual(200, response.status_int)
+        self.assertEqual(http.OK, response.status_int)
         content_types = [h for h in response.headerlist
                          if h[0] == 'Content-Type']
         self.assertEqual(1, len(content_types))
@@ -505,75 +514,37 @@ class JSONRequestDeserializerTest(test_utils.BaseTestCase):
         self.assertFalse(self._check_transfer_encoding(
                          transfer_encoding='invalid', content_length=0))
 
+    def test_has_body_invalid_transfer_encoding_no_content_len_and_body(self):
+        self.assertFalse(self._check_transfer_encoding(
+                         transfer_encoding='invalid', include_body=False))
+
+    def test_has_body_invalid_transfer_encoding_no_content_len_but_body(self):
+        self.assertTrue(self._check_transfer_encoding(
+                        transfer_encoding='invalid', include_body=True))
+
     def test_has_body_invalid_transfer_encoding_with_content_length(self):
         self.assertTrue(self._check_transfer_encoding(
                         transfer_encoding='invalid', content_length=5))
 
     def test_has_body_valid_transfer_encoding_with_content_length(self):
         self.assertTrue(self._check_transfer_encoding(
-                        transfer_encoding='chunked', content_length=0))
+                        transfer_encoding='chunked', content_length=1))
+
+    def test_has_body_valid_transfer_encoding_without_content_length(self):
+        self.assertTrue(self._check_transfer_encoding(
+                        transfer_encoding='chunked'))
 
     def _check_transfer_encoding(self, transfer_encoding=None,
-                                 content_length=None):
+                                 content_length=None, include_body=True):
         request = wsgi.Request.blank('/')
         request.method = 'POST'
-        request.body = b'fake_body'
+        if include_body:
+            request.body = b'fake_body'
         request.headers['transfer-encoding'] = transfer_encoding
         if content_length is not None:
             request.headers['content-length'] = content_length
 
         return wsgi.JSONRequestDeserializer().has_body(request)
-
-    def test_get_bind_addr_default_value(self):
-        expected = ('0.0.0.0', '123456')
-        actual = wsgi.get_bind_addr(default_port="123456")
-        self.assertEqual(expected, actual)
-
-
-class ServerTest(test_utils.BaseTestCase):
-    def test_create_pool(self):
-        """Ensure the wsgi thread pool is an eventlet.greenpool.GreenPool."""
-        actual = wsgi.Server(threads=1).create_pool()
-        self.assertIsInstance(actual, eventlet.greenpool.GreenPool)
-
-    @mock.patch.object(wsgi.Server, 'configure_socket')
-    def test_http_keepalive(self, mock_configure_socket):
-        self.config(http_keepalive=False)
-        self.config(workers=0)
-
-        server = wsgi.Server(threads=1)
-        server.sock = 'fake_socket'
-        # mocking eventlet.wsgi server method to check it is called with
-        # configured 'http_keepalive' value.
-        with mock.patch.object(eventlet.wsgi,
-                               'server') as mock_server:
-            fake_application = "fake-application"
-            server.start(fake_application, 0)
-            server.wait()
-            mock_server.assert_called_once_with('fake_socket',
-                                                fake_application,
-                                                log=server._logger,
-                                                debug=False,
-                                                custom_pool=server.pool,
-                                                keepalive=False,
-                                                socket_timeout=900)
-
-    def test_number_of_workers(self):
-        """Ensure the default number of workers matches num cpus."""
-        def pid():
-            i = 1
-            while True:
-                i = i + 1
-                yield i
-
-        with mock.patch.object(os, 'fork') as mock_fork:
-            mock_fork.side_effect = pid
-            server = wsgi.Server()
-            server.configure = mock.Mock()
-            fake_application = "fake-application"
-            server.start(fake_application, None)
-            self.assertEqual(processutils.get_worker_count(),
-                             len(server.children))
 
 
 class TestHelpers(test_utils.BaseTestCase):
@@ -593,15 +564,14 @@ class TestHelpers(test_utils.BaseTestCase):
                    'location': "file:///tmp/glance-tests/2",
                    'properties': {'distro': 'Ubuntu 10.04 LTS'}}
         headers = utils.image_meta_to_http_headers(fixture)
-        for k, v in six.iteritems(headers):
-            self.assertIsInstance(v, six.text_type)
+        for k, v in headers.items():
+            self.assertIsInstance(v, str)
 
     def test_data_passed_properly_through_headers(self):
         """
         Verifies that data is the same after being passed through headers
         """
-        fixture = {'name': 'fake public image',
-                   'is_public': True,
+        fixture = {'is_public': True,
                    'deleted': False,
                    'name': None,
                    'size': 19,
@@ -615,82 +585,128 @@ class TestHelpers(test_utils.BaseTestCase):
         response = FakeResponse()
         response.headers = headers
         result = utils.get_image_meta_from_headers(response)
-        for k, v in six.iteritems(fixture):
+        for k, v in fixture.items():
             if v is not None:
                 self.assertEqual(v, result[k])
             else:
                 self.assertNotIn(k, result)
 
 
-class GetSocketTestCase(test_utils.BaseTestCase):
+class Test_UwsgiChunkedFile(test_utils.BaseTestCase):
 
-    def setUp(self):
-        super(GetSocketTestCase, self).setUp()
-        self.useFixture(fixtures.MonkeyPatch(
-            "glance.common.wsgi.get_bind_addr",
-            lambda x: ('192.168.0.13', 1234)))
-        addr_info_list = [(2, 1, 6, '', ('192.168.0.13', 80)),
-                          (2, 2, 17, '', ('192.168.0.13', 80)),
-                          (2, 3, 0, '', ('192.168.0.13', 80))]
-        self.useFixture(fixtures.MonkeyPatch(
-            "glance.common.wsgi.socket.getaddrinfo",
-            lambda *x: addr_info_list))
-        self.useFixture(fixtures.MonkeyPatch(
-            "glance.common.wsgi.time.time",
-            mock.Mock(side_effect=[0, 1, 5, 10, 20, 35])))
-        self.useFixture(fixtures.MonkeyPatch(
-            "glance.common.wsgi.utils.validate_key_cert",
-            lambda *x: None))
-        wsgi.CONF.cert_file = '/etc/ssl/cert'
-        wsgi.CONF.key_file = '/etc/ssl/key'
-        wsgi.CONF.ca_file = '/etc/ssl/ca_cert'
-        wsgi.CONF.tcp_keepidle = 600
+    def _mock_uwsgi(self):
+        uwsgi_mod = mock.MagicMock()
+        patcher = mock.patch.object(wsgi, '_get_uwsgi', return_value=uwsgi_mod)
+        self.addCleanup(patcher.stop)
+        patcher.start()
+        return uwsgi_mod
 
-    def test_correct_configure_socket(self):
-        mock_socket = mock.Mock()
-        self.useFixture(fixtures.MonkeyPatch(
-            'glance.common.wsgi.ssl.wrap_socket',
-            mock_socket))
-        self.useFixture(fixtures.MonkeyPatch(
-            'glance.common.wsgi.eventlet.listen',
-            lambda *x, **y: mock_socket))
-        server = wsgi.Server()
-        server.default_port = 1234
-        server.configure_socket()
-        self.assertIn(mock.call.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_REUSEADDR,
-            1), mock_socket.mock_calls)
-        self.assertIn(mock.call.setsockopt(
-            socket.SOL_SOCKET,
-            socket.SO_KEEPALIVE,
-            1), mock_socket.mock_calls)
-        if hasattr(socket, 'TCP_KEEPIDLE'):
-            self.assertIn(mock.call().setsockopt(
-                socket.IPPROTO_TCP,
-                socket.TCP_KEEPIDLE,
-                wsgi.CONF.tcp_keepidle), mock_socket.mock_calls)
+    def test_read_no_data(self):
+        reader = wsgi._UWSGIChunkFile()
+        uwsgi_mod = self._mock_uwsgi()
 
-    def test_get_socket_without_all_ssl_reqs(self):
-        wsgi.CONF.key_file = None
-        self.assertRaises(RuntimeError, wsgi.get_socket, 1234)
+        def fake_read():
+            return None
 
-    def test_get_socket_with_bind_problems(self):
-        self.useFixture(fixtures.MonkeyPatch(
-            'glance.common.wsgi.eventlet.listen',
-            mock.Mock(side_effect=(
-                [wsgi.socket.error(socket.errno.EADDRINUSE)] * 3 + [None]))))
-        self.useFixture(fixtures.MonkeyPatch(
-            'glance.common.wsgi.ssl.wrap_socket',
-            lambda *x, **y: None))
+        uwsgi_mod.chunked_read = fake_read
+        out = reader.read()
+        self.assertEqual(out, b'')
 
-        self.assertRaises(RuntimeError, wsgi.get_socket, 1234)
+    def test_read_data_no_length(self):
+        reader = wsgi._UWSGIChunkFile()
+        uwsgi_mod = self._mock_uwsgi()
 
-    def test_get_socket_with_unexpected_socket_errno(self):
-        self.useFixture(fixtures.MonkeyPatch(
-            'glance.common.wsgi.eventlet.listen',
-            mock.Mock(side_effect=wsgi.socket.error(socket.errno.ENOMEM))))
-        self.useFixture(fixtures.MonkeyPatch(
-            'glance.common.wsgi.ssl.wrap_socket',
-            lambda *x, **y: None))
-        self.assertRaises(wsgi.socket.error, wsgi.get_socket, 1234)
+        values = iter([b'a', b'b', b'c', None])
+
+        def fake_read():
+            return next(values)
+
+        uwsgi_mod.chunked_read = fake_read
+        out = reader.read()
+        self.assertEqual(out, b'abc')
+
+    def test_read_zero_length(self):
+        reader = wsgi._UWSGIChunkFile()
+        self.assertEqual(b'', reader.read(length=0))
+
+    def test_read_data_length(self):
+        reader = wsgi._UWSGIChunkFile()
+        uwsgi_mod = self._mock_uwsgi()
+
+        values = iter([b'a', b'b', b'c', None])
+
+        def fake_read():
+            return next(values)
+
+        uwsgi_mod.chunked_read = fake_read
+        out = reader.read(length=2)
+        self.assertEqual(out, b'ab')
+
+    def test_read_data_negative_length(self):
+        reader = wsgi._UWSGIChunkFile()
+        uwsgi_mod = self._mock_uwsgi()
+
+        values = iter([b'a', b'b', b'c', None])
+
+        def fake_read():
+            return next(values)
+
+        uwsgi_mod.chunked_read = fake_read
+        out = reader.read(length=-2)
+        self.assertEqual(out, b'abc')
+
+    def test_read_data_length_with_overshoot(self):
+        reader = wsgi._UWSGIChunkFile()
+        uwsgi_mod = self._mock_uwsgi()
+
+        values_read_count = 0
+        values_read_count_prev = 0
+        values = iter([b'a', b'bcd', b'e', b'fg', b'h', None, None])
+
+        def fake_read():
+            nonlocal values_read_count
+            values_read_count += 1
+            return next(values)
+
+        def values_read_count_get():
+            nonlocal values_read_count_prev
+            res = values_read_count - values_read_count_prev
+            values_read_count_prev = values_read_count
+            return res
+
+        uwsgi_mod.chunked_read = fake_read
+        out = reader.read(length=2)
+
+        # empty buffer case
+        self.assertEqual(out, b'ab')
+        self.assertEqual(values_read_count_get(), 2)
+
+        # buffer contains more - no extra read
+        out = reader.read(length=1)
+        self.assertEqual(out, b'c')
+        self.assertEqual(values_read_count_get(), 0)
+
+        # buffer contains exactly what we need - no extra read
+        out = reader.read(length=1)
+        self.assertEqual(out, b'd')
+        self.assertEqual(values_read_count_get(), 0)
+
+        # buffer is empty + 1st read returns less - must read twice
+        out = reader.read(length=2)
+        self.assertEqual(out, b'ef')
+        self.assertEqual(values_read_count_get(), 2)
+
+        # buffer isn't empty, but not enough - must read
+        out = reader.read(length=2)
+        self.assertEqual(out, b'gh')
+        self.assertEqual(values_read_count_get(), 1)
+
+        # eof case
+        out = reader.read(length=2)
+        self.assertEqual(out, b'')
+        self.assertEqual(values_read_count_get(), 1)
+
+        # eof case when request till eof
+        out = reader.read(length=-2)
+        self.assertEqual(out, b'')
+        self.assertEqual(values_read_count_get(), 1)

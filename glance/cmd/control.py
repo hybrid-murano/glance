@@ -18,9 +18,6 @@ Helper script for starting/stopping/reloading Glance server programs.
 Thanks for some of the code, Swifties ;)
 """
 
-from __future__ import print_function
-from __future__ import with_statement
-
 import argparse
 import fcntl
 import os
@@ -41,8 +38,6 @@ if os.path.exists(os.path.join(possible_topdir, 'glance', '__init__.py')):
 
 from oslo_config import cfg
 from oslo_utils import units
-# NOTE(jokke): simplified transition to py3, behaves like py2 xrange
-from six.moves import range
 
 from glance.common import config
 from glance.i18n import _
@@ -51,10 +46,9 @@ CONF = cfg.CONF
 
 ALL_COMMANDS = ['start', 'status', 'stop', 'shutdown', 'restart',
                 'reload', 'force-reload']
-ALL_SERVERS = ['api', 'registry', 'scrubber']
-RELOAD_SERVERS = ['glance-api', 'glance-registry']
-GRACEFUL_SHUTDOWN_SERVERS = ['glance-api', 'glance-registry',
-                             'glance-scrubber']
+ALL_SERVERS = ['api', 'scrubber']
+RELOAD_SERVERS = ['glance-api']
+GRACEFUL_SHUTDOWN_SERVERS = ['glance-api', 'glance-scrubber']
 MAX_DESCRIPTORS = 32768
 MAX_MEMORY = 2 * units.Gi  # 2 GB
 USAGE = """%(prog)s [options] <SERVER> <COMMAND> [CONFPATH]
@@ -179,7 +173,6 @@ def do_start(verb, pid_file, server, args):
                 msg = (_('unable to launch %(serv)s. Got error: %(e)s') %
                        {'serv': server, 'e': e})
                 sys.exit(msg)
-            sys.exit(0)
         else:
             write_pid_file(pid_file, pid)
             await_child(pid, await_time)
@@ -246,7 +239,6 @@ def do_reload(pid_file, server):
         msg = (_('Reload of %(serv)s not supported') % {'serv': server})
         sys.exit(msg)
 
-    pid = None
     if os.path.exists(pid_file):
         with open(pid_file, 'r') as pidfile:
             pid = int(pidfile.read().strip())
@@ -316,8 +308,6 @@ def add_command_parsers(subparsers):
 
 
 def main():
-    global exitcode
-
     opts = [
         cfg.SubCommandOpt('server',
                           title='Server types',

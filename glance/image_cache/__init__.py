@@ -16,12 +16,10 @@
 """
 LRU Cache for Image Data
 """
-
 import hashlib
 
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import importutils
 from oslo_utils import units
@@ -33,18 +31,131 @@ from glance.i18n import _, _LE, _LI, _LW
 LOG = logging.getLogger(__name__)
 
 image_cache_opts = [
-    cfg.StrOpt('image_cache_driver', default='sqlite',
-               help=_('The driver to use for image cache management.')),
+    cfg.StrOpt('image_cache_driver', default='centralized_db',
+               choices=('centralized_db', 'sqlite', 'xattr'), ignore_case=True,
+               help=_("""
+The driver to use for image cache management.
+
+This configuration option provides the flexibility to choose between the
+different image-cache drivers available. An image-cache driver is responsible
+for providing the essential functions of image-cache like write images to/read
+images from cache, track age and usage of cached images, provide a list of
+cached images, fetch size of the cache, queue images for caching and clean up
+the cache, etc.
+
+The essential functions of a driver are defined in the base class
+``glance.image_cache.drivers.base.Driver``. All image-cache drivers (existing
+and prospective) must implement this interface. Currently available drivers
+are ``sqlite`` and ``xattr``. These drivers primarily differ in the way they
+store the information about cached images:
+
+* The ``centralized_db`` driver uses a central database (which will be common
+  for all glance nodes) to track the usage of cached images.
+* The ``sqlite`` (deprecated) driver uses a sqlite database (which sits on
+  every glance node locally) to track the usage of cached images.
+* The ``xattr`` driver uses the extended attributes of files to store this
+  information. It also requires a filesystem that sets ``atime`` on the files
+  when accessed.
+
+Deprecation warning:
+    * As centralized database will now be used for image cache management, the
+      use of `sqlite` database and driver will be dropped from 'E' (2025.1)
+      development cycle.
+
+Possible values:
+    * centralized_db
+    * sqlite
+    * xattr
+
+Related options:
+    * None
+
+""")),
+
     cfg.IntOpt('image_cache_max_size', default=10 * units.Gi,  # 10 GB
-               help=_('The upper limit (the maximum size of accumulated '
-                      'cache in bytes) beyond which the cache pruner, if '
-                      'running, starts cleaning the image cache.')),
+               min=0,
+               help=_("""
+The upper limit on cache size, in bytes, after which the cache-pruner cleans
+up the image cache.
+
+NOTE: This is just a threshold for cache-pruner to act upon. It is NOT a
+hard limit beyond which the image cache would never grow. In fact, depending
+on how often the cache-pruner runs and how quickly the cache fills, the image
+cache can far exceed the size specified here very easily. Hence, care must be
+taken to appropriately schedule the cache-pruner and in setting this limit.
+
+Glance caches an image when it is downloaded. Consequently, the size of the
+image cache grows over time as the number of downloads increases. To keep the
+cache size from becoming unmanageable, it is recommended to run the
+cache-pruner as a periodic task. When the cache pruner is kicked off, it
+compares the current size of image cache and triggers a cleanup if the image
+cache grew beyond the size specified here. After the cleanup, the size of
+cache is less than or equal to size specified here.
+
+Possible values:
+    * Any non-negative integer
+
+Related options:
+    * None
+
+""")),
+
     cfg.IntOpt('image_cache_stall_time', default=86400,  # 24 hours
-               help=_('The amount of time to let an incomplete image remain '
-                      'in the cache, before the cache cleaner, if running, '
-                      'will remove the incomplete image.')),
+               min=0,
+               help=_("""
+The amount of time, in seconds, an incomplete image remains in the cache.
+
+Incomplete images are images for which download is in progress. Please see the
+description of configuration option ``image_cache_dir`` for more detail.
+Sometimes, due to various reasons, it is possible the download may hang and
+the incompletely downloaded image remains in the ``incomplete`` directory.
+This configuration option sets a time limit on how long the incomplete images
+should remain in the ``incomplete`` directory before they are cleaned up.
+Once an incomplete image spends more time than is specified here, it'll be
+removed by cache-cleaner on its next run.
+
+It is recommended to run cache-cleaner as a periodic task on the Glance API
+nodes to keep the incomplete images from occupying disk space.
+
+Possible values:
+    * Any non-negative integer
+
+Related options:
+    * None
+
+""")),
+
     cfg.StrOpt('image_cache_dir',
-               help=_('Base directory that the image cache uses.')),
+               help=_("""
+Base directory for image cache.
+
+This is the location where image data is cached and served out of. All cached
+images are stored directly under this directory. This directory also contains
+three subdirectories, namely, ``incomplete``, ``invalid`` and ``queue``.
+
+The ``incomplete`` subdirectory is the staging area for downloading images. An
+image is first downloaded to this directory. When the image download is
+successful it is moved to the base directory. However, if the download fails,
+the partially downloaded image file is moved to the ``invalid`` subdirectory.
+
+The ``queue``subdirectory is used for queuing images for download. This is
+used primarily by the cache-prefetcher, which can be scheduled as a periodic
+task like cache-pruner and cache-cleaner, to cache images ahead of their usage.
+Upon receiving the request to cache an image, Glance touches a file in the
+``queue`` directory with the image id as the file name. The cache-prefetcher,
+when running, polls for the files in ``queue`` directory and starts
+downloading them in the order they were created. When the download is
+successful, the zero-sized file is deleted from the ``queue`` directory.
+If the download fails, the zero-sized file remains and it'll be retried the
+next time cache-prefetcher runs.
+
+Possible values:
+    * A valid path
+
+Related options:
+    * ``image_cache_sqlite_db``
+
+""")),
 ]
 
 CONF = cfg.CONF
@@ -68,11 +179,11 @@ class ImageCache(object):
             self.driver_class = importutils.import_class(driver_module)
             LOG.info(_LI("Image cache loaded driver '%s'."), driver_name)
         except ImportError as import_err:
-            LOG.warn(_LW("Image cache driver "
-                         "'%(driver_name)s' failed to load. "
-                         "Got error: '%(import_err)s."),
-                     {'driver_name': driver_name,
-                      'import_err': import_err})
+            LOG.warning(_LW("Image cache driver "
+                            "'%(driver_name)s' failed to load. "
+                            "Got error: '%(import_err)s."),
+                        {'driver_name': driver_name,
+                         'import_err': import_err})
 
             driver_module = __name__ + '.drivers.sqlite.Driver'
             LOG.info(_LI("Defaulting to SQLite driver."))
@@ -89,11 +200,11 @@ class ImageCache(object):
             self.driver.configure()
         except exception.BadDriverConfiguration as config_err:
             driver_module = self.driver_class.__module__
-            LOG.warn(_LW("Image cache driver "
-                         "'%(driver_module)s' failed to configure. "
-                         "Got error: '%(config_err)s"),
-                     {'driver_module': driver_module,
-                      'config_err': config_err})
+            LOG.warning(_LW("Image cache driver "
+                            "'%(driver_module)s' failed to configure. "
+                            "Got error: '%(config_err)s"),
+                        {'driver_module': driver_module,
+                         'config_err': config_err})
             LOG.info(_LI("Defaulting to SQLite driver."))
             default_module = __name__ + '.drivers.sqlite.Driver'
             self.driver_class = importutils.import_class(default_module)
@@ -136,6 +247,12 @@ class ImageCache(object):
         Returns a list of records about cached images.
         """
         return self.driver.get_cached_images()
+
+    def get_cached_nodes(self, image_id):
+        """
+        Returns a list of nodes where image is cached.
+        """
+        return self.driver.get_cached_nodes(image_id)
 
     def delete_all_cached_images(self):
         """
@@ -242,7 +359,7 @@ class ImageCache(object):
 
     def cache_tee_iter(self, image_id, image_iter, image_checksum):
         try:
-            current_checksum = hashlib.md5()
+            current_checksum = hashlib.md5(usedforsecurity=False)
 
             with self.driver.open_for_write(image_id) as cache_file:
                 for chunk in image_iter:
@@ -263,13 +380,13 @@ class ImageCache(object):
             with excutils.save_and_reraise_exception():
                 # image_iter has given us bad, (size_checked_iter has found a
                 # bad length), or corrupt data (checksum is wrong).
-                LOG.exception(encodeutils.exception_to_unicode(e))
+                LOG.exception(str(e))
         except Exception as e:
             LOG.exception(_LE("Exception encountered while tee'ing "
                               "image '%(image_id)s' into cache: %(error)s. "
-                              "Continuing with response.") %
+                              "Continuing with response."),
                           {'image_id': image_id,
-                           'error': encodeutils.exception_to_unicode(e)})
+                           'error': e})
 
             # If no checksum provided continue responding even if
             # caching failed.

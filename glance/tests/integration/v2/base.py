@@ -15,6 +15,7 @@
 
 import atexit
 import os.path
+import shutil
 import tempfile
 
 import fixtures
@@ -24,21 +25,31 @@ from oslo_db import options
 
 import glance.common.client
 from glance.common import config
-from glance.db import migration
 import glance.db.sqlalchemy.api
-import glance.registry.client.v1.client
 from glance import tests as glance_tests
 from glance.tests import utils as test_utils
 
 
 TESTING_API_PASTE_CONF = """
-[pipeline:glance-api]
+[composite:glance-api]
+paste.composite_factory = glance.api:root_app_factory
+/: api
+
+[pipeline: api]
 pipeline = versionnegotiation gzip unauthenticated-context rootapp
 
-[pipeline:glance-api-caching]
+[composite:glance-api-caching]
+paste.composite_factory = glance.api:root_app_factory
+/: api-caching
+
+[pipeline: api-caching]
 pipeline = versionnegotiation gzip unauthenticated-context cache rootapp
 
-[pipeline:glance-api-cachemanagement]
+[composite:glance-api-cachemanagement]
+paste.composite_factory = glance.api:root_app_factory
+/: api-cachemanagement
+
+[pipeline: api-cachemanagement]
 pipeline =
     versionnegotiation
     gzip
@@ -47,30 +58,33 @@ pipeline =
     cache_manage
     rootapp
 
-[pipeline:glance-api-fakeauth]
+[composite:glance-api-fakeauth]
+paste.composite_factory = glance.api:root_app_factory
+/: api-fakeauth
+
+[pipeline: api-fakeauth]
 pipeline = versionnegotiation gzip fakeauth context rootapp
 
-[pipeline:glance-api-noauth]
+[composite:glance-api-noauth]
+paste.composite_factory = glance.api:root_app_factory
+/: api-noauth
+
+[pipeline: api-noauth]
 pipeline = versionnegotiation gzip context rootapp
 
 [composite:rootapp]
 paste.composite_factory = glance.api:root_app_factory
 /: apiversions
-/v1: apiv1app
 /v2: apiv2app
 
 [app:apiversions]
 paste.app_factory = glance.api.versions:create_resource
 
-[app:apiv1app]
-paste.app_factory = glance.api.v1.router:API.factory
-
 [app:apiv2app]
 paste.app_factory = glance.api.v2.router:API.factory
 
 [filter:versionnegotiation]
-paste.filter_factory =
- glance.api.middleware.version_negotiation:VersionNegotiationFilter.factory
+paste.filter_factory = glance.api.middleware.version_negotiation:VersionNegotiationFilter.factory
 
 [filter:gzip]
 paste.filter_factory = glance.api.middleware.gzip:GzipMiddleware.factory
@@ -79,45 +93,23 @@ paste.filter_factory = glance.api.middleware.gzip:GzipMiddleware.factory
 paste.filter_factory = glance.api.middleware.cache:CacheFilter.factory
 
 [filter:cache_manage]
-paste.filter_factory =
- glance.api.middleware.cache_manage:CacheManageFilter.factory
+paste.filter_factory = glance.api.middleware.cache_manage:CacheManageFilter.factory
 
 [filter:context]
 paste.filter_factory = glance.api.middleware.context:ContextMiddleware.factory
 
 [filter:unauthenticated-context]
-paste.filter_factory =
- glance.api.middleware.context:UnauthenticatedContextMiddleware.factory
+paste.filter_factory = glance.api.middleware.context:UnauthenticatedContextMiddleware.factory
 
 [filter:fakeauth]
 paste.filter_factory = glance.tests.utils:FakeAuthMiddleware.factory
-"""
-
-TESTING_REGISTRY_PASTE_CONF = """
-[pipeline:glance-registry]
-pipeline = unauthenticated-context registryapp
-
-[pipeline:glance-registry-fakeauth]
-pipeline = fakeauth context registryapp
-
-[app:registryapp]
-paste.app_factory = glance.registry.api.v1:API.factory
-
-[filter:context]
-paste.filter_factory = glance.api.middleware.context:ContextMiddleware.factory
-
-[filter:unauthenticated-context]
-paste.filter_factory =
- glance.api.middleware.context:UnauthenticatedContextMiddleware.factory
-
-[filter:fakeauth]
-paste.filter_factory = glance.tests.utils:FakeAuthMiddleware.factory
-"""
+"""  # noqa: E501
 
 CONF = cfg.CONF
 
 
 class ApiTest(test_utils.BaseTestCase):
+
     def setUp(self):
         super(ApiTest, self).setUp()
         self.test_dir = self.useFixture(fixtures.TempDir()).path
@@ -125,13 +117,6 @@ class ApiTest(test_utils.BaseTestCase):
         self._setup_database()
         self._setup_stores()
         self._setup_property_protection()
-        self.glance_registry_app = self._load_paste_app(
-            'glance-registry',
-            flavor=getattr(self, 'registry_flavor', ''),
-            conf=getattr(self, 'registry_paste_conf',
-                         TESTING_REGISTRY_PASTE_CONF),
-        )
-        self._connect_registry_client()
         self.glance_api_app = self._load_paste_app(
             'glance-api',
             flavor=getattr(self, 'api_flavor', ''),
@@ -151,30 +136,26 @@ class ApiTest(test_utils.BaseTestCase):
             'boto=WARN',
             'suds=INFO',
             'keystone=INFO',
-            'eventlet.wsgi.server=DEBUG'
         ])
 
     def _setup_database(self):
         sql_connection = 'sqlite:////%s/tests.sqlite' % self.test_dir
-        options.set_defaults(CONF, connection=sql_connection,
-                             sqlite_db='glance.sqlite')
+        options.set_defaults(CONF, connection=sql_connection)
         glance.db.sqlalchemy.api.clear_db_env()
         glance_db_env = 'GLANCE_DB_TEST_SQLITE_FILE'
         if glance_db_env in os.environ:
             # use the empty db created and cached as a tempfile
             # instead of spending the time creating a new one
             db_location = os.environ[glance_db_env]
-            test_utils.execute('cp %s %s/tests.sqlite'
-                               % (db_location, self.test_dir))
+            shutil.copyfile(db_location, "%s/tests.sqlite" % self.test_dir)
         else:
-            migration.db_sync()
+            test_utils.db_sync()
 
             # copy the clean db to a temp location so that it
             # can be reused for future tests
             (osf, db_location) = tempfile.mkstemp()
             os.close(osf)
-            test_utils.execute('cp %s/tests.sqlite %s'
-                               % (self.test_dir, db_location))
+            shutil.copyfile('%s/tests.sqlite' % self.test_dir, db_location)
             os.environ[glance_db_env] = db_location
 
             # cleanup the temp file when the test suite is
@@ -199,20 +180,11 @@ class ApiTest(test_utils.BaseTestCase):
 
     def _load_paste_app(self, name, flavor, conf):
         conf_file_path = os.path.join(self.test_dir, '%s-paste.ini' % name)
-        with open(conf_file_path, 'wb') as conf_file:
+        with open(conf_file_path, 'w') as conf_file:
             conf_file.write(conf)
             conf_file.flush()
         return config.load_paste_app(name, flavor=flavor,
                                      conf_file=conf_file_path)
-
-    def _connect_registry_client(self):
-        def get_connection_type(self2):
-            def wrapped(*args, **kwargs):
-                return test_utils.HttplibWsgiAdapter(self.glance_registry_app)
-            return wrapped
-
-        self.stubs.Set(glance.common.client.BaseClient,
-                       'get_connection_type', get_connection_type)
 
     def tearDown(self):
         glance.db.sqlalchemy.api.clear_db_env()

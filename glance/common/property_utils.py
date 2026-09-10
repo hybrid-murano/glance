@@ -12,34 +12,75 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+import configparser
+import io
 import re
 
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_policy import policy
-from six.moves import configparser
 
 import glance.api.policy
 from glance.common import exception
-from glance.i18n import _, _LE
+from glance.i18n import _, _LE, _LW
 
-CONFIG = configparser.SafeConfigParser()
+CONFIG = configparser.ConfigParser()
+
 LOG = logging.getLogger(__name__)
 
 property_opts = [
     cfg.StrOpt('property_protection_file',
-               help=_('The location of the property protection file.'
-                      'This file contains the rules for property protections '
-                      'and the roles/policies associated with it. If this '
-                      'config value is not specified, by default, property '
-                      'protections won\'t be enforced. If a value is '
-                      'specified and the file is not found, then the '
-                      'glance-api service will not start.')),
+               help=_("""
+The location of the property protection file.
+
+Provide a valid path to the property protection file which contains
+the rules for property protections and the roles/policies associated
+with them.
+
+A property protection file, when set, restricts the Glance image
+properties to be created, read, updated and/or deleted by a specific
+set of users that are identified by either roles or policies.
+If this configuration option is not set, by default, property
+protections won't be enforced. If a value is specified and the file
+is not found, the glance-api service will fail to start.
+More information on property protections can be found at:
+https://docs.openstack.org/glance/latest/admin/property-protections.html
+
+Possible values:
+    * Empty string
+    * Valid path to the property protection configuration file
+
+Related options:
+    * property_protection_rule_format
+
+""")),
     cfg.StrOpt('property_protection_rule_format',
                default='roles',
                choices=('roles', 'policies'),
-               help=_('This config value indicates whether "roles" or '
-                      '"policies" are used in the property protection file.')),
+               help=_("""
+Rule format for property protection.
+
+Provide the desired way to set property protection on Glance
+image properties. The two permissible values are ``roles``
+and ``policies``. The default value is ``roles``.
+
+If the value is ``roles``, the property protection file must
+contain a comma separated list of user roles indicating
+permissions for each of the CRUD operations on each property
+being protected. If set to ``policies``, a policy defined in
+policy.yaml is used to express property protections for each
+of the CRUD operations. Examples of how property protections
+are enforced based on ``roles`` or ``policies`` can be found at:
+https://docs.openstack.org/glance/latest/admin/property-protections.html#examples
+
+Possible values:
+    * roles
+    * policies
+
+Related options:
+    * property_protection_file
+
+""")),
 ]
 
 CONF = cfg.CONF
@@ -68,10 +109,51 @@ class PropertyRules(object):
         self.prop_prot_rule_format = self.prop_prot_rule_format.lower()
         self._load_rules()
 
+    def _inject_os_glance_section(self):
+        # Inject an 'os_glance.*' section to work around bug #2085321.
+        # https://bugs.launchpad.net/glance/+bug/2085321
+        # An exception will be raised if a property protection file is in
+        # use and does not contain the os_glance.* section. Since this is
+        # internal to Glance, the users should not have to specify that
+        # section in the config file themselves. We therefore inject it
+        # here on their behalf.
+        #
+        # We also remove all sections starting with 'os_glance' since the
+        # keyword is reserved for internal use.
+        #
+        # See:
+        #   glance/tests/etc/property-protections-policies.conf
+        #   glance/tests/etc/property-protections.conf
+        global CONFIG
+
+        for section in CONFIG.sections():
+            if section.startswith('os_glance'):
+                CONFIG.remove_section(section)
+
+        # We want to insert the [os_glance.*] section at the top of the config,
+        # so it is not shadowed by sections such as [.*]. To do this, we:
+        # 1) Dump the user config into a StringIO
+        # 2) Init a new ConfigParser object
+        # 3) Read our [os_glance.*] section
+        # 4) Read the user config
+        txt_config = io.StringIO()
+        CONFIG.write(txt_config)
+        CONFIG = configparser.ConfigParser()
+        CONFIG.read_dict({
+            'os_glance.*': {
+                'create': '@',
+                'read': '@',
+                'update': '@',
+                'delete': '@',
+            }
+        })
+        CONFIG.read_string(txt_config.getvalue())
+
     def _load_rules(self):
         try:
             conf_file = CONF.find_file(CONF.property_protection_file)
             CONFIG.read(conf_file)
+            self._inject_os_glance_section()
         except Exception as e:
             msg = (_LE("Couldn't find property protection file %(file)s: "
                        "%(error)s.") % {'file': CONF.property_protection_file,
@@ -94,7 +176,10 @@ class PropertyRules(object):
             compiled_rule = self._compile_rule(property_exp)
 
             for operation in operations:
-                permissions = CONFIG.get(property_exp, operation)
+                try:
+                    permissions = CONFIG.get(property_exp, operation)
+                except configparser.NoOptionError:
+                    raise InvalidPropProtectConf()
                 if permissions:
                     if self.prop_prot_rule_format == 'policies':
                         if ',' in permissions:
@@ -124,10 +209,10 @@ class PropertyRules(object):
                     property_dict[operation] = permissions
                 else:
                     property_dict[operation] = []
-                    LOG.warn(
-                        _('Property protection on operation %(operation)s'
-                          ' for rule %(rule)s is not found. No role will be'
-                          ' allowed to perform this operation.') %
+                    LOG.warning(
+                        _LW('Property protection on operation %(operation)s'
+                            ' for rule %(rule)s is not found. No role will be'
+                            ' allowed to perform this operation.'),
                         {'operation': operation,
                          'rule': property_exp})
 
@@ -151,7 +236,7 @@ class PropertyRules(object):
         create = glance_creator
         then the corresponding policy rule would be:
         "prop_a:create": "rule:glance_creator"
-        where glance_creator is defined in policy.json. For example:
+        where glance_creator is defined in policy.yaml. For example:
         "glance_creator": "role:admin or role:glance_create_user"
         """
         rule = "rule:%s" % rule
@@ -164,13 +249,18 @@ class PropertyRules(object):
     def _check_policy(self, property_exp, action, context):
         try:
             action = ":".join([property_exp, action])
-            self.policy_enforcer.enforce(context, action, {})
+            self.policy_enforcer.enforce(context, action, {}, registered=False)
         except exception.Forbidden:
             return False
         return True
 
     def check_property_rules(self, property_name, action, context):
         roles = context.roles
+
+        # Include service roles to check if an action can be
+        # performed on the property or not
+        if context.service_roles:
+            roles.extend(context.service_roles)
         if not self.rules:
             return True
 

@@ -14,15 +14,16 @@
 #    under the License.
 
 import copy
+import http.client as http
 
 import glance_store
+from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
-from oslo_utils import encodeutils
-import six
 import webob
 
 from glance.api import policy
+from glance.api.v2 import policy as api_policy
 from glance.common import exception
 from glance.common import timeutils
 from glance.common import utils
@@ -35,6 +36,7 @@ import glance.schema
 
 
 LOG = logging.getLogger(__name__)
+CONF = cfg.CONF
 
 
 class ImageMembersController(object):
@@ -49,8 +51,6 @@ class ImageMembersController(object):
 
     def _get_member_repo(self, req, image):
         try:
-            # For public images, a forbidden exception with message
-            # "Public images do not have members" is thrown.
             return self.gateway.get_member_repo(image, req.context)
         except exception.Forbidden as e:
             msg = (_("Error fetching members of image %(image_id)s: "
@@ -63,7 +63,7 @@ class ImageMembersController(object):
         image_repo = self.gateway.get_repo(req.context)
         try:
             return image_repo.get(image_id)
-        except (exception.NotFound):
+        except exception.NotFound:
             msg = _("Image %s not found.") % image_id
             LOG.warning(msg)
             raise webob.exc.HTTPNotFound(explanation=msg)
@@ -72,9 +72,43 @@ class ImageMembersController(object):
             LOG.warning(msg)
             raise webob.exc.HTTPForbidden(explanation=msg)
 
-    def _lookup_member(self, req, image, member_id):
-        member_repo = self._get_member_repo(req, image)
+    def _check_visibility_and_ownership(self, context, image,
+                                        ownership_check=None):
+        if image.visibility != 'shared':
+            message = _("Only shared images have members.")
+            raise exception.Forbidden(message)
+
+        # NOTE(abhishekk): Ownership check only needs to performed while
+        # adding new members to image
+        owner = image.owner
+        if (not CONF.oslo_policy.enforce_new_defaults
+                and not context.is_admin):
+            if ownership_check == 'create':
+                if owner is None or owner != context.owner:
+                    message = _("You are not permitted to create image "
+                                "members for the image.")
+                    raise exception.Forbidden(message)
+            elif ownership_check == 'update':
+                if context.owner == owner:
+                    message = _("You are not permitted to modify 'status' "
+                                "on this image member.")
+                    raise exception.Forbidden(message)
+            elif ownership_check == 'delete':
+                if context.owner != owner:
+                    message = _("You cannot delete image member.")
+                    raise exception.Forbidden(message)
+
+    def _lookup_member(self, req, image, member_id, member_repo=None):
+        if not member_repo:
+            member_repo = self._get_member_repo(req, image)
         try:
+            # NOTE(abhishekk): This will verify whether user has permission
+            # to view image member or not.
+            api_policy.MemberAPIPolicy(
+                req.context,
+                image,
+                enforcer=self.policy).get_member()
+
             return member_repo.get(member_id)
         except (exception.NotFound):
             msg = (_("%(m_id)s not found in the member list of the image "
@@ -97,7 +131,7 @@ class ImageMembersController(object):
         :param member_id: the member identifier
         :returns: The response body is a mapping of the following form
 
-        .. code-block:: json
+        ::
 
             {'member_id': <MEMBER>,
              'image_id': <IMAGE>,
@@ -106,15 +140,31 @@ class ImageMembersController(object):
              'updated_at': ..}
 
         """
-        image = self._lookup_image(req, image_id)
-        member_repo = self._get_member_repo(req, image)
-        image_member_factory = self.gateway.get_image_member_factory(
-            req.context)
         try:
+            image = self._lookup_image(req, image_id)
+            # Check for image visibility and ownership before getting member
+            # repo
+            # NOTE(abhishekk): Once we support RBAC policies we can remove
+            # ownership check from here. This is added here just to maintain
+            # behavior with and without auth layer.
+            self._check_visibility_and_ownership(req.context, image,
+                                                 ownership_check='create')
+            member_repo = self._get_member_repo(req, image)
+            # NOTE(abhishekk): This will verify whether user has permission
+            # to accept membership or not.
+            api_policy.MemberAPIPolicy(
+                req.context,
+                image,
+                enforcer=self.policy).add_member()
+
+            image_member_factory = self.gateway.get_image_member_factory(
+                req.context)
             new_member = image_member_factory.new_image_member(image,
                                                                member_id)
             member_repo.add(new_member)
             return new_member
+        except exception.Invalid as e:
+            raise webob.exc.HTTPBadRequest(explanation=e.msg)
         except exception.Forbidden:
             msg = _("Not allowed to create members for image %s.") % image_id
             LOG.warning(msg)
@@ -128,20 +178,21 @@ class ImageMembersController(object):
         except exception.ImageMemberLimitExceeded as e:
             msg = (_("Image member limit exceeded for image %(id)s: %(e)s:")
                    % {"id": image_id,
-                      "e": encodeutils.exception_to_unicode(e)})
+                      "e": e})
             LOG.warning(msg)
             raise webob.exc.HTTPRequestEntityTooLarge(explanation=msg)
 
     @utils.mutating
     def update(self, req, image_id, member_id, status):
         """
-        Adds a membership to the image.
+        Update the status of a member for a given image.
         :param req: the Request object coming from the wsgi layer
         :param image_id: the image identifier
         :param member_id: the member identifier
+        :param status: the status of a member
         :returns: The response body is a mapping of the following form
 
-        .. code-block:: json
+        ::
 
             {'member_id': <MEMBER>,
              'image_id': <IMAGE>,
@@ -150,10 +201,24 @@ class ImageMembersController(object):
              'updated_at': ..}
 
         """
-        image = self._lookup_image(req, image_id)
-        member_repo = self._get_member_repo(req, image)
-        member = self._lookup_member(req, image, member_id)
         try:
+            image = self._lookup_image(req, image_id)
+            # Check for image visibility and ownership before getting member
+            # repo.
+            # NOTE(abhishekk): Once we support RBAC policies we can remove
+            # ownership check from here. This is added here just to maintain
+            # behavior with and without auth layer.
+            self._check_visibility_and_ownership(req.context, image,
+                                                 ownership_check='update')
+            member_repo = self._get_member_repo(req, image)
+            member = self._lookup_member(req, image, member_id,
+                                         member_repo=member_repo)
+
+            api_policy.MemberAPIPolicy(
+                req.context,
+                image,
+                enforcer=self.policy).modify_member()
+
             member.status = status
             member_repo.save(member)
             return member
@@ -162,8 +227,7 @@ class ImageMembersController(object):
             LOG.warning(msg)
             raise webob.exc.HTTPForbidden(explanation=msg)
         except ValueError as e:
-            msg = (_("Incorrect request: %s")
-                   % encodeutils.exception_to_unicode(e))
+            msg = (_("Incorrect request: %s") % e)
             LOG.warning(msg)
             raise webob.exc.HTTPBadRequest(explanation=msg)
 
@@ -176,7 +240,7 @@ class ImageMembersController(object):
         :param image_id: The image identifier
         :returns: The response body is a mapping of the following form
 
-        .. code-block:: json
+        ::
 
             {'members': [
                 {'member_id': <MEMBER>,
@@ -187,16 +251,32 @@ class ImageMembersController(object):
             ]}
 
         """
-        image = self._lookup_image(req, image_id)
-        member_repo = self._get_member_repo(req, image)
-        members = []
         try:
-            for member in member_repo.list():
-                members.append(member)
-        except exception.Forbidden:
-            msg = _("Not allowed to list members for image %s.") % image_id
+            image = self._lookup_image(req, image_id)
+            # Check for image visibility and ownership before getting member
+            # repo.
+            self._check_visibility_and_ownership(req.context, image)
+            member_repo = self._get_member_repo(req, image)
+
+            # NOTE(abhishekk): This will verify whether user has permission
+            # to view image members or not. Each member will be checked with
+            # get_member policy below.
+            api_policy_check = api_policy.MemberAPIPolicy(
+                req.context,
+                image,
+                enforcer=self.policy)
+            api_policy_check.get_members()
+        except exception.Forbidden as e:
+            msg = (_("Not allowed to list members for image %(image_id)s: "
+                     "%(inner_msg)s") % {"image_id": image.image_id,
+                                         "inner_msg": e.msg})
             LOG.warning(msg)
             raise webob.exc.HTTPForbidden(explanation=msg)
+
+        members = [
+            member for member in member_repo.list() if api_policy_check.check(
+                'get_member')]
+
         return dict(members=members)
 
     def show(self, req, image_id, member_id):
@@ -207,7 +287,7 @@ class ImageMembersController(object):
         :param image_id: The image identifier
         :returns: The response body is a mapping of the following form
 
-        .. code-block:: json
+        ::
 
             {'member_id': <MEMBER>,
              'image_id': <IMAGE>,
@@ -218,7 +298,14 @@ class ImageMembersController(object):
         """
         try:
             image = self._lookup_image(req, image_id)
+            # Check for image visibility and ownership before getting member
+            # repo.
+            self._check_visibility_and_ownership(req.context, image)
             return self._lookup_member(req, image, member_id)
+        except exception.Forbidden as e:
+            # Convert Forbidden to NotFound to prevent information
+            # leakage.
+            raise webob.exc.HTTPNotFound(explanation=e.msg)
         except webob.exc.HTTPForbidden as e:
             # Convert Forbidden to NotFound to prevent information
             # leakage.
@@ -229,12 +316,28 @@ class ImageMembersController(object):
         """
         Removes a membership from the image.
         """
-        image = self._lookup_image(req, image_id)
-        member_repo = self._get_member_repo(req, image)
-        member = self._lookup_member(req, image, member_id)
         try:
+            image = self._lookup_image(req, image_id)
+            # Check for image visibility and ownership before getting member
+            # repo.
+            # NOTE(abhishekk): Once we support RBAC policies we can remove
+            # ownership check from here. This is added here just to maintain
+            # behavior with and without auth layer.
+            self._check_visibility_and_ownership(req.context, image,
+                                                 ownership_check='delete')
+            member_repo = self._get_member_repo(req, image)
+            member = self._lookup_member(req, image, member_id,
+                                         member_repo=member_repo)
+
+            # NOTE(abhishekk): This will verify whether user has permission
+            # to delete image member or not.
+            api_policy.MemberAPIPolicy(
+                req.context,
+                image,
+                enforcer=self.policy).delete_member()
+
             member_repo.remove(member)
-            return webob.Response(body='', status=204)
+            return webob.Response(body='', status=http.NO_CONTENT)
         except exception.Forbidden:
             msg = _("Not allowed to delete members for image %s.") % image_id
             LOG.warning(msg)
@@ -304,13 +407,13 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
     def create(self, response, image_member):
         image_member_view = self._format_image_member(image_member)
         body = jsonutils.dumps(image_member_view, ensure_ascii=False)
-        response.unicode_body = six.text_type(body)
+        response.unicode_body = body
         response.content_type = 'application/json'
 
     def update(self, response, image_member):
         image_member_view = self._format_image_member(image_member)
         body = jsonutils.dumps(image_member_view, ensure_ascii=False)
-        response.unicode_body = six.text_type(body)
+        response.unicode_body = body
         response.content_type = 'application/json'
 
     def index(self, response, image_members):
@@ -322,13 +425,13 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
         totalview = dict(members=image_members_view)
         totalview['schema'] = '/v2/schemas/members'
         body = jsonutils.dumps(totalview, ensure_ascii=False)
-        response.unicode_body = six.text_type(body)
+        response.unicode_body = body
         response.content_type = 'application/json'
 
     def show(self, response, image_member):
         image_member_view = self._format_image_member(image_member)
         body = jsonutils.dumps(image_member_view, ensure_ascii=False)
-        response.unicode_body = six.text_type(body)
+        response.unicode_body = body
         response.content_type = 'application/json'
 
 

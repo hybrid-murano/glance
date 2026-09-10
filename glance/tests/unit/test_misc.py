@@ -15,10 +15,6 @@
 
 import os
 
-import six
-# NOTE(jokke): simplified transition to py3, behaves like py2 xrange
-from six.moves import range
-
 from glance.common import crypt
 from glance.common import utils
 from glance.tests import utils as test_utils
@@ -35,9 +31,7 @@ class UtilsTestCase(test_utils.BaseTestCase):
         plaintext_list = ['']
         blocksize = 64
         for i in range(3 * blocksize):
-            text = os.urandom(i)
-            if six.PY3:
-                text = text.decode('latin1')
+            text = os.urandom(i).decode('latin1')
             plaintext_list.append(text)
 
         for key in key_list:

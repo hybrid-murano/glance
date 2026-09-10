@@ -1,0 +1,448 @@
+- job:
+    name: glance-tox-oslo-tips-base
+    parent: tox
+    abstract: true
+    nodeset: ubuntu-noble
+    timeout: 2400
+    description: Abstract job for Glance vs. oslo libraries
+    # NOTE(rosmaita): we only need functional test jobs, oslo is
+    # already running periodic jobs using our unit tests.  Those
+    # jobs are configured for glance in openstack/project-config/
+    # zuul.d/projects.yaml using the template 'periodic-jobs-with-oslo-master'
+    # which is defined in openstack/openstack-zuul-jobs/zuul.d/
+    # project-templates.yaml; the jobs the template refers to are
+    # defined in openstack/openstack-zuul-jobs/zuul.d/jobs.yaml
+    required-projects:
+      - name: openstack/debtcollector
+      - name: openstack/oslo.concurrency
+      - name: openstack/oslo.config
+      - name: openstack/oslo.context
+      - name: openstack/oslo.db
+      - name: openstack/oslo.i18n
+      - name: openstack/oslo.log
+      - name: openstack/oslo.messaging
+      - name: openstack/oslo.middleware
+      - name: openstack/oslo.policy
+      - name: openstack/oslo.utils
+      - name: openstack/osprofiler
+      - name: openstack/stevedore
+      - name: openstack/taskflow
+
+- job:
+    name: glance-tox-functional-py313-oslo-tips
+    parent: glance-tox-oslo-tips-base
+    nodeset: debian-trixie-8GB
+    description: |
+      Glance py313 functional tests vs. oslo libraries masters
+    vars:
+      python_version: 3.13
+      tox_envlist: functional-py313
+
+- job:
+    name: glance-tox-keystone-tips-base
+    parent: tox
+    abstract: true
+    nodeset: ubuntu-noble
+    timeout: 2400
+    description: Abstract job for Glance vs. keystone
+    required-projects:
+      - name: openstack/keystoneauth
+      - name: openstack/keystonemiddleware
+      - name: openstack/python-keystoneclient
+
+- job:
+    name: glance-tox-py313-keystone-tips
+    parent: glance-tox-keystone-tips-base
+    nodeset: debian-trixie-8GB
+    description: |
+      Glance py313 unit tests vs. keystone masters
+    vars:
+      python_version: 3.13
+      tox_envlist: py313
+
+- job:
+    name: glance-tox-functional-py313-keystone-tips
+    parent: glance-tox-keystone-tips-base
+    nodeset: debian-trixie-8GB
+    description: |
+      Glance py313 functional tests vs. keystone masters
+    vars:
+      python_version: 3.13
+      tox_envlist: functional-py313
+
+- job:
+    name: glance-tox-glance_store-tips-base
+    parent: tox
+    abstract: true
+    nodeset: ubuntu-noble
+    timeout: 2400
+    description: Abstract job for Glance vs. glance_store
+    required-projects:
+      - name: openstack/glance_store
+
+- job:
+    name: glance-tox-py313-glance_store-tips
+    parent: glance-tox-glance_store-tips-base
+    nodeset: debian-trixie-8GB
+    description: |
+      Glance py313 unit tests vs. glance_store master
+    vars:
+      python_version: 3.13
+      tox_envlist: py313
+
+- job:
+    name: glance-tox-functional-py313-glance_store-tips
+    parent: glance-tox-glance_store-tips-base
+    nodeset: debian-trixie-8GB
+    description: |
+      Glance py313 functional tests vs. glance_store master
+    vars:
+      python_version: 3.13
+      tox_envlist: functional-py313
+
+- job:
+    name: glance-tox-cursive-tips-base
+    parent: tox
+    abstract: true
+    nodeset: ubuntu-noble
+    timeout: 2400
+    description: Abstract job for Glance vs. cursive and related libs
+    required-projects:
+      - name: openstack/cursive
+      - name: openstack/python-barbicanclient
+      - name: openstack/castellan
+
+- job:
+    name: glance-tox-py313-cursive-tips
+    parent: glance-tox-cursive-tips-base
+    nodeset: debian-trixie-8GB
+    description: |
+      Glance py313 unit tests vs. cursive (and related libs) master
+    vars:
+      python_version: 3.13
+      tox_envlist: py313
+
+- job:
+    name: glance-tox-functional-py313-cursive-tips
+    parent: glance-tox-cursive-tips-base
+    nodeset: debian-trixie-8GB
+    description: |
+      Glance py313 functional tests vs. cursive (and related libs) master
+    vars:
+      python_version: 3.13
+      tox_envlist: functional-py313
+
+- job:
+    name: tempest-integrated-storage-import
+    parent: tempest-integrated-storage
+    description: |
+      The regular tempest-integrated-storage job but with glance metadata injection
+    post-run: playbooks/post-check-metadata-injection.yaml
+    timeout: 10800
+    vars:
+      configure_swap_size: 8192
+      tempest_concurrency: 3
+      zuul_copy_output:
+        /etc/glance-remote: logs
+      devstack_localrc:
+        GLANCE_USE_IMPORT_WORKFLOW: True
+      devstack_services:
+        g-api-r: true
+      devstack_local_conf:
+        post-config:
+          $GLANCE_API_CONF:
+            DEFAULT:
+              enabled_import_methods: "[\"copy-image\", \"glance-direct\"]"
+            wsgi:
+              python_interpreter: /opt/stack/data/venv/bin/python
+          $GLANCE_IMAGE_IMPORT_CONF:
+            image_import_opts:
+              image_import_plugins: "['inject_image_metadata', 'image_conversion']"
+            inject_metadata_properties:
+              ignore_user_roles:
+              inject: |
+                "glance_devstack_test":"doyouseeme?"
+            image_conversion:
+              output_format: raw
+        test-config:
+          "$TEMPEST_CONFIG":
+            image:
+              image_caching_enabled: True
+            image-feature-enabled:
+              do_secure_hash: True
+              http_store_enabled: True
+
+- job:
+    name: glance-multistore-cinder-import
+    parent: tempest-integrated-storage-import
+    description: |
+      The regular import workflow job to test with multiple cinder stores
+    vars:
+      devstack_localrc:
+        USE_CINDER_FOR_GLANCE: True
+        GLANCE_ENABLE_MULTIPLE_STORES: True
+        CINDER_ENABLED_BACKENDS: lvm:lvmdriver-1,lvm:lvmdriver-2
+        GLANCE_CINDER_DEFAULT_BACKEND: lvmdriver-1
+        # Glance RBAC new defaults are tested by default so we need to test
+        # old defaults in some job.
+        GLANCE_ENFORCE_SCOPE: false
+      devstack_local_conf:
+        test-config:
+          "$TEMPEST_CONFIG":
+            image-feature-enabled:
+              http_store_enabled: False
+
+- job:
+    name: glance-s3-multistore
+    parent: tempest-integrated-storage-import
+    description: |
+      Just like the normal s3 job, but with glance multistore.
+      Store weights are configured so tempest StoreWeightTest
+      can verify weight-based ordering (s3_fast, test_file, web).
+    timeout: 9000
+    vars:
+      devstack_localrc:
+        GLANCE_USE_S3: True
+        GLANCE_ENABLE_MULTIPLE_STORES: True
+        GLANCE_USE_IMPORT_WORKFLOW: True
+        GLANCE_LIMIT_IMAGE_SIZE_TOTAL: 2048
+      devstack_services:
+        c-bak: false
+        tls-proxy: false
+        s-account: true
+        s-container: true
+        s-object: true
+        s-proxy: true
+        s3api: true
+        openstack-cli-server: true
+      devstack_local_conf:
+        post-config:
+          $GLANCE_API_CONF:
+            DEFAULT:
+              enabled_backends: "s3_fast:s3, test_file:file, web:http"
+            s3_fast:
+              weight: 200
+            test_file:
+              filesystem_store_datadir: /opt/stack/data/glance/images/
+              weight: 100
+            web:
+              https_insecure: false
+              weight: 50
+            os_glance_staging_store:
+              filesystem_store_datadir: /opt/stack/data/glance/os_glance_staging_store/
+            os_glance_tasks_store:
+              filesystem_store_datadir: /opt/stack/data/glance/os_glance_tasks_store/
+        test-config:
+          "$TEMPEST_CONFIG":
+            image-feature-enabled:
+              http_store_enabled: True
+              do_secure_hash: True
+              store_weight_enabled: True
+
+- job:
+    name: glance-multistore-add-location-do-secure-hash-false
+    parent: glance-s3-multistore
+    description: |
+      Like glance-s3-multistore but with do_secure_hash disabled in Glance
+      and Tempest so the add-location API tests for the no-hash path run
+      LocationImportTest.test_add_location_with_do_secure_hash_false and
+      MultistoreLocationImportTest.test_add_location_with_do_secure_hash_false.
+      The do_secure_hash=True API path stays covered by
+      tempest-integrated-storage-import (single store) and glance-s3-multistore.
+      Scenario hash tests require do_secure_hash=True and skip here.
+    vars:
+      devstack_local_conf:
+        post-config:
+          $GLANCE_API_CONF:
+            DEFAULT:
+              do_secure_hash: False
+        test-config:
+          "$TEMPEST_CONFIG":
+            image-feature-enabled:
+              do_secure_hash: False
+
+- job:
+    name: glance-multistore-cinder-import-fips
+    parent: tempest-integrated-storage-import
+    description: |
+      The regular import workflow job to test with multiple cinder stores with
+      fips enabled
+    nodeset: devstack-single-node-centos-10-stream
+    pre-run: playbooks/enable-fips.yaml
+    vars:
+      configure_swap_size: 4096
+      nslookup_target: 'opendev.org'
+      devstack_local_conf:
+        post-config:
+          $GLANCE_API_CONF:
+            wsgi:
+              python_interpreter: $PYTHON
+      devstack_localrc:
+        USE_CINDER_FOR_GLANCE: True
+        GLANCE_ENABLE_MULTIPLE_STORES: True
+        CINDER_ENABLED_BACKENDS: lvm:lvmdriver-1,lvm:lvmdriver-2
+        GLANCE_CINDER_DEFAULT_BACKEND: lvmdriver-1
+        GLOBAL_VENV: false
+
+- job:
+    name: glance-ceph-thin-provisioning
+    parent: devstack-plugin-ceph-tempest-py3
+    description: |
+      Just like devstack-plugin-ceph-tempest-py3, but with thin provisioning enabled
+    required-projects:
+      - name: openstack/glance_store
+    vars:
+      tempest_concurrency: 3
+      devstack_local_conf:
+        post-config:
+          $GLANCE_API_CONF:
+            glance_store:
+              rbd_thin_provisioning: True
+
+# NOTE(gmann): Remove this job once Glance remove the RBAC old defaults.
+- job:
+    name: tempest-integrated-storage-rbac-old-defaults
+    parent: tempest-integrated-storage
+    description: |
+      This job runs the Tempest tests with glance RBAC old defaults.
+    timeout: 10800
+    vars:
+      tempest_concurrency: 3
+      devstack_localrc:
+        GLANCE_ENFORCE_NEW_DEFAULTS: false
+
+- job:
+    name: glance-rally-task-uwsgi
+    parent: rally-task-at-devstack
+    timeout: 7800
+    description: |
+      Rally benchmarks against Glance as deployed by DevStack, which runs
+      the image API under uWSGI with native threading.
+    required-projects:
+      - name: openstack/devstack
+      - name: openstack/rally
+      - name: openstack/rally-openstack
+    vars:
+      rally_task: rally-jobs/glance.yaml
+      devstack_plugins:
+        rally-openstack: https://opendev.org/openstack/rally-openstack
+      devstack_localrc:
+        # rally-jobs/glance.yaml runs 700 create_and_list iterations; DevStack
+        # defaults image_count_total / image_count_uploading to 100 otherwise.
+        GLANCE_LIMIT_IMAGE_COUNT_TOTAL: 800
+        GLANCE_LIMIT_IMAGE_COUNT_UPLOADING: 800
+
+- project:
+    templates:
+      - check-requirements
+      - integrated-gate-storage
+      - openstack-python3-jobs
+      - openstack-python3-jobs-arm64
+      - periodic-stable-jobs
+      - publish-openstack-docs-pti
+      - release-notes-jobs-python3
+    check:
+      jobs:
+        - openstack-tox-functional-py311
+        - openstack-tox-functional-py313
+        - glance-ceph-thin-provisioning:
+            voting: false
+            irrelevant-files: &tempest-irrelevant-files
+              - ^(test-|)requirements.txt$
+              - ^.*\.rst$
+              - ^api-ref/.*$
+              - ^glance/hacking/.*$
+              - ^glance/locale/.*$
+              - ^glance/tests/.*$
+              - ^doc/.*$
+              - ^releasenotes/.*$
+              - ^tools/.*$
+              - ^tox.ini$
+        - tempest-integrated-storage:
+            irrelevant-files: *tempest-irrelevant-files
+        - tempest-integrated-storage-import:
+            irrelevant-files: *tempest-irrelevant-files
+        - tempest-integrated-storage-import-standalone:
+            irrelevant-files: *tempest-irrelevant-files
+        - glance-multistore-cinder-import:
+            irrelevant-files: *tempest-irrelevant-files
+        - grenade:
+            irrelevant-files: *tempest-irrelevant-files
+        - tempest-ipv6-only:
+            irrelevant-files: *tempest-irrelevant-files
+        - nova-ceph-multistore:
+            irrelevant-files: *tempest-irrelevant-files
+        - glance-s3-multistore:
+            voting: false
+            irrelevant-files: *tempest-irrelevant-files
+        - glance-multistore-add-location-do-secure-hash-false:
+            voting: false
+            irrelevant-files: *tempest-irrelevant-files
+        - glance-secure-rbac-protection-functional
+        - ironic-tempest-bios-ipmi-direct:
+            voting: false
+            irrelevant-files: *tempest-irrelevant-files
+        - glance-rally-task-uwsgi:
+            voting: false
+            irrelevant-files: *tempest-irrelevant-files
+
+    gate:
+      jobs:
+        - openstack-tox-functional-py311
+        - openstack-tox-functional-py313
+        - tempest-integrated-storage:
+            irrelevant-files: *tempest-irrelevant-files
+        - tempest-integrated-storage-import:
+            irrelevant-files: *tempest-irrelevant-files
+        - tempest-integrated-storage-import-standalone:
+            irrelevant-files: *tempest-irrelevant-files
+        - grenade:
+            irrelevant-files: *tempest-irrelevant-files
+        - grenade-skip-level:
+            irrelevant-files: *tempest-irrelevant-files
+        - tempest-ipv6-only:
+            irrelevant-files: *tempest-irrelevant-files
+        - nova-ceph-multistore:
+            irrelevant-files: *tempest-irrelevant-files
+        - glance-secure-rbac-protection-functional
+    experimental:
+      jobs:
+        - glance-tox-py313-glance_store-tips
+        - glance-tox-functional-py313-glance_store-tips
+        - barbican-tempest-plugin-simple-crypto
+        - grenade-multinode
+        - glance-multistore-cinder-import-fips:
+            irrelevant-files: *tempest-irrelevant-files
+        - tempest-integrated-storage-rbac-old-defaults
+    periodic:
+      jobs:
+        # NOTE(rosmaita): we only want the "tips" jobs to be run against
+        # master, hence the 'branches' qualifiers below.  Without them, when
+        # a stable branch is cut, the tests would be run against the stable
+        # branch as well, which is pointless because these libraries are
+        # frozen (more or less) in the stable branches.
+        #
+        # The "tips" jobs can be removed from the stable branch .zuul.yaml
+        # files if someone is so inclined, but that would require manual
+        # maintenance, so we do not do it by default.  Another option is
+        # to define these jobs in the openstack/project-config repo.
+        # That would make us less agile in adjusting these tests, so we
+        # aren't doing that either.
+        - glance-tox-functional-py313-oslo-tips:
+            branches: master
+        - glance-tox-py313-keystone-tips:
+            branches: master
+        - glance-tox-functional-py313-keystone-tips:
+            branches: master
+        - glance-tox-py313-glance_store-tips:
+            branches: master
+        - glance-tox-functional-py313-glance_store-tips:
+            branches: master
+        - glance-tox-py313-cursive-tips:
+            branches: master
+        - glance-tox-functional-py313-cursive-tips:
+            branches: master
+        - glance-multistore-cinder-import-fips:
+            branches: master
+        - tempest-integrated-storage-rbac-old-defaults:
+            branches: master

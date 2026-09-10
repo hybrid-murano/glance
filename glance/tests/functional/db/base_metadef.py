@@ -13,22 +13,36 @@
 # under the License.
 
 import copy
+import os
+import os.path
 
 from glance.common import config
 from glance.common import exception
 from glance import context
+from glance.db.sqlalchemy import metadata
 import glance.tests.functional.db as db_tests
 from glance.tests import utils as test_utils
 
 
+# root of repo
+ROOT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    os.pardir,
+    os.pardir,
+    os.pardir,
+    os.pardir,
+)
+METADEFS_DIR = os.path.join(ROOT_DIR, 'etc', 'metadefs')
+
+
 def build_namespace_fixture(**kwargs):
     namespace = {
-        'namespace': u'MyTestNamespace',
-        'display_name': u'test-display-name',
-        'description': u'test-description',
-        'visibility': u'public',
+        'namespace': 'MyTestNamespace',
+        'display_name': 'test-display-name',
+        'description': 'test-description',
+        'visibility': 'public',
         'protected': 0,
-        'owner': u'test-owner'
+        'owner': 'test-owner'
     }
     namespace.update(kwargs)
     return namespace
@@ -36,7 +50,7 @@ def build_namespace_fixture(**kwargs):
 
 def build_resource_type_fixture(**kwargs):
     resource_type = {
-        'name': u'MyTestResourceType',
+        'name': 'MyTestResourceType',
         'protected': 0
     }
     resource_type.update(kwargs)
@@ -45,7 +59,7 @@ def build_resource_type_fixture(**kwargs):
 
 def build_association_fixture(**kwargs):
     association = {
-        'name': u'MyTestResourceType',
+        'name': 'MyTestResourceType',
         'properties_target': 'test-properties-target',
         'prefix': 'test-prefix'
     }
@@ -57,10 +71,10 @@ def build_object_fixture(**kwargs):
     # Full testing of required and schema done via rest api tests
     object = {
         'namespace_id': 1,
-        'name': u'test-object-name',
-        'description': u'test-object-description',
-        'required': u'fake-required-properties-list',
-        'json_schema': u'{fake-schema}'
+        'name': 'test-object-name',
+        'description': 'test-object-description',
+        'required': 'fake-required-properties-list',
+        'json_schema': '{fake-schema}'
     }
     object.update(kwargs)
     return object
@@ -70,8 +84,8 @@ def build_property_fixture(**kwargs):
     # Full testing of required and schema done via rest api tests
     property = {
         'namespace_id': 1,
-        'name': u'test-property-name',
-        'json_schema': u'{fake-schema}'
+        'name': 'test-property-name',
+        'json_schema': '{fake-schema}'
     }
     property.update(kwargs)
     return property
@@ -81,7 +95,7 @@ def build_tag_fixture(**kwargs):
     # Full testing of required and schema done via rest api tests
     tag = {
         'namespace_id': 1,
-        'name': u'test-tag-name',
+        'name': 'test-tag-name',
     }
     tag.update(kwargs)
     return tag
@@ -102,6 +116,7 @@ class TestMetadefDriver(test_utils.BaseTestCase):
         """Run before each test method to initialize test environment."""
         super(TestMetadefDriver, self).setUp()
         config.parse_args(args=[])
+        self.config(metadata_source_path=METADEFS_DIR)
         context_cls = context.RequestContext
         self.adm_context = context_cls(is_admin=True,
                                        auth_token='user:user:admin')
@@ -162,7 +177,7 @@ class MetadefNamespaceTests(object):
             self._assert_saved_fields(ns_fixture, item)
 
     def test_namespace_update(self):
-        delta = {'owner': u'New Owner'}
+        delta = {'owner': 'New Owner'}
         fixture = build_namespace_fixture()
 
         created = self.db_api.metadef_namespace_create(self.context, fixture)
@@ -285,7 +300,7 @@ class MetadefPropertyTests(object):
         self.assertEqual(2, len(found))
 
     def test_property_update(self):
-        delta = {'name': u'New-name', 'json_schema': u'new-schema'}
+        delta = {'name': 'New-name', 'json_schema': 'new-schema'}
 
         fixture_ns = build_namespace_fixture()
         created_ns = self.db_api.metadef_namespace_create(
@@ -412,8 +427,8 @@ class MetadefObjectTests(object):
         self.assertEqual(2, len(found))
 
     def test_object_update(self):
-        delta = {'name': u'New-name', 'json_schema': u'new-schema',
-                 'required': u'new-required'}
+        delta = {'name': 'New-name', 'json_schema': 'new-schema',
+                 'required': 'new-required'}
 
         fixture_ns = build_namespace_fixture()
         created_ns = self.db_api.metadef_namespace_create(self.context,
@@ -590,6 +605,34 @@ class MetadefTagTests(object):
         expected = set(['Tag1', 'Tag2', 'Tag3'])
         self.assertEqual(expected, actual)
 
+    def test_tag_create_tags_with_append(self):
+        fixture = build_namespace_fixture()
+        created_ns = self.db_api.metadef_namespace_create(self.context,
+                                                          fixture)
+        self.assertIsNotNone(created_ns)
+        self._assert_saved_fields(fixture, created_ns)
+
+        tags = build_tags_fixture(['Tag1', 'Tag2', 'Tag3'])
+        created_tags = self.db_api.metadef_tag_create_tags(
+            self.context, created_ns['namespace'], tags)
+        actual = set([tag['name'] for tag in created_tags])
+        expected = set(['Tag1', 'Tag2', 'Tag3'])
+        self.assertEqual(expected, actual)
+
+        new_tags = build_tags_fixture(['Tag4', 'Tag5', 'Tag6'])
+        new_created_tags = self.db_api.metadef_tag_create_tags(
+            self.context, created_ns['namespace'], new_tags, can_append=True)
+        actual = set([tag['name'] for tag in new_created_tags])
+        expected = set(['Tag4', 'Tag5', 'Tag6'])
+        self.assertEqual(expected, actual)
+
+        tags = self.db_api.metadef_tag_get_all(self.context,
+                                               created_ns['namespace'],
+                                               sort_key='created_at')
+        actual = set([tag['name'] for tag in tags])
+        expected = set(['Tag1', 'Tag2', 'Tag3', 'Tag4', 'Tag5', 'Tag6'])
+        self.assertEqual(expected, actual)
+
     def test_tag_create_duplicate_tags_1(self):
         fixture = build_namespace_fixture()
         created_ns = self.db_api.metadef_namespace_create(self.context,
@@ -618,6 +661,22 @@ class MetadefTagTests(object):
         self.assertRaises(exception.Duplicate,
                           self.db_api.metadef_tag_create,
                           self.context, created_ns['namespace'], dup_tag)
+
+    def test_tag_create_duplicate_tags_3(self):
+        fixture = build_namespace_fixture()
+        created_ns = self.db_api.metadef_namespace_create(self.context,
+                                                          fixture)
+        self.assertIsNotNone(created_ns)
+        self._assert_saved_fields(fixture, created_ns)
+
+        tags = build_tags_fixture(['Tag1', 'Tag2', 'Tag3'])
+        self.db_api.metadef_tag_create_tags(self.context,
+                                            created_ns['namespace'], tags)
+        dup_tags = build_tags_fixture(['Tag3', 'Tag4', 'Tag5'])
+        self.assertRaises(exception.Duplicate,
+                          self.db_api.metadef_tag_create_tags,
+                          self.context, created_ns['namespace'],
+                          dup_tags, can_append=True)
 
     def test_tag_get(self):
         fixture_ns = build_namespace_fixture()
@@ -657,7 +716,7 @@ class MetadefTagTests(object):
         self.assertEqual(2, len(found))
 
     def test_tag_update(self):
-        delta = {'name': u'New-name'}
+        delta = {'name': 'New-name'}
 
         fixture_ns = build_namespace_fixture()
         created_ns = self.db_api.metadef_namespace_create(self.context,
@@ -697,11 +756,107 @@ class MetadefTagTests(object):
                           created_tag['name'])
 
 
+class MetadefLoadUnloadTests:
+
+    # if additional default schemas are added, you need to update this
+    _namespace_count = 32
+    _namespace_object_counts = {
+        'OS::Compute::Quota': 3,
+        'OS::Software::WebServers': 3,
+        'OS::Software::DBMS': 12,
+        'OS::Software::Runtimes': 5,
+    }
+    _namespace_property_counts = {
+        'CIM::ProcessorAllocationSettingData': 3,
+        'CIM::ResourceAllocationSettingData': 19,
+        'CIM::StorageAllocationSettingData': 13,
+        'CIM::VirtualSystemSettingData': 17,
+        'OS::Compute::XenAPI': 1,
+        'OS::Compute::InstanceData': 2,
+        'OS::Compute::Libvirt': 5,
+        'OS::Compute::VMwareQuotaFlavor': 2,
+        'OS::Cinder::Volumetype': 1,
+        'OS::Glance::Signatures': 4,
+        'OS::Compute::AggregateIoOpsFilter': 1,
+        'OS::Compute::RandomNumberGenerator': 3,
+        'OS::Compute::VTPM': 2,
+        'OS::Compute::Hypervisor': 2,
+        'OS::Compute::CPUPinning': 2,
+        'OS::OperatingSystem': 3,
+        'OS::Compute::AggregateDiskFilter': 1,
+        'OS::Compute::AggregateNumInstancesFilter': 1,
+        'OS::Compute::HostCapabilities': 7,
+        'OS::Compute::VirtCPUTopology': 6,
+        'OS::Glance::CommonImageProperties': 9,
+        'OS::Compute::GuestShutdownBehavior': 1,
+        'OS::Compute::VMwareFlavor': 2,
+        'OS::Compute::TPM': 2,
+        'OS::Compute::GuestMemoryBacking': 1,
+        'OS::Compute::LibvirtImage': 17,
+        'OS::Compute::VMware': 6,
+        'OS::Compute::Watchdog': 1,
+    }
+
+    def test_metadef_load_unload(self):
+        # load the metadata definitions
+        metadata.db_load_metadefs(self.db_api.get_engine())
+
+        # trust but verify
+        expected = self._namespace_count
+        namespaces = self.db_api.metadef_namespace_get_all(self.adm_context)
+        actual = len(namespaces)
+        self.assertEqual(
+            expected,
+            actual,
+            f"expected {expected} namespaces but got {actual}"
+        )
+
+        for namespace in namespaces:
+            expected = self._namespace_object_counts.get(
+                namespace['namespace'],
+                0,
+            )
+            objects = self.db_api.metadef_object_get_all(
+                self.adm_context,
+                namespace['namespace'],
+            )
+            actual = len(objects)
+            self.assertEqual(
+                expected,
+                actual,
+                f"expected {expected} objects in {namespace['namespace']} "
+                f"namespace but got {actual}: "
+                f"{', '.join(o['name'] for o in objects)}"
+            )
+
+        for namespace in namespaces:
+            expected = self._namespace_property_counts.get(
+                namespace['namespace'],
+                0,
+            )
+            properties = self.db_api.metadef_property_get_all(
+                self.adm_context,
+                namespace['namespace'],
+            )
+            actual = len(properties)
+            self.assertEqual(
+                expected,
+                actual,
+                f"expected {expected} properties in {namespace['namespace']} "
+                f"namespace but got {actual}: "
+                f"{', '.join(p['name'] for p in properties)}"
+            )
+
+        # unload the definitions
+        metadata.db_unload_metadefs(self.db_api.get_engine())
+
+
 class MetadefDriverTests(MetadefNamespaceTests,
                          MetadefResourceTypeTests,
                          MetadefResourceTypeAssociationTests,
                          MetadefPropertyTests,
                          MetadefObjectTests,
-                         MetadefTagTests):
+                         MetadefTagTests,
+                         MetadefLoadUnloadTests):
     # collection class
     pass

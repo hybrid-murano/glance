@@ -17,31 +17,6 @@ from glance.tests import utils
 
 
 class HackingTestCase(utils.BaseTestCase):
-    def test_assert_true_instance(self):
-        self.assertEqual(1, len(list(checks.assert_true_instance(
-            "self.assertTrue(isinstance(e, "
-            "exception.BuildAbortException))"))))
-
-        self.assertEqual(
-            0, len(list(checks.assert_true_instance("self.assertTrue()"))))
-
-    def test_assert_equal_type(self):
-        self.assertEqual(1, len(list(checks.assert_equal_type(
-            "self.assertEqual(type(als['QuicAssist']), list)"))))
-
-        self.assertEqual(
-            0, len(list(checks.assert_equal_type("self.assertTrue()"))))
-
-    def test_assert_equal_none(self):
-        self.assertEqual(1, len(list(checks.assert_equal_none(
-            "self.assertEqual(A, None)"))))
-
-        self.assertEqual(1, len(list(checks.assert_equal_none(
-            "self.assertEqual(None, A)"))))
-
-        self.assertEqual(
-            0, len(list(checks.assert_equal_none("self.assertIsNone()"))))
-
     def test_no_translate_debug_logs(self):
         self.assertEqual(1, len(list(checks.no_translate_debug_logs(
             "LOG.debug(_('foo'))", "glance/store/foo.py"))))
@@ -51,17 +26,6 @@ class HackingTestCase(utils.BaseTestCase):
 
         self.assertEqual(0, len(list(checks.no_translate_debug_logs(
             "LOG.info(_('foo'))", "glance/store/foo.py"))))
-
-    def test_no_direct_use_of_unicode_function(self):
-        self.assertEqual(1, len(list(checks.no_direct_use_of_unicode_function(
-            "unicode('the party dont start til the unicode walks in')"))))
-        self.assertEqual(1, len(list(checks.no_direct_use_of_unicode_function(
-            """unicode('something '
-                       'something else"""))))
-        self.assertEqual(0, len(list(checks.no_direct_use_of_unicode_function(
-            "six.text_type('party over')"))))
-        self.assertEqual(0, len(list(checks.no_direct_use_of_unicode_function(
-            "not_actually_unicode('something completely different')"))))
 
     def test_no_contextlib_nested(self):
         self.assertEqual(1, len(list(checks.check_no_contextlib_nested(
@@ -101,40 +65,14 @@ class HackingTestCase(utils.BaseTestCase):
         self.assertEqual(0, len(list(checks.dict_constructor_with_list_copy(
             "      self._render_dict(xml, data_el, data.__dict__)"))))
 
-    def test_check_python3_xrange(self):
-        func = checks.check_python3_xrange
-        self.assertEqual(1, len(list(func('for i in xrange(10)'))))
-        self.assertEqual(1, len(list(func('for i in xrange    (10)'))))
-        self.assertEqual(0, len(list(func('for i in range(10)'))))
-        self.assertEqual(0, len(list(func('for i in six.moves.range(10)'))))
-        self.assertEqual(0, len(list(func('testxrange(10)'))))
-
-    def test_dict_iteritems(self):
-        self.assertEqual(1, len(list(checks.check_python3_no_iteritems(
-            "obj.iteritems()"))))
-
-        self.assertEqual(0, len(list(checks.check_python3_no_iteritems(
-            "six.iteritems(obj)"))))
-
-        self.assertEqual(0, len(list(checks.check_python3_no_iteritems(
-            "obj.items()"))))
-
-    def test_dict_iterkeys(self):
-        self.assertEqual(1, len(list(checks.check_python3_no_iterkeys(
-            "obj.iterkeys()"))))
-
-        self.assertEqual(0, len(list(checks.check_python3_no_iterkeys(
-            "six.iterkeys(obj)"))))
-
-        self.assertEqual(0, len(list(checks.check_python3_no_iterkeys(
-            "obj.keys()"))))
-
-    def test_dict_itervalues(self):
-        self.assertEqual(1, len(list(checks.check_python3_no_itervalues(
-            "obj.itervalues()"))))
-
-        self.assertEqual(0, len(list(checks.check_python3_no_itervalues(
-            "six.itervalues(ob)"))))
-
-        self.assertEqual(0, len(list(checks.check_python3_no_itervalues(
-            "obj.values()"))))
+    def test_no_log_warn(self):
+        code = """
+                  LOG.warn("LOG.warn is deprecated")
+               """
+        errors = [(1, 0, 'G330')]
+        self._assert_has_errors(code, checks.no_log_warn,
+                                expected_errors=errors)
+        code = """
+                  LOG.warning("LOG.warn is deprecated")
+               """
+        self._assert_has_no_errors(code, checks.no_log_warn)

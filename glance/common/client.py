@@ -17,35 +17,20 @@
 # http://code.activestate.com/recipes/
 #   577548-https-httplib-client-connection-with-certificate-v/
 
-import collections
+import collections.abc
 import copy
-import errno
 import functools
+import http.client
 import os
-import re
-
-try:
-    from eventlet.green import socket
-    from eventlet.green import ssl
-except ImportError:
-    import socket
-    import ssl
+import socket
+import ssl
+import urllib.parse as urlparse
 
 import osprofiler.web
 
-try:
-    import sendfile  # noqa
-    SENDFILE_SUPPORTED = True
-except ImportError:
-    SENDFILE_SUPPORTED = False
-
 from oslo_log import log as logging
 from oslo_utils import encodeutils
-import six
-from six.moves import http_client
-# NOTE(jokke): simplified transition to py3, behaves like py2 xrange
-from six.moves import range
-import six.moves.urllib.parse as urlparse
+from oslo_utils import netutils
 
 from glance.common import auth
 from glance.common import exception
@@ -56,8 +41,6 @@ LOG = logging.getLogger(__name__)
 
 # common chunk size for get and put
 CHUNKSIZE = 65536
-
-VERSION_REGEX = re.compile(r"/?v[0-9\.]+")
 
 
 def handle_unauthenticated(func):
@@ -93,7 +76,7 @@ def handle_redirects(func):
     return wrapped
 
 
-class HTTPSClientAuthConnection(http_client.HTTPSConnection):
+class HTTPSClientAuthConnection(http.client.HTTPSConnection):
     """
     Class to make a HTTPS connection, with support for
     full client-based SSL Authentication
@@ -104,7 +87,7 @@ class HTTPSClientAuthConnection(http_client.HTTPSConnection):
 
     def __init__(self, host, port, key_file, cert_file,
                  ca_file, timeout=None, insecure=False):
-        http_client.HTTPSConnection.__init__(self, host, port,
+        http.client.HTTPSConnection.__init__(self, host, port,
                                              key_file=key_file,
                                              cert_file=cert_file)
         self.key_file = key_file
@@ -151,24 +134,23 @@ class BaseClient(object):
                             '/etc/ssl/cert.pem')
 
     OK_RESPONSE_CODES = (
-        http_client.OK,
-        http_client.CREATED,
-        http_client.ACCEPTED,
-        http_client.NO_CONTENT,
+        http.client.OK,
+        http.client.CREATED,
+        http.client.ACCEPTED,
+        http.client.NO_CONTENT,
     )
 
     REDIRECT_RESPONSE_CODES = (
-        http_client.MOVED_PERMANENTLY,
-        http_client.FOUND,
-        http_client.SEE_OTHER,
-        http_client.USE_PROXY,
-        http_client.TEMPORARY_REDIRECT,
+        http.client.MOVED_PERMANENTLY,
+        http.client.FOUND,
+        http.client.SEE_OTHER,
+        http.client.USE_PROXY,
+        http.client.TEMPORARY_REDIRECT,
     )
 
     def __init__(self, host, port=None, timeout=None, use_ssl=False,
                  auth_token=None, creds=None, doc_root=None, key_file=None,
-                 cert_file=None, ca_file=None, insecure=False,
-                 configure_via_auth=True):
+                 cert_file=None, ca_file=None, insecure=False):
         """
         Creates a new client to some service.
 
@@ -198,10 +180,6 @@ class BaseClient(object):
                         GLANCE_CLIENT_CA_FILE is looked for.
         :param insecure: Optional. If set then the server's certificate
                          will not be verified.
-        :param configure_via_auth: Optional. Defaults to True. If set, the
-                         URL returned from the service catalog for the image
-                         endpoint will **override** the URL supplied to in
-                         the host parameter.
         """
         self.host = host
         self.port = port or self.DEFAULT_PORT
@@ -213,7 +191,6 @@ class BaseClient(object):
         self.auth_token = auth_token
         self.creds = creds or {}
         self.connection = None
-        self.configure_via_auth = configure_via_auth
         # doc_root can be a nullstring, which is valid, and why we
         # cannot simply do doc_root or self.DEFAULT_DOC_ROOT below.
         self.doc_root = (doc_root if doc_root is not None
@@ -286,40 +263,12 @@ class BaseClient(object):
 
         return connect_kwargs
 
-    def configure_from_url(self, url):
-        """
-        Setups the connection based on the given url.
-
-        The form is:
-
-            <http|https>://<host>:port/doc_root
-        """
-        LOG.debug("Configuring from URL: %s", url)
-        parsed = urlparse.urlparse(url)
-        self.use_ssl = parsed.scheme == 'https'
-        self.host = parsed.hostname
-        self.port = parsed.port or 80
-        self.doc_root = parsed.path.rstrip('/')
-
-        # We need to ensure a version identifier is appended to the doc_root
-        if not VERSION_REGEX.match(self.doc_root):
-            if self.DEFAULT_DOC_ROOT:
-                doc_root = self.DEFAULT_DOC_ROOT.lstrip('/')
-                self.doc_root += '/' + doc_root
-                LOG.debug("Appending doc_root %(doc_root)s to URL %(url)s",
-                          {'doc_root': doc_root, 'url': url})
-
-        # ensure connection kwargs are re-evaluated after the service catalog
-        # publicURL is parsed for potential SSL usage
-        self.connect_kwargs = self.get_connect_kwargs()
-
     def make_auth_plugin(self, creds, insecure):
         """
         Returns an instantiated authentication plugin.
         """
         strategy = creds.get('strategy', 'noauth')
-        plugin = auth.get_plugin_from_strategy(strategy, creds, insecure,
-                                               self.configure_via_auth)
+        plugin = auth.get_plugin_from_strategy(strategy, creds, insecure)
         return plugin
 
     def get_connection_type(self):
@@ -329,7 +278,7 @@ class BaseClient(object):
         if self.use_ssl:
             return HTTPSClientAuthConnection
         else:
-            return http_client.HTTPConnection
+            return http.client.HTTPConnection
 
     def _authenticate(self, force_reauth=False):
         """
@@ -343,10 +292,6 @@ class BaseClient(object):
             auth_plugin.authenticate()
 
         self.auth_token = auth_plugin.auth_token
-
-        management_url = auth_plugin.management_url
-        if management_url and self.configure_via_auth:
-            self.configure_from_url(management_url)
 
     @handle_unauthenticated
     def do_request(self, method, action, body=None, headers=None,
@@ -379,14 +324,17 @@ class BaseClient(object):
         action = urlparse.quote(action)
         path = '/'.join([self.doc_root or '', action.lstrip('/')])
         scheme = "https" if self.use_ssl else "http"
-        netloc = "%s:%d" % (self.host, self.port)
+        if netutils.is_valid_ipv6(self.host):
+            netloc = "[%s]:%d" % (self.host, self.port)
+        else:
+            netloc = "%s:%d" % (self.host, self.port)
 
         if isinstance(params, dict):
             for (key, value) in list(params.items()):
                 if value is None:
                     del params[key]
                     continue
-                if not isinstance(value, six.string_types):
+                if not isinstance(value, str):
                     value = str(value)
                 params[key] = encodeutils.safe_encode(value)
             query = urlparse.urlencode(params)
@@ -397,23 +345,6 @@ class BaseClient(object):
         log_msg = _("Constructed URL: %s")
         LOG.debug(log_msg, url.geturl())
         return url
-
-    def _encode_headers(self, headers):
-        """
-        Encodes headers.
-
-        Note: This should be used right before
-        sending anything out.
-
-        :param headers: Headers to encode
-        :returns: Dictionary with encoded headers'
-                  names and values
-        """
-        if six.PY3:
-            to_str = str
-        else:
-            to_str = encodeutils.safe_encode
-        return {to_str(h): to_str(v) for h, v in six.iteritems(headers)}
 
     @handle_redirects
     def _do_request(self, method, url, body, headers):
@@ -445,7 +376,7 @@ class BaseClient(object):
 
         try:
             connection_type = self.get_connection_type()
-            headers = self._encode_headers(headers or {})
+            headers = headers or {}
             headers.update(osprofiler.web.get_trace_id_headers())
 
             if 'x-auth-token' not in headers and self.auth_token:
@@ -461,12 +392,6 @@ class BaseClient(object):
 
             def _filelike(body):
                 return hasattr(body, 'read')
-
-            def _sendbody(connection, iter):
-                connection.endheaders()
-                for sent in iter:
-                    # iterator has done the heavy lifting
-                    pass
 
             def _chunkbody(connection, iter):
                 connection.putheader('Transfer-Encoding', 'chunked')
@@ -485,22 +410,15 @@ class BaseClient(object):
             elif _filelike(body) or self._iterable(body):
                 c.putrequest(method, path)
 
-                use_sendfile = self._sendable(body)
-
                 # According to HTTP/1.1, Content-Length and Transfer-Encoding
                 # conflict.
                 for header, value in headers.items():
-                    if use_sendfile or header.lower() != 'content-length':
+                    if header.lower() != 'content-length':
                         c.putheader(header, str(value))
 
                 iter = utils.chunkreadable(body)
 
-                if use_sendfile:
-                    # send actual file without copying into userspace
-                    _sendbody(c, iter)
-                else:
-                    # otherwise iterate and chunk
-                    _chunkbody(c, iter)
+                _chunkbody(c, iter)
             else:
                 raise TypeError('Unsupported image type: %s' % body.__class__)
 
@@ -510,9 +428,7 @@ class BaseClient(object):
                 return res.getheader('Retry-After')
 
             def read_body(res):
-                body = res.read()
-                if six.PY3:
-                    body = body.decode('utf-8')
+                body = res.read().decode('utf-8')
                 return body
 
             status_code = self.get_status_code(res)
@@ -520,24 +436,24 @@ class BaseClient(object):
                 return res
             elif status_code in self.REDIRECT_RESPONSE_CODES:
                 raise exception.RedirectException(res.getheader('Location'))
-            elif status_code == http_client.UNAUTHORIZED:
+            elif status_code == http.client.UNAUTHORIZED:
                 raise exception.NotAuthenticated(read_body(res))
-            elif status_code == http_client.FORBIDDEN:
+            elif status_code == http.client.FORBIDDEN:
                 raise exception.Forbidden(read_body(res))
-            elif status_code == http_client.NOT_FOUND:
+            elif status_code == http.client.NOT_FOUND:
                 raise exception.NotFound(read_body(res))
-            elif status_code == http_client.CONFLICT:
+            elif status_code == http.client.CONFLICT:
                 raise exception.Duplicate(read_body(res))
-            elif status_code == http_client.BAD_REQUEST:
+            elif status_code == http.client.BAD_REQUEST:
                 raise exception.Invalid(read_body(res))
-            elif status_code == http_client.MULTIPLE_CHOICES:
+            elif status_code == http.client.MULTIPLE_CHOICES:
                 raise exception.MultipleChoices(body=read_body(res))
-            elif status_code == http_client.REQUEST_ENTITY_TOO_LARGE:
+            elif status_code == http.client.REQUEST_ENTITY_TOO_LARGE:
                 raise exception.LimitExceeded(retry=_retry(res),
                                               body=read_body(res))
-            elif status_code == http_client.INTERNAL_SERVER_ERROR:
+            elif status_code == http.client.INTERNAL_SERVER_ERROR:
                 raise exception.ServerError()
-            elif status_code == http_client.SERVICE_UNAVAILABLE:
+            elif status_code == http.client.SERVICE_UNAVAILABLE:
                 raise exception.ServiceUnavailable(retry=_retry(res))
             else:
                 raise exception.UnexpectedStatus(status=status_code,
@@ -546,24 +462,8 @@ class BaseClient(object):
         except (socket.error, IOError) as e:
             raise exception.ClientConnectionError(e)
 
-    def _seekable(self, body):
-        # pipes are not seekable, avoids sendfile() failure on e.g.
-        #   cat /path/to/image | glance add ...
-        # or where add command is launched via popen
-        try:
-            os.lseek(body.fileno(), 0, os.SEEK_CUR)
-            return True
-        except OSError as e:
-            return (e.errno != errno.ESPIPE)
-
-    def _sendable(self, body):
-        return (SENDFILE_SUPPORTED and
-                hasattr(body, 'fileno') and
-                self._seekable(body) and
-                not self.use_ssl)
-
     def _iterable(self, body):
-        return isinstance(body, collections.Iterable)
+        return isinstance(body, collections.abc.Iterable)
 
     def get_status_code(self, response):
         """

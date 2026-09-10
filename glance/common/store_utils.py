@@ -13,13 +13,13 @@
 #    under the License.
 
 import sys
+import urllib.parse as urlparse
 
 import glance_store as store_api
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import encodeutils
-import six.moves.urllib.parse as urlparse
 
+from glance.common import utils as common_utils
 import glance.db as db_api
 from glance.i18n import _LE, _LW
 from glance import scrubber
@@ -29,6 +29,13 @@ LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
 
 RESTRICTED_URI_SCHEMAS = frozenset(['file', 'filesystem', 'swift+config'])
+
+
+def check_reserved_stores(enabled_stores):
+    for store in enabled_stores:
+        if store.startswith("os_glance_"):
+            return True
+    return False
 
 
 def safe_delete_from_backend(context, image_id, location):
@@ -45,17 +52,28 @@ def safe_delete_from_backend(context, image_id, location):
     """
 
     try:
-        ret = store_api.delete_from_backend(location['url'], context=context)
+        if CONF.enabled_backends:
+            backend = location['metadata'].get('store')
+            ret = store_api.delete(location['url'],
+                                   backend,
+                                   context=context)
+        else:
+            ret = store_api.delete_from_backend(location['url'],
+                                                context=context)
+
         location['status'] = 'deleted'
         if 'id' in location:
-            db_api.get_api().image_location_delete(context, image_id,
-                                                   location['id'], 'deleted')
+            common_utils.retry_on_db_lock(
+                lambda: db_api.get_api().image_location_delete(
+                    context, image_id, location['id'], 'deleted'))
         return ret
     except store_api.NotFound:
-        msg = _LW('Failed to delete image %s in store from URI') % image_id
-        LOG.warn(msg)
+        msg = ("The image data for %(iid)s was not found in the store. "
+               "The image record has been updated to reflect "
+               "this." % {'iid': image_id})
+        LOG.warning(msg)
     except store_api.StoreDeleteNotSupported as e:
-        LOG.warn(encodeutils.exception_to_unicode(e))
+        LOG.warning(str(e))
     except store_api.UnsupportedBackend:
         exc_type = sys.exc_info()[0].__name__
         msg = (_LE('Failed to delete image %(image_id)s from store: %(exc)s') %
@@ -75,8 +93,7 @@ def schedule_delayed_delete_from_backend(context, image_id, location):
 
     db_queue = scrubber.get_scrub_queue()
 
-    if not CONF.use_user_token:
-        context = None
+    context = None
 
     ret = db_queue.add_location(image_id, location)
     if ret:
@@ -84,9 +101,9 @@ def schedule_delayed_delete_from_backend(context, image_id, location):
         if 'id' in location:
             # NOTE(zhiyan): New added image location entry will has no 'id'
             # field since it has not been saved to DB.
-            db_api.get_api().image_location_delete(context, image_id,
-                                                   location['id'],
-                                                   'pending_delete')
+            common_utils.retry_on_db_lock(
+                lambda: db_api.get_api().image_location_delete(
+                    context, image_id, location['id'], 'pending_delete'))
         else:
             db_api.get_api().image_location_add(context, image_id, location)
 
@@ -118,10 +135,14 @@ def validate_external_location(uri):
     """
     Validate if URI of external location are supported.
 
-    Only over non-local store types are OK, i.e. S3, Swift,
+    Only over non-local store types are OK, i.e. Swift,
     HTTP. Note the absence of 'file://' for security reasons,
     see LP bug #942118, 1400966, 'swift+config://' is also
     absent for security reasons, see LP bug #1334196.
+
+    HTTP(S) locations are additionally checked with the same
+    ``import_filtering_opts`` host/port rules used for web-download
+    (see LP bug #2161330).
 
     :param uri: The URI of external image location.
     :returns: Whether given URI of external image location are OK.
@@ -132,5 +153,146 @@ def validate_external_location(uri):
     # TODO(zhiyan): This function could be moved to glance_store.
     # TODO(gm): Use a whitelist of allowed schemes
     scheme = urlparse.urlparse(uri).scheme
-    return (scheme in store_api.get_known_schemes() and
-            scheme not in RESTRICTED_URI_SCHEMAS)
+    known_schemes = store_api.get_known_schemes()
+    if CONF.enabled_backends:
+        known_schemes = store_api.get_known_schemes_for_multi_store()
+
+    if (scheme not in known_schemes or
+            scheme in RESTRICTED_URI_SCHEMAS):
+        return False
+
+    # NOTE(abhishekk): Apply import host filtering to HTTP(S) locations so
+    # location add cannot SSRF glance-api into loopback/link-local targets
+    # (or other hosts blocked by import_filtering_opts).
+    if scheme in ('http', 'https'):
+        return common_utils.validate_uri(uri)
+
+    return True
+
+
+def _get_store_id_from_uri(uri):
+    scheme = urlparse.urlparse(uri).scheme
+    location_map = store_api.location.SCHEME_TO_CLS_BACKEND_MAP
+    url_matched = False
+    if scheme not in location_map:
+        LOG.warning("Unknown scheme '%(scheme)s' found in uri '%(uri)s'", {
+            'scheme': scheme, 'uri': uri})
+        return
+    for store in location_map[scheme]:
+        store_instance = location_map[scheme][store]['store']
+        url_prefix = store_instance.url_prefix
+        if url_prefix and uri.startswith(url_prefix):
+            url_matched = True
+            break
+
+    if url_matched:
+        return u"%s" % store
+    else:
+        LOG.warning("Invalid location uri %s", uri)
+        return
+
+
+def update_store_in_locations(context, image, image_repo):
+    store_updated = False
+    for loc in image.locations:
+        if loc['url'].startswith(('s3://', 's3+http://', 's3+https://')):
+            if _update_s3_location_credentials(loc):
+                store_updated = True
+        if (not loc['metadata'].get(
+                'store') or loc['metadata'].get(
+                'store') not in CONF.enabled_backends):
+            if loc['url'].startswith("cinder://"):
+                _update_cinder_location_and_store_id(context, loc)
+
+            store_id = _get_store_id_from_uri(loc['url'])
+            if store_id:
+                if 'store' in loc['metadata']:
+                    old_store = loc['metadata']['store']
+                    if old_store != store_id:
+                        LOG.debug("Store '%(old)s' has changed to "
+                                  "'%(new)s' by operator, updating "
+                                  "the same in the location of image "
+                                  "'%(id)s'", {'old': old_store,
+                                               'new': store_id,
+                                               'id': image.image_id})
+
+                store_updated = True
+                loc['metadata']['store'] = store_id
+
+    if store_updated:
+        image_repo.save(image)
+
+
+def _update_cinder_location_and_store_id(context, loc):
+    """Update store location of legacy images
+
+    While upgrading from single cinder store to multiple stores,
+    the images having a store configured with a volume type matching
+    the image-volume's type will be migrated/associated to that store
+    and their location url will be updated respectively to the new format
+    i.e. cinder://store-id/volume-id
+    If there is no store configured for the image, the location url will
+    not be updated.
+    """
+    uri = loc['url']
+    volume_id = loc['url'].split("/")[-1]
+    scheme = urlparse.urlparse(uri).scheme
+    location_map = store_api.location.SCHEME_TO_CLS_BACKEND_MAP
+    if scheme not in location_map:
+        LOG.warning(_LW("Unknown scheme '%(scheme)s' found in uri '%(uri)s'"),
+                    {'scheme': scheme, 'uri': uri})
+        return
+
+    for store in location_map[scheme]:
+        store_instance = location_map[scheme][store]['store']
+        if store_instance.is_image_associated_with_store(context, volume_id):
+            url_prefix = store_instance.url_prefix
+            loc['url'] = "%s/%s" % (url_prefix, volume_id)
+            loc['metadata']['store'] = "%s" % store
+            return
+
+
+def _update_s3_location_credentials(loc):
+    """Migrate S3 location from legacy credential-embedded URI to
+    credential-free format.
+
+    :param loc: The image location entry
+    :returns: True if an update was made, False otherwise
+    """
+    uri = loc['url']
+
+    if '@' not in uri:
+        return False
+
+    scheme = urlparse.urlparse(uri).scheme
+
+    uri_without_query = uri.split('?')[0].split('#')[0]
+    at_pos = uri_without_query.rfind('@')
+    if at_pos == -1:
+        return False
+
+    host_and_path = uri_without_query[at_pos + 1:]
+    loc['url'] = "%s://%s" % (scheme, host_and_path)
+    return True
+
+
+def get_updated_store_location(locations, context):
+    for loc in locations:
+        if loc['url'].startswith("cinder://") and context:
+            _update_cinder_location_and_store_id(context, loc)
+            continue
+
+        store_id = _get_store_id_from_uri(loc['url'])
+        if store_id:
+            loc['metadata']['store'] = store_id
+
+    return locations
+
+
+def get_dir_separator():
+    separator = ''
+    staging_dir = "file://%s" % getattr(
+        CONF, 'os_glance_staging_store').filesystem_store_datadir
+    if not staging_dir.endswith('/'):
+        separator = '/'
+    return separator, staging_dir

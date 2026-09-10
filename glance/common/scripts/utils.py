@@ -18,16 +18,26 @@ __all__ = [
     'unpack_task_input',
     'set_base_image_properties',
     'validate_location_uri',
+    'validate_legacy_import_from_uri',
     'get_image_data_iter',
+    'open_external_uri',
+    'SafeRedirectHandler',
 ]
+import http.client
+import os
+import urllib
+import urllib.error
+import urllib.request
 
-
+from oslo_config import cfg
 from oslo_log import log as logging
-from six.moves import urllib
+from oslo_utils import timeutils
 
 from glance.common import exception
+from glance.common import utils as common_utils
 from glance.i18n import _, _LE
 
+CONF = cfg.CONF
 LOG = logging.getLogger(__name__)
 
 
@@ -52,14 +62,31 @@ def unpack_task_input(task):
 
     :param task: Task domain object
     """
+    task_type = task.type
     task_input = task.task_input
 
-    # NOTE: until we support multiple task types, we just check for
-    # input fields related to 'import task'.
-    for key in ["import_from", "import_from_format", "image_properties"]:
-        if key not in task_input:
-            msg = _("Input does not contain '%(key)s' field") % {"key": key}
+    if task_type == 'api_image_import':
+        if not task_input:
+            msg = _("Input to api_image_import task is empty.")
             raise exception.Invalid(msg)
+        if 'image_id' not in task_input:
+            msg = _("Missing required 'image_id' field")
+            raise exception.Invalid(msg)
+    elif task_type == 'location_import':
+        if not task_input:
+            msg = _("Input to location_import task is empty.")
+            raise exception.Invalid(msg)
+        for key in ['image_id', 'loc_url', 'validation_data']:
+            if key not in task_input:
+                msg = (_("Input does not contain '%(key)s' field") %
+                       {"key": key})
+                raise exception.Invalid(msg)
+    else:
+        for key in ["import_from", "import_from_format", "image_properties"]:
+            if key not in task_input:
+                msg = (_("Input does not contain '%(key)s' field") %
+                       {"key": key})
+                raise exception.Invalid(msg)
 
     return task_input
 
@@ -107,16 +134,141 @@ def validate_location_uri(location):
         raise urllib.error.URLError(msg)
 
 
+def validate_legacy_import_from_uri(location):
+    """Validate legacy ``import_from`` URI (scheme + import filter)."""
+    uri = validate_location_uri(location)
+    if not common_utils.validate_uri(uri):
+        msg = (_("URI for legacy import task does not pass filtering: %s") %
+               uri)
+        raise exception.Invalid(msg)
+    return uri
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """HTTP redirect handler that validates redirect destinations."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not common_utils.validate_uri(newurl):
+            msg = (_("Redirect to disallowed URL: %s") % newurl)
+            raise exception.InvalidRedirect(msg)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTP connection that connects to a pre-validated IP address."""
+
+    def __init__(self, host, port=None, *, pinned_ip=None, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(host, port=port, **kwargs)
+
+    def connect(self):
+        if self._pinned_ip:
+            self.sock = self._create_connection(
+                (self._pinned_ip, self.port), self.timeout,
+                self.source_address)
+            return
+        super().connect()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that connects to a pre-validated IP address."""
+
+    def __init__(self, host, port=None, *, pinned_ip=None, **kwargs):
+        self._pinned_ip = pinned_ip
+        super().__init__(host, port=port, **kwargs)
+
+    def connect(self):
+        if self._pinned_ip:
+            sock = self._create_connection(
+                (self._pinned_ip, self.port), self.timeout,
+                self.source_address)
+            if self._tunnel_host:
+                self.sock = sock
+                self._tunnel()
+            else:
+                self.sock = self._context.wrap_socket(
+                    sock, server_hostname=self.host)
+            return
+        super().connect()
+
+
+def _pinned_ip_for_request(req):
+    """Return a pinned destination IP for an external HTTP(S) URI."""
+    try:
+        return common_utils.get_validated_address(req.full_url)
+    except ValueError as exc:
+        msg = (_("URI does not pass filtering: %s") % req.full_url)
+        LOG.debug("%s (%s)", msg, exc)
+        raise exception.Invalid(msg)
+
+
+class _ValidatedExternalHTTPHandler(urllib.request.HTTPHandler):
+    """Open HTTP URIs using validated, pinned destination addresses."""
+
+    def http_open(self, req):
+        pinned_ip = _pinned_ip_for_request(req)
+        for addr in pinned_ip:
+            try:
+                return self.do_open(
+                    lambda host, **kwargs: _PinnedHTTPConnection(
+                        host, pinned_ip=addr, **kwargs),
+                    req)
+            except Exception as exc:  # noqa
+                LOG.warning("Failed to import image %(url)s using IP %(ip)s: "
+                            "%(exc)s",
+                            {"url": req.full_url, "ip": addr, "exc": exc})
+                continue
+        raise exception.ImportTaskError(
+            "Exhausted allowed addresses when importing image."
+        )
+
+
+class _ValidatedExternalHTTPSHandler(urllib.request.HTTPSHandler):
+    """Open HTTPS URIs using validated, pinned destination addresses."""
+
+    def https_open(self, req):
+        pinned_ip = _pinned_ip_for_request(req)
+        for addr in pinned_ip:
+            try:
+                return self.do_open(
+                    lambda host, **kwargs: _PinnedHTTPSConnection(
+                        host, pinned_ip=addr, **kwargs),
+                    req)
+            except Exception as exc:  # noqa
+                LOG.warning("Failed to import image %(url)s using IP %(ip)s: "
+                            "%(exc)s",
+                            {"url": req.full_url, "ip": addr, "exc": exc})
+                continue
+        raise exception.ImportTaskError(
+            "Exhausted allowed addresses when importing image."
+        )
+
+
+def open_external_uri(uri_or_request):
+    """Open an external URL string or Request with validation and IP pinning.
+
+    The destination is re-checked at fetch time and the TCP connection is
+    pinned to the validated address so DNS cannot rebind mid-download.
+    Suitable for import downloads and other outbound HTTP(S) fetches that
+    need the same host filtering protections.
+    """
+    opener = urllib.request.build_opener(
+        SafeRedirectHandler,
+        _ValidatedExternalHTTPHandler,
+        _ValidatedExternalHTTPSHandler,
+    )
+    return opener.open(uri_or_request)
+
+
 def get_image_data_iter(uri):
     """Returns iterable object either for local file or uri
 
     :param uri: uri (remote or local) to the datasource we want to iterate
 
-    Validation/sanitization of the uri is expected to happen before we get
-    here.
+    Remote HTTP(S) URIs are validated and resolved at fetch time. The
+    connection is pinned to the validated destination address to close the
+    DNS rebinding window between API validation and worker download.
     """
-    # NOTE(flaper87): This is safe because the input uri is already
-    # verified before the task is created.
+    size = 0
     if uri.startswith("file://"):
         uri = uri.split("file://")[-1]
         # NOTE(flaper87): The caller of this function expects to have
@@ -124,10 +276,118 @@ def get_image_data_iter(uri):
         # we are returning it as is.
         # The file descriptor will be eventually cleaned up by the garbage
         # collector once its ref-count is dropped to 0. That is, when there
-        # wont be any references pointing to this file.
+        # won't be any references pointing to this file.
         #
         # We're not using StringIO or other tools to avoid reading everything
         # into memory. Some images may be quite heavy.
-        return open(uri, "r")
+        size = os.path.getsize(uri)
+        data = open(uri, "rb")
+        return common_utils.LimitingReader(
+            common_utils.CooperativeReader(data),
+            CONF.image_size_cap), size
 
-    return urllib.request.urlopen(uri)
+    urlopen = open_external_uri(uri)
+    try:
+        size = int(urlopen.headers['content-length'])
+    except (KeyError, ValueError, TypeError):
+        pass
+
+    return common_utils.LimitingReader(
+        common_utils.CooperativeReader(urlopen),
+        CONF.image_size_cap), size
+
+
+class CallbackIterator(object):
+    """A proxy iterator that calls a callback function periodically
+
+    This is used to wrap a reading file object and proxy its chunks
+    through to another caller. Periodically, the callback function
+    will be called with information about the data processed so far,
+    allowing for status updating or cancel flag checking. The function
+    can be called every time we process a chunk, or only after we have
+    processed a certain amount of data since the last call.
+
+    :param source: A source iterator whose content will be proxied
+                   through this object.
+    :param callback: A function to be called periodically while iterating.
+                     The signature should be fn(chunk_bytes, total_bytes),
+                     where chunk is the number of bytes since the last
+                     call of the callback, and total_bytes is the total amount
+                     copied thus far.
+    :param min_interval: Limit the calls to callback to only when this many
+                         seconds have elapsed since the last callback (a
+                         close() or final iteration may fire the callback in
+                         less time to ensure completion).
+    """
+
+    def __init__(self, source, callback, min_interval=None):
+        self._source = source
+        self._callback = callback
+        self._min_interval = min_interval
+        self._chunk_bytes = 0
+        self._total_bytes = 0
+        self._timer = None
+
+    @property
+    def callback_due(self):
+        """Indicates if a callback should be made.
+
+        If no time-based limit is set, this will always be True.
+        If a limit is set, then this returns True exactly once,
+        resetting the timer when it does.
+        """
+        if not self._min_interval:
+            return True
+
+        if not self._timer:
+            self._timer = timeutils.StopWatch(self._min_interval)
+            self._timer.start()
+
+        if self._timer.expired():
+            self._timer.restart()
+            return True
+        else:
+            return False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            chunk = next(self._source)
+        except StopIteration:
+            # NOTE(danms): Make sure we call the callback the last
+            # time if we have processed data since the last one.
+            self._call_callback(b'', is_last=True)
+            raise
+
+        self._call_callback(chunk)
+        return chunk
+
+    def close(self):
+        self._call_callback(b'', is_last=True)
+        if hasattr(self._source, 'close'):
+            return self._source.close()
+
+    def _call_callback(self, chunk, is_last=False):
+        self._total_bytes += len(chunk)
+        self._chunk_bytes += len(chunk)
+
+        if not self._chunk_bytes:
+            # NOTE(danms): Never call the callback if we haven't processed
+            # any data since the last time
+            return
+
+        if is_last or self.callback_due:
+            # FIXME(danms): Perhaps we should only abort the read if
+            # the callback raises a known abort exception, otherwise
+            # log and swallow. Need to figure out what exception
+            # read() callers would be expecting that we could raise
+            # from here.
+            self._callback(self._chunk_bytes, self._total_bytes)
+            self._chunk_bytes = 0
+
+    def read(self, size=None):
+        chunk = self._source.read(size)
+        self._call_callback(chunk)
+        return chunk

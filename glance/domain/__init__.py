@@ -14,7 +14,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import collections
+from collections import abc
 import datetime
 import uuid
 
@@ -22,11 +22,10 @@ from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_utils import excutils
 from oslo_utils import importutils
-import six
+from oslo_utils import timeutils
 
 from glance.common import exception
-from glance.common import timeutils
-from glance.i18n import _, _LE, _LI, _LW
+from glance.i18n import _, _LE, _LI
 
 LOG = logging.getLogger(__name__)
 CONF = cfg.CONF
@@ -48,7 +47,8 @@ def _import_delayed_delete():
 
 class ImageFactory(object):
     _readonly_properties = ['created_at', 'updated_at', 'status', 'checksum',
-                            'size', 'virtual_size']
+                            'os_hash_algo', 'os_hash_value', 'size',
+                            'virtual_size']
     _reserved_properties = ['owner', 'locations', 'deleted', 'deleted_at',
                             'direct_url', 'self', 'file', 'schema']
 
@@ -68,10 +68,11 @@ class ImageFactory(object):
                 if key in properties:
                     raise exception.ReservedProperty(property=key)
 
-    def new_image(self, image_id=None, name=None, visibility='private',
+    def new_image(self, image_id=None, name=None, visibility='shared',
                   min_disk=0, min_ram=0, protected=False, owner=None,
                   disk_format=None, container_format=None,
-                  extra_properties=None, tags=None, **other_args):
+                  extra_properties=None, tags=None, os_hidden=False,
+                  **other_args):
         extra_properties = extra_properties or {}
         self._check_readonly(other_args)
         self._check_unexpected(other_args)
@@ -89,6 +90,7 @@ class ImageFactory(object):
                      min_ram=min_ram, protected=protected,
                      owner=owner, disk_format=disk_format,
                      container_format=container_format,
+                     os_hidden=os_hidden,
                      extra_properties=extra_properties, tags=tags or [])
 
 
@@ -101,11 +103,13 @@ class Image(object):
         # NOTE(flwang): In v2, we are deprecating the 'killed' status, so it's
         # allowed to restore image from 'saving' to 'queued' so that upload
         # can be retried.
-        'queued': ('saving', 'active', 'deleted'),
+        'queued': ('saving', 'uploading', 'importing', 'active', 'deleted'),
         'saving': ('active', 'killed', 'deleted', 'queued'),
+        'uploading': ('importing', 'queued', 'deleted'),
+        'importing': ('active', 'deleted', 'queued'),
         'active': ('pending_delete', 'deleted', 'deactivated'),
         'killed': ('deleted',),
-        'pending_delete': ('deleted',),
+        'pending_delete': ('deleted', 'active'),
         'deleted': (),
         'deactivated': ('active', 'deleted'),
     }
@@ -116,12 +120,15 @@ class Image(object):
         self.created_at = created_at
         self.updated_at = updated_at
         self.name = kwargs.pop('name', None)
-        self.visibility = kwargs.pop('visibility', 'private')
+        self.visibility = kwargs.pop('visibility', 'shared')
+        self.os_hidden = kwargs.pop('os_hidden', False)
         self.min_disk = kwargs.pop('min_disk', 0)
         self.min_ram = kwargs.pop('min_ram', 0)
         self.protected = kwargs.pop('protected', False)
         self.locations = kwargs.pop('locations', [])
         self.checksum = kwargs.pop('checksum', None)
+        self.os_hash_algo = kwargs.pop('os_hash_algo', None)
+        self.os_hash_value = kwargs.pop('os_hash_value', None)
         self.owner = kwargs.pop('owner', None)
         self._disk_format = kwargs.pop('disk_format', None)
         self._container_format = kwargs.pop('container_format', None)
@@ -130,6 +137,7 @@ class Image(object):
         extra_properties = kwargs.pop('extra_properties', {})
         self.extra_properties = ExtraProperties(extra_properties)
         self.tags = kwargs.pop('tags', [])
+        self.member = kwargs.pop('member', None)
         if kwargs:
             message = _("__init__() got unexpected keyword argument '%s'")
             raise TypeError(message % list(kwargs.keys())[0])
@@ -148,7 +156,8 @@ class Image(object):
                 LOG.debug(e)
                 raise e
 
-            if self._status == 'queued' and status in ('saving', 'active'):
+            if self._status in ('queued', 'uploading') and status in (
+                    'saving', 'active', 'importing'):
                 missing = [k for k in ['disk_format', 'container_format']
                            if not getattr(self, k)]
                 if len(missing) > 0:
@@ -172,9 +181,9 @@ class Image(object):
 
     @visibility.setter
     def visibility(self, visibility):
-        if visibility not in ('public', 'private'):
-            raise ValueError(_('Visibility must be either "public" '
-                               'or "private"'))
+        if visibility not in ('community', 'public', 'private', 'shared'):
+            raise ValueError(_('Visibility must be one of "community", '
+                               '"public", "private", or "shared"'))
         self._visibility = visibility
 
     @property
@@ -191,7 +200,8 @@ class Image(object):
 
     @container_format.setter
     def container_format(self, value):
-        if hasattr(self, '_container_format') and self.status != 'queued':
+        if (hasattr(self, '_container_format') and
+                self.status not in ('queued', 'importing')):
             msg = _("Attribute container_format can be only replaced "
                     "for a queued image.")
             raise exception.Forbidden(message=msg)
@@ -203,7 +213,8 @@ class Image(object):
 
     @disk_format.setter
     def disk_format(self, value):
-        if hasattr(self, '_disk_format') and self.status != 'queued':
+        if (hasattr(self, '_disk_format') and
+                self.status not in ('queued', 'importing')):
             msg = _("Attribute disk_format can be only replaced "
                     "for a queued image.")
             raise exception.Forbidden(message=msg)
@@ -247,7 +258,7 @@ class Image(object):
         if self.status == 'active':
             self.status = 'deactivated'
         elif self.status == 'deactivated':
-            # Noop if already deactive
+            # Noop if already deactivate
             pass
         else:
             LOG.debug("Not allowed to deactivate image in status '%s'",
@@ -272,11 +283,11 @@ class Image(object):
     def get_data(self, *args, **kwargs):
         raise NotImplementedError()
 
-    def set_data(self, data, size=None):
+    def set_data(self, data, size=None, backend=None, set_active=True):
         raise NotImplementedError()
 
 
-class ExtraProperties(collections.MutableMapping, dict):
+class ExtraProperties(abc.MutableMapping, dict):
 
     def __getitem__(self, key):
         return dict.__getitem__(self, key)
@@ -289,17 +300,20 @@ class ExtraProperties(collections.MutableMapping, dict):
 
     def __eq__(self, other):
         if isinstance(other, ExtraProperties):
-            return dict(self).__eq__(dict(other))
+            return dict.__eq__(self, dict(other))
         elif isinstance(other, dict):
-            return dict(self).__eq__(other)
+            return dict.__eq__(self, other)
         else:
             return False
 
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
     def __len__(self):
-        return dict(self).__len__()
+        return dict.__len__(self)
 
     def keys(self):
-        return dict(self).keys()
+        return dict.keys(self)
 
 
 class ImageMembership(object):
@@ -337,19 +351,20 @@ class ImageMemberFactory(object):
 
 
 class Task(object):
-    _supported_task_type = ('import',)
+    _supported_task_type = ('import', 'api_image_import', 'location_import')
 
     _supported_task_status = ('pending', 'processing', 'success', 'failure')
 
     def __init__(self, task_id, task_type, status, owner,
+                 image_id, user_id, request_id,
                  expires_at, created_at, updated_at,
                  task_input, result, message):
 
         if task_type not in self._supported_task_type:
-            raise exception.InvalidTaskType(task_type)
+            raise exception.InvalidTaskType(type=task_type)
 
         if status not in self._supported_task_status:
-            raise exception.InvalidTaskStatus(status)
+            raise exception.InvalidTaskStatus(status=status)
 
         self.task_id = task_id
         self._status = status
@@ -365,6 +380,9 @@ class Task(object):
         self.task_input = task_input
         self.result = result
         self.message = message
+        self.image_id = image_id
+        self.request_id = request_id
+        self.user_id = user_id
 
     @property
     def status(self):
@@ -377,9 +395,9 @@ class Task(object):
     @message.setter
     def message(self, message):
         if message:
-            self._message = six.text_type(message)
+            self._message = str(message)
         else:
-            self._message = six.text_type('')
+            self._message = ''
 
     def _validate_task_status_transition(self, cur_status, new_status):
         valid_transitions = {
@@ -396,12 +414,12 @@ class Task(object):
 
     def _set_task_status(self, new_status):
         if self._validate_task_status_transition(self.status, new_status):
+            old_status = self.status
             self._status = new_status
             LOG.info(_LI("Task [%(task_id)s] status changing from "
                          "%(cur_status)s to %(new_status)s"),
-                     {'task_id': self.task_id, 'cur_status': self.status,
+                     {'task_id': self.task_id, 'cur_status': old_status,
                       'new_status': new_status})
-            self._status = new_status
         else:
             LOG.error(_LE("Task [%(task_id)s] status failed to change from "
                           "%(cur_status)s to %(new_status)s"),
@@ -435,7 +453,8 @@ class Task(object):
 class TaskStub(object):
 
     def __init__(self, task_id, task_type, status, owner,
-                 expires_at, created_at, updated_at):
+                 expires_at, created_at, updated_at,
+                 image_id, user_id, request_id):
         self.task_id = task_id
         self._status = status
         self.type = task_type
@@ -443,6 +462,9 @@ class TaskStub(object):
         self.expires_at = expires_at
         self.created_at = created_at
         self.updated_at = updated_at
+        self.image_id = image_id
+        self.request_id = request_id
+        self.user_id = user_id
 
     @property
     def status(self):
@@ -451,8 +473,8 @@ class TaskStub(object):
 
 class TaskFactory(object):
 
-    def new_task(self, task_type, owner,
-                 task_input=None, **kwargs):
+    def new_task(self, task_type, owner, image_id, user_id,
+                 request_id, task_input=None, **kwargs):
         task_id = str(uuid.uuid4())
         status = 'pending'
         # Note(nikhil): expires_at would be set on the task, only when it
@@ -465,52 +487,42 @@ class TaskFactory(object):
             task_type,
             status,
             owner,
+            image_id,
+            user_id,
+            request_id,
             expires_at,
             created_at,
             updated_at,
             task_input,
             kwargs.get('result'),
-            kwargs.get('message')
+            kwargs.get('message'),
         )
 
 
 class TaskExecutorFactory(object):
-    eventlet_deprecation_warned = False
 
-    def __init__(self, task_repo, image_repo, image_factory):
+    def __init__(self, task_repo, image_repo, image_factory, admin_repo=None):
         self.task_repo = task_repo
         self.image_repo = image_repo
         self.image_factory = image_factory
+        self.admin_repo = admin_repo
 
     def new_task_executor(self, context):
         try:
-            # NOTE(flaper87): Backwards compatibility layer.
-            # It'll allow us to provide a deprecation path to
-            # users that are currently consuming the `eventlet`
-            # executor.
             task_executor = CONF.task.task_executor
-            if task_executor == 'eventlet':
-                # NOTE(jokke): Making sure we do not log the deprecation
-                # warning 1000 times or anything crazy like that.
-                if not TaskExecutorFactory.eventlet_deprecation_warned:
-                    msg = _LW("The `eventlet` executor has been deprecated. "
-                              "Use `taskflow` instead.")
-                    LOG.warn(msg)
-                    TaskExecutorFactory.eventlet_deprecation_warned = True
-                task_executor = 'taskflow'
-
-            executor_cls = ('glance.async.%s_executor.'
+            executor_cls = ('glance.async_.%s_executor.'
                             'TaskExecutor' % task_executor)
             LOG.debug("Loading %s executor", task_executor)
             executor = importutils.import_class(executor_cls)
             return executor(context,
                             self.task_repo,
                             self.image_repo,
-                            self.image_factory)
+                            self.image_factory,
+                            admin_repo=self.admin_repo)
         except ImportError:
             with excutils.save_and_reraise_exception():
                 LOG.exception(_LE("Failed to load the %s executor provided "
-                                  "in the config.") % CONF.task.task_executor)
+                                  "in the config."), CONF.task.task_executor)
 
 
 class MetadefNamespace(object):

@@ -22,7 +22,6 @@ return
 from oslo_config import cfg
 from oslo_log import log as logging
 
-from glance.api.glare import versions as artifacts_versions
 from glance.api import versions
 from glance.common import wsgi
 
@@ -73,15 +72,28 @@ class VersionNegotiationFilter(wsgi.Middleware):
 
     def _get_allowed_versions(self):
         allowed_versions = {}
-        if CONF.enable_v1_api:
-            allowed_versions['v1'] = 1
-            allowed_versions['v1.0'] = 1
-            allowed_versions['v1.1'] = 1
-        if CONF.enable_v2_api:
-            allowed_versions['v2'] = 2
-            allowed_versions['v2.0'] = 2
-            allowed_versions['v2.1'] = 2
-            allowed_versions['v2.2'] = 2
+        allowed_versions['v2'] = 2
+        allowed_versions['v2.0'] = 2
+        allowed_versions['v2.1'] = 2
+        allowed_versions['v2.2'] = 2
+        allowed_versions['v2.3'] = 2
+        allowed_versions['v2.4'] = 2
+        allowed_versions['v2.5'] = 2
+        allowed_versions['v2.6'] = 2
+        allowed_versions['v2.7'] = 2
+        allowed_versions['v2.9'] = 2
+        if CONF.image_cache_dir:
+            allowed_versions['v2.14'] = 2
+            allowed_versions['v2.16'] = 2
+            allowed_versions['v2.18'] = 2
+        allowed_versions['v2.15'] = 2
+        if CONF.enabled_backends:
+            allowed_versions['v2.8'] = 2
+            allowed_versions['v2.10'] = 2
+            allowed_versions['v2.11'] = 2
+            allowed_versions['v2.12'] = 2
+            allowed_versions['v2.13'] = 2
+        allowed_versions['v2.17'] = 2
         return allowed_versions
 
     def _match_version_string(self, subject):
@@ -91,7 +103,7 @@ class VersionNegotiationFilter(wsgi.Middleware):
 
         :param subject: The string to check
         :returns: version found in the subject
-        :raises: ValueError if no acceptable version could be found
+        :raises ValueError: if no acceptable version could be found
         """
         if self.allowed_versions is None:
             self.allowed_versions = self._get_allowed_versions()
@@ -116,15 +128,3 @@ class VersionNegotiationFilter(wsgi.Middleware):
         r = path[:idx]
         req.path_info = path[idx:]
         return r
-
-
-class GlareVersionNegotiationFilter(VersionNegotiationFilter):
-    def __init__(self, app):
-        super(GlareVersionNegotiationFilter, self).__init__(app)
-        self.versions_app = artifacts_versions.Controller()
-        self.vnd_mime_type = 'application/vnd.openstack.artifacts-'
-
-    def _get_allowed_versions(self):
-        return {
-            'v0.1': 0.1
-        }

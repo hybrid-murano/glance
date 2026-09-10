@@ -13,12 +13,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-from mox3 import mox
-from six.moves import http_client
+import http.client
+from unittest import mock
+
+from oslo_log.fixture import logging_error as log_fixture
 import testtools
 
 from glance.common import auth
 from glance.common import client
+from glance.tests.unit import fixtures as glance_fixtures
 from glance.tests import utils
 
 
@@ -26,65 +29,46 @@ class TestClient(testtools.TestCase):
 
     def setUp(self):
         super(TestClient, self).setUp()
-        self.mock = mox.Mox()
-        self.mock.StubOutWithMock(http_client.HTTPConnection, 'request')
-        self.mock.StubOutWithMock(http_client.HTTPConnection, 'getresponse')
-
         self.endpoint = 'example.com'
         self.client = client.BaseClient(self.endpoint, port=9191,
-                                        auth_token=u'abc123')
+                                        auth_token='abc123')
 
-    def tearDown(self):
-        super(TestClient, self).tearDown()
-        self.mock.UnsetStubs()
+        # Limit the amount of DeprecationWarning messages in the unit test logs
+        self.useFixture(glance_fixtures.WarningsFixture())
+
+        # Make sure logging output is limited but still test debug formatting
+        self.useFixture(log_fixture.get_logging_handle_error_fixture())
+        self.useFixture(glance_fixtures.StandardLogging())
 
     def test_make_auth_plugin(self):
         creds = {'strategy': 'keystone'}
         insecure = False
-        configure_via_auth = True
 
-        self.mock.StubOutWithMock(auth, 'get_plugin_from_strategy')
-        auth.get_plugin_from_strategy('keystone', creds, insecure,
-                                      configure_via_auth)
+        with mock.patch.object(auth, 'get_plugin_from_strategy'):
+            self.client.make_auth_plugin(creds, insecure)
 
-        self.mock.ReplayAll()
-
-        self.client.make_auth_plugin(creds, insecure)
-
-        self.mock.VerifyAll()
-
-    def test_http_encoding_headers(self):
-        http_client.HTTPConnection.request(
-            mox.IgnoreArg(),
-            mox.IgnoreArg(),
-            mox.IgnoreArg(),
-            mox.IgnoreArg())
-
+    @mock.patch.object(http.client.HTTPConnection, "getresponse")
+    @mock.patch.object(http.client.HTTPConnection, "request")
+    def test_http_encoding_headers(self, _mock_req, _mock_resp):
         # Lets fake the response
-        # returned by http_client
+        # returned by http.client
         fake = utils.FakeHTTPResponse(data=b"Ok")
-        http_client.HTTPConnection.getresponse().AndReturn(fake)
-        self.mock.ReplayAll()
+        _mock_resp.return_value = fake
 
-        headers = {"test": u'ni\xf1o'}
+        headers = {"test": 'ni\xf1o'}
         resp = self.client.do_request('GET', '/v1/images/detail',
                                       headers=headers)
         self.assertEqual(fake, resp)
 
-    def test_http_encoding_params(self):
-        http_client.HTTPConnection.request(
-            mox.IgnoreArg(),
-            mox.IgnoreArg(),
-            mox.IgnoreArg(),
-            mox.IgnoreArg())
-
+    @mock.patch.object(http.client.HTTPConnection, "getresponse")
+    @mock.patch.object(http.client.HTTPConnection, "request")
+    def test_http_encoding_params(self, _mock_req, _mock_resp):
         # Lets fake the response
-        # returned by http_client
+        # returned by http.client
         fake = utils.FakeHTTPResponse(data=b"Ok")
-        http_client.HTTPConnection.getresponse().AndReturn(fake)
-        self.mock.ReplayAll()
+        _mock_resp.return_value = fake
 
-        params = {"test": u'ni\xf1o'}
+        params = {"test": 'ni\xf1o'}
         resp = self.client.do_request('GET', '/v1/images/detail',
                                       params=params)
         self.assertEqual(fake, resp)

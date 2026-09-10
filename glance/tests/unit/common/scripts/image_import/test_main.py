@@ -13,8 +13,8 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import mock
-from six.moves import urllib
+from unittest import mock
+import urllib
 
 import glance.common.exception as exception
 from glance.common.scripts.image_import import main as image_import_script
@@ -88,7 +88,8 @@ class TestImageImport(test_utils.BaseTestCase):
     def test_set_image_data_http(self, mock_image_iter):
         uri = 'http://www.example.com'
         image = mock.Mock()
-        mock_image_iter.return_value = test_utils.FakeHTTPResponse()
+        image.size = None
+        mock_image_iter.return_value = (test_utils.FakeHTTPResponse(), 0)
         self.assertIsNone(image_import_script.set_image_data(image,
                                                              uri,
                                                              None))
@@ -121,3 +122,74 @@ class TestImageImport(test_utils.BaseTestCase):
         self.assertEqual(1, mock_set_img_data.call_count)
         mock_delete_data.assert_called_once_with(
             mock_create_image().context, image_id, 'location')
+
+    @mock.patch('oslo_utils.timeutils.StopWatch')
+    @mock.patch('glance.common.scripts.utils.get_image_data_iter')
+    def test_set_image_data_with_callback(self, mock_gidi, mock_sw):
+        data = [b'0' * 60, b'0' * 50, b'0' * 10, b'0' * 150]
+        result_data = []
+        # Return the iterator and the total size in bytes of the data
+        mock_gidi.return_value = (iter(data), len(data))
+        mock_sw.return_value.expired.side_effect = [False, True, False,
+                                                    False]
+        image = mock.MagicMock()
+        image.size = None
+        callback = mock.MagicMock()
+
+        def fake_set_data(data_iter, **kwargs):
+            for chunk in data_iter:
+                result_data.append(chunk)
+
+        image.set_data.side_effect = fake_set_data
+        image_import_script.set_image_data(image, 'http://fake', None,
+                                           callback=callback)
+
+        mock_gidi.assert_called_once_with('http://fake')
+        self.assertEqual(data, result_data)
+        # Since we only fired the timer once, only two calls expected
+        # for the four reads we did, including the final obligatory one
+        callback.assert_has_calls([mock.call(110, 110),
+                                   mock.call(160, 270)])
+
+    @mock.patch.object(utils, 'get_image_data_iter')
+    def test_set_image_data_passes_image_size_to_set_data(
+            self, mock_image_iter):
+        """Verify set_data called with size=image.size when image.size set."""
+        uri = 'http://www.example.com'
+        image = mock.Mock(size=1024)
+        mock_image_iter.return_value = (test_utils.FakeHTTPResponse(), 1024)
+
+        image_import_script.set_image_data(image, uri, None)
+
+        image.set_data.assert_called_once()
+        call_kwargs = image.set_data.call_args[1]
+        self.assertEqual(1024, call_kwargs['size'])
+        self.assertIn('backend', call_kwargs)
+        self.assertIn('set_active', call_kwargs)
+
+    @mock.patch.object(utils, 'get_image_data_iter')
+    def test_set_image_data_passes_zero_size_when_image_size_is_none(
+            self, mock_image_iter):
+        """Verify set_data is called with size=0 when image.size is None."""
+        uri = 'http://www.example.com'
+        image = mock.Mock(size=None)
+        mock_image_iter.return_value = (test_utils.FakeHTTPResponse(), 0)
+
+        image_import_script.set_image_data(image, uri, None)
+
+        image.set_data.assert_called_once()
+        call_kwargs = image.set_data.call_args[1]
+        self.assertEqual(0, call_kwargs['size'])
+        self.assertIn('backend', call_kwargs)
+        self.assertIn('set_active', call_kwargs)
+
+    @mock.patch.object(utils, 'get_image_data_iter')
+    def test_set_image_data_fails_when_image_size_mismatch(
+            self, mock_image_iter):
+        """Verify set_data fails during size mismatch"""
+        uri = 'http://www.example.com'
+        image = mock.Mock(size=1024)
+        mock_image_iter.return_value = (test_utils.FakeHTTPResponse(), 512)
+
+        self.assertRaises(exception.ImportTaskError,
+                          image_import_script.set_image_data, image, uri, None)

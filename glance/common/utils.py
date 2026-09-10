@@ -21,34 +21,68 @@ System-level utilities and helper functions.
 """
 
 import errno
-
-try:
-    from eventlet import sleep
-except ImportError:
-    from time import sleep
-from eventlet.green import socket
+import ipaddress
+import socket
+import sqlite3
 
 import functools
 import os
 import re
-import uuid
+import time
+from time import sleep
+import urllib
 
-from OpenSSL import crypto
+import glance_store
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import encodeutils
 from oslo_utils import excutils
 from oslo_utils import netutils
 from oslo_utils import strutils
-import six
+from oslo_utils import timeutils as oslo_timeutils
+from sqlalchemy import exc as sqlalchemy_exc
 from webob import exc
 
 from glance.common import exception
-from glance.i18n import _, _LE
+from glance.common import wsgi_app
+from glance.i18n import _, _LE, _LW
 
 CONF = cfg.CONF
 
 LOG = logging.getLogger(__name__)
+
+# Default total time to retry sqlite "database is locked" errors.
+DEFAULT_DB_LOCK_RETRY_TIMEOUT = 30.0
+
+
+def is_db_lock_error(exc):
+    """Return True if exc is a sqlite database-is-locked error.
+
+    Repo operations go through SQLAlchemy, which wraps the underlying
+    sqlite3.OperationalError in sqlalchemy.exc.OperationalError.
+    """
+    if isinstance(exc, sqlite3.OperationalError):
+        return 'locked' in str(exc).lower()
+    if isinstance(exc, sqlalchemy_exc.OperationalError):
+        orig = getattr(exc, 'orig', None)
+        if isinstance(orig, sqlite3.OperationalError):
+            return 'locked' in str(orig).lower()
+    return False
+
+
+def retry_on_db_lock(func, timeout=DEFAULT_DB_LOCK_RETRY_TIMEOUT,
+                     interval=0.05):
+    """Retry a DB operation that may fail with sqlite lock errors."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return func()
+        except Exception as exc:
+            if not is_db_lock_error(exc):
+                raise
+            if time.monotonic() >= deadline:
+                raise
+            sleep(interval)
+
 
 # Whitelist of v1 API headers of form x-image-meta-xxx
 IMAGE_META_HEADERS = ['x-image-meta-location', 'x-image-meta-size',
@@ -94,8 +128,8 @@ def chunkiter(fp, chunk_size=65536):
 
 def cooperative_iter(iter):
     """
-    Return an iterator which schedules after each
-    iteration. This can prevent eventlet thread starvation.
+    Return an iterator which yields briefly after each iteration so other
+    concurrent work can run (cooperative scheduling).
 
     :param iter: an iterator to wrap
     """
@@ -111,8 +145,8 @@ def cooperative_iter(iter):
 
 def cooperative_read(fd):
     """
-    Wrap a file descriptor's read with a partial function which schedules
-    after each read. This can prevent eventlet thread starvation.
+    Wrap a file descriptor's read with a partial function which yields briefly
+    after each read so other concurrent work can run.
 
     :param fd: a file descriptor to wrap
     """
@@ -125,16 +159,226 @@ def cooperative_read(fd):
 
 MAX_COOP_READER_BUFFER_SIZE = 134217728  # 128M seems like a sane buffer limit
 
+CONF.import_group('import_filtering_opts',
+                  'glance.async_.flows._internal_plugins')
+
+
+def normalize_hostname(host):
+    """Normalize IP address to standard format or return hostname.
+
+    Uses ipaddress module to validate and normalize IP addresses, rejecting
+    encoded formats. For hostnames, requires DNS resolution to ensure they
+    are valid and not encoded IP attempts.
+
+    :param host: hostname or IP address
+    :returns: normalized IP address, hostname unchanged, or None
+    """
+    if not host:
+        return host
+
+    # NOTE(abhishekk): Try to parse as IPv4. ipaddress module only accepts
+    # standard format like 127.0.0.1. It rejects encoded formats like
+    # decimal (2130706433), hex (0x7f000001), or octal (017700000001).
+    try:
+        return str(ipaddress.IPv4Address(host))
+    except ValueError:
+        pass
+
+    # NOTE(abhishekk): Try to parse as IPv6. ipaddress module only accepts
+    # standard IPv6 format and rejects encoded formats.
+    try:
+        return str(ipaddress.IPv6Address(host))
+    except ValueError:
+        pass
+
+    # NOTE(abhishekk): Not valid IP address, check as hostname. Reject pure
+    # numeric strings like "2130706433" (decimal encoded IP). ipaddress module
+    # rejected it, but OS might still resolve using inet_aton() if not blocked.
+    if host.isdigit():
+        return None
+
+    # NOTE(abhishekk): Reject all numeric strings with dots like "127.1" or
+    # "10.1". These are shorthand IP addresses. ipaddress module rejects them
+    # because they need 4 octets, but OS may still resolve them. We block to
+    # prevent SSRF bypass attacks.
+    if all(c.isdigit() or c == '.' for c in host):
+        return None
+
+    # NOTE(abhishekk): Add trailing dot to force DNS lookup instead of numeric
+    # parsing. This blocks encoded IP formats like 0x7f000001 or 127.0x0.0.1
+    # because they fail DNS lookup. Only real hostnames that resolve via DNS
+    # are allowed.
+    testhost = host
+    if not testhost.endswith('.'):
+        testhost += '.'
+
+    try:
+        socket.getaddrinfo(testhost, 80)
+    except socket.gaierror:
+        # NOTE(abhishekk): DNS resolution failed, reject the hostname
+        return None
+
+    # NOTE(abhishekk): Valid and resolvable hostname, return unchanged
+    return host
+
+
+def default_port(scheme):
+    """Return the default port for an external HTTP(S) URI scheme."""
+    return 443 if scheme == 'https' else 80
+
+
+def resolve_pinned_address(hostname, port):
+    """Resolve hostname and return the first allowed IP address.
+
+    Blocks loopback and link-local addresses (including cloud metadata
+    endpoints such as 169.254.169.254) unless the host is listed in
+    allowed_hosts. Private RFC1918 ranges are not blocked so private
+    clouds can fetch from internal hosts. IPv4-mapped IPv6 addresses
+    are checked against the embedded IPv4 address. Matching
+    disallowed_hosts IP entries also reject resolved addresses.
+
+    Used for web-download import and other external HTTP(S) fetches that
+    apply ``import_filtering_opts`` (for example HTTP image locations).
+
+    :param hostname: hostname or IP from the external URI
+    :param port: destination port from the external URI
+    :returns: IP address string to connect to
+    :raises ValueError: if the host cannot be used for an external fetch
+    """
+    normalized_host = normalize_hostname(hostname)
+    if not normalized_host:
+        raise ValueError('invalid external host: %s' % hostname)
+
+    bl_hosts = list(CONF.import_filtering_opts.disallowed_hosts)
+    wl_hosts = CONF.import_filtering_opts.allowed_hosts
+    if wl_hosts and bl_hosts:
+        bl_hosts = []
+    host_is_whitelisted = bool(wl_hosts and normalized_host in wl_hosts)
+
+    try:
+        try:
+            addresses = [ipaddress.ip_address(normalized_host)]
+        except ValueError:
+            testhost = (normalized_host if normalized_host.endswith('.')
+                        else normalized_host + '.')
+            addresses = []
+            for result in socket.getaddrinfo(testhost, port):
+                ip = result[4][0]
+                if not ip:
+                    raise ValueError('empty address in getaddrinfo result')
+                if '%' in ip:
+                    ip = ip.split('%', 1)[0]
+                addr = ipaddress.ip_address(ip)
+                if addr not in addresses:
+                    addresses.append(addr)
+    except (socket.gaierror, ValueError) as exc:
+        raise ValueError('failed to resolve external host %s: %s' %
+                         (hostname, exc))
+
+    filtered = []
+    for addr in addresses:
+        if host_is_whitelisted:
+            filtered.append(str(addr))
+
+        check = addr
+        if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+            check = addr.ipv4_mapped
+        if check.is_loopback or check.is_link_local:
+            continue
+
+        addr_str = str(addr)
+        blocked = False
+        for blocked_host in bl_hosts:
+            if blocked_host == normalized_host:
+                continue
+            try:
+                if addr == ipaddress.ip_address(blocked_host):
+                    blocked = True
+                    break
+            except ValueError:
+                if addr_str == blocked_host:
+                    blocked = True
+                    break
+        if not blocked:
+            filtered.append(str(addr))
+
+    if not filtered:
+        raise ValueError(
+            'no allowed addresses for external host: %s' % hostname
+        )
+    return filtered
+
+
+def get_validated_address(uri):
+    """Validate an external URI and return a pinned destination IP.
+
+    Applies ``import_filtering_opts`` scheme/host/port filtering, resolves
+    DNS, and returns the first allowed address. Raises ValueError if the
+    URI must not be fetched.
+    """
+    if not uri:
+        raise ValueError('empty external URI')
+
+    parsed_uri = urllib.parse.urlparse(uri)
+    scheme = parsed_uri.scheme
+    host = parsed_uri.hostname
+    port = parsed_uri.port
+    wl_schemes = CONF.import_filtering_opts.allowed_schemes
+    bl_schemes = CONF.import_filtering_opts.disallowed_schemes
+    wl_hosts = CONF.import_filtering_opts.allowed_hosts
+    bl_hosts = CONF.import_filtering_opts.disallowed_hosts
+    wl_ports = CONF.import_filtering_opts.allowed_ports
+    bl_ports = CONF.import_filtering_opts.disallowed_ports
+
+    # NOTE(jokke): Checking if both allowed and disallowed are defined and
+    # logging it to inform only allowed will be obeyed.
+    if wl_schemes and bl_schemes:
+        bl_schemes = []
+        LOG.debug("Both allowed and disallowed schemes has been configured. "
+                  "Will only process allowed list.")
+    if wl_hosts and bl_hosts:
+        bl_hosts = []
+        LOG.debug("Both allowed and disallowed hosts has been configured. "
+                  "Will only process allowed list.")
+    if wl_ports and bl_ports:
+        bl_ports = []
+        LOG.debug("Both allowed and disallowed ports has been configured. "
+                  "Will only process allowed list.")
+
+    if not scheme or ((wl_schemes and scheme not in wl_schemes) or
+                      parsed_uri.scheme in bl_schemes):
+        raise ValueError('scheme not allowed for external URI: %s' % uri)
+
+    normalized_host = normalize_hostname(host)
+    if not normalized_host or (
+            (wl_hosts and normalized_host not in wl_hosts) or
+            normalized_host in bl_hosts):
+        raise ValueError('host not allowed for external URI: %s' % uri)
+
+    if port and ((wl_ports and port not in wl_ports) or
+                 port in bl_ports):
+        raise ValueError('port not allowed for external URI: %s' % uri)
+
+    resolve_port = port or default_port(scheme)
+    return resolve_pinned_address(normalized_host, resolve_port)
+
+
+def validate_uri(uri):
+    """Return True if the URI passes ``import_filtering_opts`` filtering."""
+    try:
+        get_validated_address(uri)
+        return True
+    except ValueError:
+        return False
+
 
 class CooperativeReader(object):
     """
-    An eventlet thread friendly class for reading in image data.
+    A reader for image data that yields cooperatively on each read/iteration.
 
-    When accessing data either through the iterator or the read method
-    we perform a sleep to allow a co-operative yield. When there is more than
-    one image being uploaded/downloaded this prevents eventlet thread
-    starvation, ie allows all threads to be scheduled periodically rather than
-    having the same thread be continuously active.
+    When accessing data through the iterator or the read method, a short sleep
+    is used so other concurrent uploads or downloads can make progress instead
+    of one stream monopolizing the worker.
     """
     def __init__(self, fd):
         """
@@ -166,7 +410,7 @@ class CooperativeReader(object):
                 result = self.buffer[self.position:]
                 self.buffer = b''
                 self.position = 0
-                return str(result)
+                return bytes(result)
             else:
                 # otherwise read the next chunk from the underlying iterator
                 # and return it as a whole. Reset the buffer, as subsequent
@@ -176,7 +420,7 @@ class CooperativeReader(object):
                         self.iterator = self.__iter__()
                     return next(self.iterator)
                 except StopIteration:
-                    return ''
+                    return b''
                 finally:
                     self.buffer = b''
                     self.position = 0
@@ -219,20 +463,23 @@ class LimitingReader(object):
     Reader designed to fail when reading image data past the configured
     allowable amount.
     """
-    def __init__(self, data, limit):
+    def __init__(self, data, limit,
+                 exception_class=exception.ImageSizeLimitExceeded):
         """
         :param data: Underlying image data object
         :param limit: maximum number of bytes the reader should allow
+        :param exception_class: Type of exception to be raised
         """
         self.data = data
         self.limit = limit
         self.bytes_read = 0
+        self.exception_class = exception_class
 
     def __iter__(self):
         for chunk in self.data:
             self.bytes_read += len(chunk)
             if self.bytes_read > self.limit:
-                raise exception.ImageSizeLimitExceeded()
+                raise self.exception_class()
             else:
                 yield chunk
 
@@ -240,8 +487,15 @@ class LimitingReader(object):
         result = self.data.read(i)
         self.bytes_read += len(result)
         if self.bytes_read > self.limit:
-            raise exception.ImageSizeLimitExceeded()
+            raise self.exception_class()
         return result
+
+
+def wrap_data_for_store_upload(data, size_cap=None):
+    """Wrap an image data iterator for backend store upload."""
+    if size_cap is None:
+        size_cap = CONF.image_size_cap
+    return LimitingReader(CooperativeReader(data), size_cap)
 
 
 def image_meta_to_http_headers(image_meta):
@@ -259,9 +513,9 @@ def image_meta_to_http_headers(image_meta):
                 for pk, pv in v.items():
                     if pv is not None:
                         headers["x-image-meta-property-%s"
-                                % pk.lower()] = six.text_type(pv)
+                                % pk.lower()] = str(pv)
             else:
-                headers["x-image-meta-%s" % k.lower()] = six.text_type(v)
+                headers["x-image-meta-%s" % k.lower()] = str(v)
     return headers
 
 
@@ -330,10 +584,9 @@ def create_mashup_dict(image_meta):
     """
 
     d = {}
-    for key, value in six.iteritems(image_meta):
+    for key, value in image_meta.items():
         if isinstance(value, dict):
-            for subkey, subvalue in six.iteritems(
-                    create_mashup_dict(value)):
+            for subkey, subvalue in create_mashup_dict(value).items():
                 if subkey not in image_meta:
                     d[subkey] = subvalue
         else:
@@ -385,68 +638,11 @@ def setup_remote_pydev_debug(host, port):
             LOG.exception(error_msg)
 
 
-def validate_key_cert(key_file, cert_file):
-    try:
-        error_key_name = "private key"
-        error_filename = key_file
-        with open(key_file, 'r') as keyfile:
-            key_str = keyfile.read()
-        key = crypto.load_privatekey(crypto.FILETYPE_PEM, key_str)
-
-        error_key_name = "certificate"
-        error_filename = cert_file
-        with open(cert_file, 'r') as certfile:
-            cert_str = certfile.read()
-        cert = crypto.load_certificate(crypto.FILETYPE_PEM, cert_str)
-    except IOError as ioe:
-        raise RuntimeError(_("There is a problem with your %(error_key_name)s "
-                             "%(error_filename)s.  Please verify it."
-                             "  Error: %(ioe)s") %
-                           {'error_key_name': error_key_name,
-                            'error_filename': error_filename,
-                            'ioe': ioe})
-    except crypto.Error as ce:
-        raise RuntimeError(_("There is a problem with your %(error_key_name)s "
-                             "%(error_filename)s.  Please verify it. OpenSSL"
-                             " error: %(ce)s") %
-                           {'error_key_name': error_key_name,
-                            'error_filename': error_filename,
-                            'ce': ce})
-
-    try:
-        data = str(uuid.uuid4())
-        # On Python 3, explicitly encode to UTF-8 to call crypto.sign() which
-        # requires bytes. Otherwise, it raises a deprecation warning (and
-        # will raise an error later).
-        data = encodeutils.to_utf8(data)
-        digest = CONF.digest_algorithm
-        if digest == 'sha1':
-            LOG.warn('The FIPS (FEDERAL INFORMATION PROCESSING STANDARDS)'
-                     ' state that the SHA-1 is not suitable for'
-                     ' general-purpose digital signature applications (as'
-                     ' specified in FIPS 186-3) that require 112 bits of'
-                     ' security. The default value is sha1 in Kilo for a'
-                     ' smooth upgrade process, and it will be updated'
-                     ' with sha256 in next release(L).')
-        out = crypto.sign(key, data, digest)
-        crypto.verify(cert, out, data, digest)
-    except crypto.Error as ce:
-        raise RuntimeError(_("There is a problem with your key pair.  "
-                             "Please verify that cert %(cert_file)s and "
-                             "key %(key_file)s belong together.  OpenSSL "
-                             "error %(ce)s") % {'cert_file': cert_file,
-                                                'key_file': key_file,
-                                                'ce': ce})
-
-
 def get_test_suite_socket():
-    global GLANCE_TEST_SOCKET_FD_STR
     if GLANCE_TEST_SOCKET_FD_STR in os.environ:
         fd = int(os.environ[GLANCE_TEST_SOCKET_FD_STR])
         sock = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
-        if six.PY2:
-            sock = socket.SocketType(_sock=sock)
-        sock.listen(CONF.backlog)
+        sock.listen(4096)
         del os.environ[GLANCE_TEST_SOCKET_FD_STR]
         os.close(fd)
         return sock
@@ -460,7 +656,7 @@ def is_valid_hostname(hostname):
 
 def is_valid_fqdn(fqdn):
     """Verify whether a host is a valid FQDN."""
-    return re.match('^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', fqdn) is not None
+    return re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', fqdn) is not None
 
 
 def parse_valid_host_port(host_port):
@@ -503,10 +699,10 @@ def parse_valid_host_port(host_port):
 
 
 try:
-    REGEX_4BYTE_UNICODE = re.compile(u'[\U00010000-\U0010ffff]')
+    REGEX_4BYTE_UNICODE = re.compile('[\U00010000-\U0010ffff]')
 except re.error:
     # UCS-2 build case
-    REGEX_4BYTE_UNICODE = re.compile(u'[\uD800-\uDBFF][\uDC00-\uDFFF]')
+    REGEX_4BYTE_UNICODE = re.compile('[\uD800-\uDBFF][\uDC00-\uDFFF]')
 
 
 def no_4byte_params(f):
@@ -517,12 +713,14 @@ def no_4byte_params(f):
     def wrapper(*args, **kwargs):
 
         def _is_match(some_str):
-            return (isinstance(some_str, six.text_type) and
-                    REGEX_4BYTE_UNICODE.findall(some_str) != [])
+            return (
+                isinstance(some_str, str) and
+                REGEX_4BYTE_UNICODE.findall(some_str) != []
+            )
 
         def _check_dict(data_dict):
             # a dict of dicts has to be checked recursively
-            for key, value in six.iteritems(data_dict):
+            for key, value in data_dict.items():
                 if isinstance(value, dict):
                     _check_dict(value)
                 else:
@@ -548,49 +746,6 @@ def no_4byte_params(f):
     return wrapper
 
 
-def validate_mysql_int(*args, **kwargs):
-    """
-    Make sure that all arguments are less than 2 ** 31 - 1.
-
-    This limitation is introduced because mysql stores INT in 4 bytes.
-    If the validation fails for some argument, exception.Invalid is raised with
-    appropriate information.
-    """
-    max_int = (2 ** 31) - 1
-    for param in args:
-        if param > max_int:
-            msg = _("Value %(value)d out of range, "
-                    "must not exceed %(max)d") % {"value": param,
-                                                  "max": max_int}
-            raise exception.Invalid(msg)
-
-    for param_str in kwargs:
-        param = kwargs.get(param_str)
-        if param and param > max_int:
-            msg = _("'%(param)s' value out of range, "
-                    "must not exceed %(max)d") % {"param": param_str,
-                                                  "max": max_int}
-            raise exception.Invalid(msg)
-
-
-def stash_conf_values():
-    """
-    Make a copy of some of the current global CONF's settings.
-    Allows determining if any of these values have changed
-    when the config is reloaded.
-    """
-    conf = {
-        'bind_host': CONF.bind_host,
-        'bind_port': CONF.bind_port,
-        'tcp_keepidle': CONF.cert_file,
-        'backlog': CONF.backlog,
-        'key_file': CONF.key_file,
-        'cert_file': CONF.cert_file
-    }
-
-    return conf
-
-
 def split_filter_op(expression):
     """Split operator from threshold in an expression.
     Designed for use on a comparative-filtering query field.
@@ -602,8 +757,17 @@ def split_filter_op(expression):
     """
     left, sep, right = expression.partition(':')
     if sep:
-        op = left
-        threshold = right
+        # If the expression is a date of the format ISO 8601 like
+        # CCYY-MM-DDThh:mm:ss+hh:mm and has no operator, it should
+        # not be partitioned, and a default operator of eq should be
+        # assumed.
+        try:
+            oslo_timeutils.parse_isotime(expression)
+            op = 'eq'
+            threshold = expression
+        except ValueError:
+            op = left
+            threshold = right
     else:
         op = 'eq'  # default operator
         threshold = left
@@ -666,7 +830,7 @@ def evaluate_filter_op(value, operator, threshold):
     :param operator: any supported filter operation
     :param threshold: to compare value against, as right side of expression
 
-    :raises: InvalidFilterOperatorValue if an unknown operator is provided
+    :raises InvalidFilterOperatorValue: if an unknown operator is provided
 
     :returns: boolean result of applied comparison
 
@@ -686,3 +850,86 @@ def evaluate_filter_op(value, operator, threshold):
 
     msg = _("Unable to filter on a unknown operator.")
     raise exception.InvalidFilterOperatorValue(msg)
+
+
+def _get_available_stores():
+    available_stores = CONF.enabled_backends
+    stores = []
+    # Remove reserved stores from the available stores list
+    for store in available_stores:
+        # NOTE (abhishekk): http store is readonly and should be
+        # excluded from the list.
+        if available_stores[store] == 'http':
+            continue
+        if store not in wsgi_app.RESERVED_STORES:
+            stores.append(store)
+
+    return stores
+
+
+def get_stores_from_request(req, body):
+    """Processes a supplied request and extract stores from it
+
+    :param req: request to process
+    :param body: request body
+
+    :raises glance_store.UnknownScheme:  if a store is not valid
+    :return: a list of stores
+    """
+    if body.get('all_stores', False):
+        if 'stores' in body or 'x-image-meta-store' in req.headers:
+            msg = _("All_stores parameter can't be used with "
+                    "x-image-meta-store header or stores parameter")
+            raise exc.HTTPBadRequest(explanation=msg)
+        stores = _get_available_stores()
+    else:
+        try:
+            stores = body['stores']
+        except KeyError:
+            stores = [req.headers.get('x-image-meta-store',
+                                      CONF.glance_store.default_backend)]
+        else:
+            if 'x-image-meta-store' in req.headers:
+                msg = _("Stores parameter and x-image-meta-store header can't "
+                        "be both specified")
+                raise exc.HTTPBadRequest(explanation=msg)
+    # Validate each store
+    for store in stores:
+        glance_store.get_store_from_store_identifier(store)
+    return stores
+
+
+def sort_image_locations(locations):
+    if not CONF.enabled_backends:
+        return locations
+
+    def get_store_weight(location):
+        store_id = location['metadata'].get('store')
+        if not store_id:
+            return 0
+        try:
+            return glance_store.get_store_weight(store_id)
+        except glance_store.exceptions.UnknownScheme:
+            msg = (_LW("Unable to find store '%s', returning "
+                       "default weight '0'") % store_id)
+            LOG.warning(msg)
+            return 0
+
+    sorted_locations = sorted(locations, key=get_store_weight, reverse=True)
+    scrubbed = []
+    for loc in sorted_locations:
+        scrubbed.append({'store_name': loc["metadata"].get("store")})
+
+    LOG.debug(('Sorted locations: %s'), scrubbed)
+    return sorted_locations
+
+
+def is_http_store_configured(url):
+    if not url.startswith("http"):
+        return False
+
+    enabled_backends = CONF.enabled_backends
+    if enabled_backends:
+        return 'http' in enabled_backends.values()
+    else:
+        return 'http' in CONF.glance_store.stores

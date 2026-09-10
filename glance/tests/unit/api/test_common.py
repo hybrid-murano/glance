@@ -13,13 +13,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from unittest import mock
+
+from oslo_log.fixture import logging_error as log_fixture
 import testtools
 import webob
 
 import glance.api.common
-from glance.common import config
 from glance.common import exception
-from glance.tests import utils as test_utils
+from glance.tests.unit import fixtures as glance_fixtures
 
 
 class SimpleIterator(object):
@@ -36,10 +38,21 @@ class SimpleIterator(object):
             yield chunk
             chunk = read_chunk()
         else:
-            raise StopIteration()
+            return
 
 
 class TestSizeCheckedIter(testtools.TestCase):
+
+    def setUp(self):
+        super().setUp()
+
+        # Limit the amount of DeprecationWarning messages in the unit test logs
+        self.useFixture(glance_fixtures.WarningsFixture())
+
+        # Make sure logging output is limited but still test debug formatting
+        self.useFixture(log_fixture.get_logging_handle_error_fixture())
+        self.useFixture(glance_fixtures.StandardLogging())
+
     def _get_image_metadata(self):
         return {'id': 'e31cb99c-fe89-49fb-9cc5-f5104fffa636'}
 
@@ -127,19 +140,60 @@ class TestSizeCheckedIter(testtools.TestCase):
         self.assertEqual('E', next(checked_image))
         self.assertRaises(exception.GlanceException, next, checked_image)
 
+    @mock.patch('glance.api.common.image_send_notification')
+    def test_notification_sent_on_close(self, mock_image_send_notification):
+        """Verify that notification is sent when close() is called."""
+        resp = self._get_webob_response()
+        meta = self._get_image_metadata()
+        notifier = mock.Mock()
+        checked_image = glance.api.common.size_checked_iter(
+            resp, meta, 4, ['AB', 'CD'], notifier)
 
-class TestMalformedRequest(test_utils.BaseTestCase):
+        # Consume the iterator
+        self.assertEqual('AB', next(checked_image))
+        self.assertEqual('CD', next(checked_image))
+        self.assertRaises(StopIteration, next, checked_image)
+
+        # Notification should not be sent yet
+        mock_image_send_notification.assert_not_called()
+
+        # Call close() to simulate WSGI server cleanup
+        checked_image.close()
+
+        # Now notification should be sent
+        mock_image_send_notification.assert_called_once_with(
+            4, 4, meta, resp.request, notifier)
+
+
+class TestThreadPool(testtools.TestCase):
     def setUp(self):
-        """Establish a clean test environment"""
-        super(TestMalformedRequest, self).setUp()
-        self.config(flavor='',
-                    group='paste_deploy',
-                    config_file='etc/glance-api-paste.ini')
-        self.api = config.load_paste_app('glance-api')
+        super().setUp()
 
-    def test_redirect_incomplete_url(self):
-        """Test Glance redirects /v# to /v#/ with correct Location header"""
-        req = webob.Request.blank('/v1.1')
-        res = req.get_response(self.api)
-        self.assertEqual(webob.exc.HTTPFound.code, res.status_int)
-        self.assertEqual('http://localhost/v1/', res.location)
+        # Limit the amount of DeprecationWarning messages in the unit test logs
+        self.useFixture(glance_fixtures.WarningsFixture())
+
+        # Make sure logging output is limited but still test debug formatting
+        self.useFixture(log_fixture.get_logging_handle_error_fixture())
+        self.useFixture(glance_fixtures.StandardLogging())
+
+    @mock.patch('glance.async_.get_threadpool_model')
+    def test_get_thread_pool(self, mock_gtm):
+        get_thread_pool = glance.api.common.get_thread_pool
+
+        pool1 = get_thread_pool('pool1', size=123)
+        get_thread_pool('pool2', size=456)
+        pool1a = get_thread_pool('pool1')
+
+        # Two calls for the same pool should return the exact same thing
+        self.assertEqual(pool1, pool1a)
+
+        # Only two calls to get new threadpools should have been made
+        mock_gtm.return_value.assert_has_calls(
+            [mock.call(123), mock.call(456)])
+
+    @mock.patch('glance.async_.get_threadpool_model')
+    def test_get_thread_pool_log(self, mock_gtm):
+        with mock.patch.object(glance.api.common, 'LOG') as mock_log:
+            glance.api.common.get_thread_pool('test-pool')
+            mock_log.debug.assert_called_once_with(
+                'Initializing named threadpool %r', 'test-pool')

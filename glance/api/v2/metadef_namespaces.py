@@ -13,12 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import http.client as http
+import urllib.parse as urlparse
+
 from oslo_config import cfg
 from oslo_log import log as logging
 from oslo_serialization import jsonutils
-from oslo_utils import encodeutils
-import six
-import six.moves.urllib.parse as urlparse
 import webob.exc
 from wsme.rest import json
 
@@ -29,6 +29,7 @@ from glance.api.v2.model.metadef_object import MetadefObject
 from glance.api.v2.model.metadef_property_type import PropertyType
 from glance.api.v2.model.metadef_resource_type import ResourceTypeAssociation
 from glance.api.v2.model.metadef_tag import MetadefTag
+from glance.api.v2 import policy as api_policy
 from glance.common import exception
 from glance.common import utils
 from glance.common import wsgi
@@ -61,6 +62,19 @@ class NamespaceController(object):
         try:
             ns_repo = self.gateway.get_metadef_namespace_repo(req.context)
 
+            policy_check = api_policy.MetadefAPIPolicy(
+                req.context,
+                enforcer=self.policy)
+            # NOTE(abhishekk): This is just a "do you have permission to
+            # list namespace" check. Each namespace is checked against
+            # get_metadef_namespace below.
+            policy_check.get_metadef_namespaces()
+
+            # NOTE(abhishekk): We also need to fetch resource_types associated
+            # with namespaces, so better to check we have permission for the
+            # same in advance.
+            policy_check.list_metadef_resource_types()
+
             # Get namespace id
             if marker:
                 namespace_obj = ns_repo.get(marker)
@@ -69,15 +83,30 @@ class NamespaceController(object):
             database_ns_list = ns_repo.list(
                 marker=marker, limit=limit, sort_key=sort_key,
                 sort_dir=sort_dir, filters=filters)
-            for db_namespace in database_ns_list:
+
+            ns_list = [
+                ns for ns in database_ns_list if api_policy.MetadefAPIPolicy(
+                    req.context, md_resource=ns, enforcer=self.policy).check(
+                    'get_metadef_namespace')]
+
+            rs_repo = (
+                self.gateway.get_metadef_resource_type_repo(req.context))
+            for db_namespace in ns_list:
                 # Get resource type associations
                 filters = dict()
                 filters['namespace'] = db_namespace.namespace
-                rs_repo = (
-                    self.gateway.get_metadef_resource_type_repo(req.context))
-                repo_rs_type_list = rs_repo.list(filters=filters)
-                resource_type_list = [ResourceTypeAssociation.to_wsme_model(
-                    resource_type) for resource_type in repo_rs_type_list]
+                try:
+                    repo_rs_type_list = rs_repo.list(filters=filters)
+                except exception.NotFound:
+                    # NOTE(danms): If we fail to list resource_types
+                    # for this namespace, do not fail the entire
+                    # namespace list operation with NotFound.
+                    repo_rs_type_list = []
+                resource_type_list = [
+                    ResourceTypeAssociation.to_wsme_model(
+                        resource_type
+                    ) for resource_type in repo_rs_type_list]
+
                 if resource_type_list:
                     db_namespace.resource_type_associations = (
                         resource_type_list)
@@ -85,11 +114,11 @@ class NamespaceController(object):
             namespace_list = [Namespace.to_wsme_model(
                 db_namespace,
                 get_namespace_href(db_namespace),
-                self.ns_schema_link) for db_namespace in database_ns_list]
+                self.ns_schema_link) for db_namespace in ns_list]
             namespaces = Namespaces()
             namespaces.namespaces = namespace_list
             if len(namespace_list) != 0 and len(namespace_list) == limit:
-                namespaces.next = namespace_list[-1].namespace
+                namespaces.next = ns_list[-1].namespace
 
         except exception.Forbidden as e:
             LOG.debug("User not permitted to retrieve metadata namespaces "
@@ -97,9 +126,6 @@ class NamespaceController(object):
             raise webob.exc.HTTPForbidden(explanation=e.msg)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
-        except Exception as e:
-            LOG.error(encodeutils.exception_to_unicode(e))
-            raise webob.exc.HTTPInternalServerError()
         return namespaces
 
     @utils.mutating
@@ -110,7 +136,30 @@ class NamespaceController(object):
             ns_factory = self.gateway.get_metadef_namespace_factory(
                 req.context)
             ns_repo = self.gateway.get_metadef_namespace_repo(req.context)
-            new_namespace = ns_factory.new_namespace(**namespace.to_dict())
+
+            # NOTE(abhishekk): Here we are going to check if user is authorized
+            # to create namespace, resource_types, objects, properties etc.
+            policy_check = api_policy.MetadefAPIPolicy(
+                req.context, enforcer=self.policy)
+            policy_check.add_metadef_namespace()
+
+            if namespace.resource_type_associations:
+                policy_check.add_metadef_resource_type_association()
+            if namespace.objects:
+                policy_check.add_metadef_object()
+            if namespace.properties:
+                policy_check.add_metadef_property()
+            if namespace.tags:
+                policy_check.add_metadef_tag()
+
+            # NOTE(abhishekk): As we are getting rid of auth layer, this
+            # is the place where we should add owner if it is not specified
+            # in request.
+            kwargs = namespace.to_dict()
+            if 'owner' not in kwargs:
+                kwargs.update({'owner': req.context.owner})
+
+            new_namespace = ns_factory.new_namespace(**kwargs)
             ns_repo.add(new_namespace)
             namespace_created = True
 
@@ -142,7 +191,8 @@ class NamespaceController(object):
             if namespace.tags:
                 tag_factory = self.gateway.get_metadef_tag_factory(
                     req.context)
-                tag_repo = self.gateway.get_metadef_tag_repo(req.context)
+                tag_repo = self.gateway.get_metadef_tag_repo(
+                    req.context)
                 for metadata_tag in namespace.tags:
                     new_meta_tag = tag_factory.new_tag(
                         namespace=namespace.namespace,
@@ -162,7 +212,9 @@ class NamespaceController(object):
                             **self._to_property_dict(name, value)
                         ))
                     prop_repo.add(new_property_type)
-
+        except exception.Invalid as e:
+            msg = (_("Couldn't create metadata namespace: %s") % e)
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.Forbidden as e:
             self._cleanup_namespace(ns_repo, namespace, namespace_created)
             LOG.debug("User not permitted to create metadata namespace")
@@ -173,9 +225,6 @@ class NamespaceController(object):
         except exception.Duplicate as e:
             self._cleanup_namespace(ns_repo, namespace, namespace_created)
             raise webob.exc.HTTPConflict(explanation=e.msg)
-        except Exception as e:
-            LOG.error(encodeutils.exception_to_unicode(e))
-            raise webob.exc.HTTPInternalServerError()
 
         # Return the user namespace as we don't expose the id to user
         new_namespace.properties = namespace.properties
@@ -202,16 +251,40 @@ class NamespaceController(object):
                 namespace_repo.remove(namespace_obj)
                 LOG.debug("Cleaned up namespace %(namespace)s ",
                           {'namespace': namespace.namespace})
-            except exception:
-                msg = (_LE("Failed to delete namespace %(namespace)s ") %
-                       {'namespace': namespace.namespace})
+            except Exception as e:
+                msg = (_LE("Failed to delete namespace %(namespace)s."
+                           "Exception: %(exception)s"),
+                       {'namespace': namespace.namespace,
+                        'exception': str(e)})
                 LOG.error(msg)
 
     def show(self, req, namespace, filters=None):
         try:
             # Get namespace
-            ns_repo = self.gateway.get_metadef_namespace_repo(req.context)
-            namespace_obj = ns_repo.get(namespace)
+            ns_repo = self.gateway.get_metadef_namespace_repo(
+                req.context)
+            try:
+                namespace_obj = ns_repo.get(namespace)
+                policy_check = api_policy.MetadefAPIPolicy(
+                    req.context,
+                    md_resource=namespace_obj,
+                    enforcer=self.policy)
+                policy_check.get_metadef_namespace()
+            except (exception.Forbidden, webob.exc.HTTPForbidden):
+                LOG.debug("User not permitted to show namespace '%s'",
+                          namespace)
+                # NOTE (abhishekk): Returning 404 Not Found as the
+                # namespace is outside of this user's project
+                raise webob.exc.HTTPNotFound()
+
+            # NOTE(abhishekk): We also need to fetch resource_types, objects,
+            # properties, tags associated with namespace, so better to check
+            # whether user has permissions for the same.
+            policy_check.list_metadef_resource_types()
+            policy_check.get_metadef_objects()
+            policy_check.get_metadef_properties()
+            policy_check.get_metadef_tags()
+
             namespace_detail = Namespace.to_wsme_model(
                 namespace_obj,
                 get_namespace_href(namespace_obj),
@@ -230,7 +303,8 @@ class NamespaceController(object):
                 namespace_detail.objects = object_list
 
             # Get resource type associations
-            rs_repo = self.gateway.get_metadef_resource_type_repo(req.context)
+            rs_repo = self.gateway.get_metadef_resource_type_repo(
+                req.context)
             db_resource_type_list = rs_repo.list(filters=ns_filters)
             resource_type_list = [ResourceTypeAssociation.to_wsme_model(
                 resource_type) for resource_type in db_resource_type_list]
@@ -263,15 +337,26 @@ class NamespaceController(object):
             raise webob.exc.HTTPForbidden(explanation=e.msg)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
-        except Exception as e:
-            LOG.error(encodeutils.exception_to_unicode(e))
-            raise webob.exc.HTTPInternalServerError()
         return namespace_detail
 
     def update(self, req, user_ns, namespace):
         namespace_repo = self.gateway.get_metadef_namespace_repo(req.context)
         try:
             ns_obj = namespace_repo.get(namespace)
+        except (exception.Forbidden, exception.NotFound):
+            # NOTE (abhishekk): Returning 404 Not Found as the
+            # namespace is outside of this user's project
+            msg = _("Namespace %s not found") % namespace
+            raise webob.exc.HTTPNotFound(explanation=msg)
+
+        try:
+            # NOTE(abhishekk): Here we are just checking if use is authorized
+            # to modify the namespace or not
+            api_policy.MetadefAPIPolicy(
+                req.context,
+                md_resource=ns_obj,
+                enforcer=self.policy).modify_metadef_namespace()
+
             ns_obj._old_namespace = ns_obj.namespace
             ns_obj.namespace = wsme_utils._get_value(user_ns.namespace)
             ns_obj.display_name = wsme_utils._get_value(user_ns.display_name)
@@ -285,6 +370,9 @@ class NamespaceController(object):
             ns_obj.owner = (
                 wsme_utils._get_value(user_ns.owner) or req.context.owner)
             updated_namespace = namespace_repo.save(ns_obj)
+        except exception.Invalid as e:
+            msg = (_("Couldn't update metadata namespace: %s") % e)
+            raise webob.exc.HTTPBadRequest(explanation=msg)
         except exception.Forbidden as e:
             LOG.debug("User not permitted to update metadata namespace "
                       "'%s'", namespace)
@@ -293,9 +381,6 @@ class NamespaceController(object):
             raise webob.exc.HTTPNotFound(explanation=e.msg)
         except exception.Duplicate as e:
             raise webob.exc.HTTPConflict(explanation=e.msg)
-        except Exception as e:
-            LOG.error(encodeutils.exception_to_unicode(e))
-            raise webob.exc.HTTPInternalServerError()
 
         return Namespace.to_wsme_model(updated_namespace,
                                        get_namespace_href(updated_namespace),
@@ -305,6 +390,19 @@ class NamespaceController(object):
         namespace_repo = self.gateway.get_metadef_namespace_repo(req.context)
         try:
             namespace_obj = namespace_repo.get(namespace)
+        except (exception.Forbidden, exception.NotFound):
+            # NOTE (abhishekk): Returning 404 Not Found as the
+            # namespace is outside of this user's project
+            msg = _("Namespace %s not found") % namespace
+            raise webob.exc.HTTPNotFound(explanation=msg)
+
+        try:
+            # NOTE(abhishekk): Here we are just checking user is authorized to
+            # delete the namespace or not.
+            api_policy.MetadefAPIPolicy(
+                req.context,
+                md_resource=namespace_obj,
+                enforcer=self.policy).delete_metadef_namespace()
             namespace_obj.delete()
             namespace_repo.remove(namespace_obj)
         except exception.Forbidden as e:
@@ -313,14 +411,26 @@ class NamespaceController(object):
             raise webob.exc.HTTPForbidden(explanation=e.msg)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
-        except Exception as e:
-            LOG.error(encodeutils.exception_to_unicode(e))
-            raise webob.exc.HTTPInternalServerError()
 
     def delete_objects(self, req, namespace):
         ns_repo = self.gateway.get_metadef_namespace_repo(req.context)
         try:
             namespace_obj = ns_repo.get(namespace)
+        except (exception.Forbidden, exception.NotFound):
+            # NOTE (abhishekk): Returning 404 Not Found as the
+            # namespace is outside of this user's project
+            msg = _("Namespace %s not found") % namespace
+            raise webob.exc.HTTPNotFound(explanation=msg)
+
+        try:
+            # NOTE(abhishekk): This call currently checks whether user
+            # has permission to delete the namespace or not before deleting
+            # the objects associated with it.
+            api_policy.MetadefAPIPolicy(
+                req.context,
+                md_resource=namespace_obj,
+                enforcer=self.policy).delete_metadef_namespace()
+
             namespace_obj.delete()
             ns_repo.remove_objects(namespace_obj)
         except exception.Forbidden as e:
@@ -329,14 +439,30 @@ class NamespaceController(object):
             raise webob.exc.HTTPForbidden(explanation=e.msg)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
-        except Exception as e:
-            LOG.error(encodeutils.exception_to_unicode(e))
-            raise webob.exc.HTTPInternalServerError()
 
     def delete_tags(self, req, namespace):
         ns_repo = self.gateway.get_metadef_namespace_repo(req.context)
         try:
             namespace_obj = ns_repo.get(namespace)
+        except (exception.Forbidden, exception.NotFound):
+            # NOTE (abhishekk): Returning 404 Not Found as the
+            # namespace is outside of this user's project
+            msg = _("Namespace %s not found") % namespace
+            raise webob.exc.HTTPNotFound(explanation=msg)
+
+        try:
+            # NOTE(abhishekk): This call currently checks whether user
+            # has permission to delete the namespace or not before deleting
+            # the objects associated with it.
+            policy_check = api_policy.MetadefAPIPolicy(
+                req.context,
+                md_resource=namespace_obj,
+                enforcer=self.policy)
+            policy_check.delete_metadef_namespace()
+            # NOTE(abhishekk): This call checks whether user
+            # has permission to delete the tags or not.
+            policy_check.delete_metadef_tags()
+
             namespace_obj.delete()
             ns_repo.remove_tags(namespace_obj)
         except exception.Forbidden as e:
@@ -345,14 +471,25 @@ class NamespaceController(object):
             raise webob.exc.HTTPForbidden(explanation=e.msg)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
-        except Exception as e:
-            LOG.error(encodeutils.exception_to_unicode(e))
-            raise webob.exc.HTTPInternalServerError()
 
     def delete_properties(self, req, namespace):
         ns_repo = self.gateway.get_metadef_namespace_repo(req.context)
         try:
             namespace_obj = ns_repo.get(namespace)
+        except (exception.Forbidden, exception.NotFound):
+            # NOTE (abhishekk): Returning 404 Not Found as the
+            # namespace is outside of this user's project
+            msg = _("Namespace %s not found") % namespace
+            raise webob.exc.HTTPNotFound(explanation=msg)
+        try:
+            # NOTE(abhishekk): This call currently checks whether user
+            # has permission to delete the namespace or not before deleting
+            # the objects associated with it.
+            api_policy.MetadefAPIPolicy(
+                req.context,
+                md_resource=namespace_obj,
+                enforcer=self.policy).delete_metadef_namespace()
+
             namespace_obj.delete()
             ns_repo.remove_properties(namespace_obj)
         except exception.Forbidden as e:
@@ -361,9 +498,6 @@ class NamespaceController(object):
             raise webob.exc.HTTPForbidden(explanation=e.msg)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
-        except Exception as e:
-            LOG.error(encodeutils.exception_to_unicode(e))
-            raise webob.exc.HTTPInternalServerError()
 
     def _prefix_property_name(self, namespace_detail, user_resource_type):
         prefix = None
@@ -503,7 +637,7 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
 
     def create(self, response, namespace):
         ns_json = json.tojson(Namespace, namespace)
-        response = self.__render(ns_json, response, 201)
+        response = self.__render(ns_json, response, http.CREATED)
         response.location = get_namespace_href(namespace)
 
     def show(self, response, namespace):
@@ -528,20 +662,23 @@ class ResponseSerializer(wsgi.JSONResponseSerializer):
 
     def update(self, response, namespace):
         ns_json = json.tojson(Namespace, namespace)
-        response = self.__render(ns_json, response, 200)
+        response = self.__render(ns_json, response, http.OK)
 
     def delete(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
     def delete_objects(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
     def delete_properties(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
+
+    def delete_tags(self, response, result):
+        response.status_int = http.NO_CONTENT
 
     def __render(self, json_data, response, response_status=None):
         body = jsonutils.dumps(json_data, ensure_ascii=False)
-        response.unicode_body = six.text_type(body)
+        response.unicode_body = body
         response.content_type = 'application/json'
         if response_status:
             response.status_int = response_status
@@ -577,7 +714,8 @@ def get_schema_definitions():
                 "required": ["title", "type"],
                 "properties": {
                     "name": {
-                        "type": "string"
+                        "type": "string",
+                        "maxLength": 80
                     },
                     "title": {
                         "type": "string"

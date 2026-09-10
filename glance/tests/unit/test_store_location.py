@@ -13,7 +13,7 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 import glance_store
-import mock
+from unittest import mock
 
 from glance.common import exception
 from glance.common import store_utils
@@ -43,8 +43,8 @@ class TestStoreLocation(base.StoreClearingUnitTest):
         def fake_get_size_from_backend(uri, context=None):
             return 1
 
-        self.stubs.Set(glance_store, 'get_size_from_backend',
-                       fake_get_size_from_backend)
+        self.mock_object(glance_store, 'get_size_from_backend',
+                         fake_get_size_from_backend)
 
         with mock.patch('glance.location._check_image_location'):
             loc1 = {'url': 'file:///fake1.img.tar.gz', 'metadata': {}}
@@ -82,3 +82,14 @@ class TestStoreLocation(base.StoreClearingUnitTest):
         locations = glance.location.StoreLocations(image2, [loc1])
         self.assertRaises(exception.BadStoreUri, locations.insert, 0, loc2)
         self.assertNotIn(loc2, locations)
+
+    def test_add_http_location_blocks_restricted_hosts(self):
+        """HTTP locations to loopback/link-local are rejected before fetch."""
+        image = TestStoreLocation.FakeImageProxy()
+        locations = glance.location.StoreLocations(image, [])
+        for url in ('http://127.0.0.1/secret',
+                    'http://169.254.169.254/latest/meta-data/'):
+            loc = {'url': url, 'metadata': {}}
+            self.assertRaises(exception.BadStoreUri,
+                              locations.insert, 0, loc)
+            self.assertNotIn(loc, locations)

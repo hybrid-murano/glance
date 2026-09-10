@@ -14,31 +14,29 @@
 
 __all__ = [
     'list_api_opts',
-    'list_registry_opts',
     'list_scrubber_opts',
     'list_cache_opts',
     'list_manage_opts',
-    'list_artifacts_opts'
+    'list_image_import_opts',
 ]
 
 import copy
 import itertools
 
+from osprofiler import opts as profiler
+
 import glance.api.middleware.context
 import glance.api.versions
-import glance.async.taskflow_executor
+import glance.async_.flows._internal_plugins
+import glance.async_.flows.api_image_import
+import glance.async_.flows.convert
+from glance.async_.flows.plugins import plugin_opts
+import glance.async_.taskflow_executor
 import glance.common.config
-import glance.common.location_strategy
-import glance.common.location_strategy.store_type
 import glance.common.property_utils
-import glance.common.rpc
-import glance.common.wsgi
 import glance.image_cache
 import glance.image_cache.drivers.sqlite
 import glance.notifier
-import glance.registry
-import glance.registry.client
-import glance.registry.client.v1.api
 import glance.scrubber
 
 
@@ -47,70 +45,44 @@ _api_opts = [
         glance.api.middleware.context.context_opts,
         glance.api.versions.versions_opts,
         glance.common.config.common_opts,
-        glance.common.location_strategy.location_strategy_opts,
         glance.common.property_utils.property_opts,
-        glance.common.rpc.rpc_opts,
-        glance.common.wsgi.bind_opts,
-        glance.common.wsgi.eventlet_opts,
-        glance.common.wsgi.socket_opts,
+        glance.common.config.store_opts,
         glance.image_cache.drivers.sqlite.sqlite_opts,
         glance.image_cache.image_cache_opts,
         glance.notifier.notifier_opts,
-        glance.registry.registry_addr_opts,
-        glance.registry.client.registry_client_ctx_opts,
-        glance.registry.client.registry_client_opts,
-        glance.registry.client.v1.api.registry_client_ctx_opts,
         glance.scrubber.scrubber_opts))),
     ('image_format', glance.common.config.image_format_opts),
     ('task', glance.common.config.task_opts),
-    ('taskflow_executor',
-     glance.async.taskflow_executor.taskflow_executor_opts),
-    ('store_type_location_strategy',
-     glance.common.location_strategy.store_type.store_type_opts),
-    ('profiler', glance.common.wsgi.profiler_opts),
-    ('paste_deploy', glance.common.config.paste_deploy_opts)
-]
-_registry_opts = [
-    (None, list(itertools.chain(
-        glance.api.middleware.context.context_opts,
-        glance.common.config.common_opts,
-        glance.common.wsgi.bind_opts,
-        glance.common.wsgi.socket_opts,
-        glance.common.wsgi.eventlet_opts))),
-    ('profiler', glance.common.wsgi.profiler_opts),
-    ('paste_deploy', glance.common.config.paste_deploy_opts)
+    ('taskflow_executor', list(itertools.chain(
+        glance.async_.taskflow_executor.taskflow_executor_opts,
+        glance.async_.flows.convert.convert_task_opts))),
+    profiler.list_opts()[0],
+    ('paste_deploy', glance.common.config.paste_deploy_opts),
+    ('wsgi', glance.common.config.wsgi_opts),
 ]
 _scrubber_opts = [
     (None, list(itertools.chain(
         glance.common.config.common_opts,
         glance.scrubber.scrubber_opts,
         glance.scrubber.scrubber_cmd_opts,
-        glance.scrubber.scrubber_cmd_cli_opts,
-        glance.registry.client.registry_client_opts,
-        glance.registry.client.registry_client_ctx_opts,
-        glance.registry.registry_addr_opts))),
+        glance.scrubber.scrubber_cmd_cli_opts))),
 ]
 _cache_opts = [
     (None, list(itertools.chain(
         glance.common.config.common_opts,
         glance.image_cache.drivers.sqlite.sqlite_opts,
-        glance.image_cache.image_cache_opts,
-        glance.registry.registry_addr_opts,
-        glance.registry.client.registry_client_ctx_opts))),
+        glance.image_cache.image_cache_opts))),
 ]
 _manage_opts = [
     (None, [])
 ]
-_artifacts_opts = [
-    (None, list(itertools.chain(
-        glance.api.middleware.context.context_opts,
-        glance.api.versions.versions_opts,
-        glance.common.wsgi.bind_opts,
-        glance.common.wsgi.eventlet_opts,
-        glance.common.wsgi.socket_opts,
-        glance.common.wsgi.profiler_opts,
-        glance.notifier.notifier_opts))),
-    ('paste_deploy', glance.common.config.paste_deploy_opts)
+_image_import_opts = [
+    ('image_import_opts',
+     glance.async_.flows.api_image_import.api_import_opts),
+    ('import_filtering_opts',
+     glance.async_.flows._internal_plugins.import_filtering_opts),
+    ('glance_download_properties',
+     glance.async_.flows.api_image_import.glance_download_opts)
 ]
 
 
@@ -134,13 +106,6 @@ def list_api_opts():
     return [(g, copy.deepcopy(o)) for g, o in _api_opts]
 
 
-def list_registry_opts():
-    """Return a list of oslo_config options available in Glance Registry
-    service.
-    """
-    return [(g, copy.deepcopy(o)) for g, o in _registry_opts]
-
-
 def list_scrubber_opts():
     """Return a list of oslo_config options available in Glance Scrubber
     service.
@@ -160,6 +125,9 @@ def list_manage_opts():
     return [(g, copy.deepcopy(o)) for g, o in _manage_opts]
 
 
-def list_artifacts_opts():
-    """Return a list of oslo_config options available in Glance artifacts"""
-    return [(g, copy.deepcopy(o)) for g, o in _artifacts_opts]
+def list_image_import_opts():
+    """Return a list of oslo_config options available for Image Import"""
+
+    opts = copy.deepcopy(_image_import_opts)
+    opts.extend(plugin_opts.get_plugin_opts())
+    return [(g, copy.deepcopy(o)) for g, o in opts]

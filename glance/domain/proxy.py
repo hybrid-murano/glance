@@ -104,6 +104,16 @@ class Repo(object):
         result = self.base.remove(base_item)
         return self.helper.proxy(result)
 
+    def set_property_atomic(self, item, name, value):
+        msg = '%s is only valid for images' % __name__
+        assert hasattr(item, 'image_id'), msg
+        self.base.set_property_atomic(item, name, value)
+
+    def delete_property_atomic(self, item, name, value):
+        msg = '%s is only valid for images' % __name__
+        assert hasattr(item, 'image_id'), msg
+        self.base.delete_property_atomic(item, name, value)
+
 
 class MemberRepo(object):
     def __init__(self, image, base,
@@ -172,8 +182,11 @@ class Image(object):
     min_disk = _proxy('base', 'min_disk')
     min_ram = _proxy('base', 'min_ram')
     protected = _proxy('base', 'protected')
+    os_hidden = _proxy('base', 'os_hidden')
     locations = _proxy('base', 'locations')
     checksum = _proxy('base', 'checksum')
+    os_hash_algo = _proxy('base', 'os_hash_algo')
+    os_hash_value = _proxy('base', 'os_hash_value')
     owner = _proxy('base', 'owner')
     disk_format = _proxy('base', 'disk_format')
     container_format = _proxy('base', 'container_format')
@@ -181,6 +194,7 @@ class Image(object):
     virtual_size = _proxy('base', 'virtual_size')
     extra_properties = _proxy('base', 'extra_properties')
     tags = _proxy('base', 'tags')
+    member = _proxy('base', 'member')
 
     def delete(self):
         self.base.delete()
@@ -191,8 +205,8 @@ class Image(object):
     def reactivate(self):
         self.base.reactivate()
 
-    def set_data(self, data, size=None):
-        self.base.set_data(data, size)
+    def set_data(self, data, size=None, backend=None, set_active=True):
+        self.base.set_data(data, size, backend=backend, set_active=set_active)
 
     def get_data(self, *args, **kwargs):
         return self.base.get_data(*args, **kwargs)
@@ -224,6 +238,9 @@ class Task(object):
     task_input = _proxy('base', 'task_input')
     result = _proxy('base', 'result')
     message = _proxy('base', 'message')
+    image_id = _proxy('base', 'image_id')
+    request_id = _proxy('base', 'request_id')
+    user_id = _proxy('base', 'user_id')
 
     def begin_processing(self):
         self.base.begin_processing()
@@ -530,11 +547,11 @@ class MetadefTagRepo(object):
     def add(self, meta_tag):
         self.base.add(self.tag_proxy_helper.unproxy(meta_tag))
 
-    def add_tags(self, meta_tags):
+    def add_tags(self, meta_tags, can_append=False):
         tags_list = []
         for meta_tag in meta_tags:
             tags_list.append(self.tag_proxy_helper.unproxy(meta_tag))
-        self.base.add_tags(tags_list)
+        self.base.add_tags(tags_list, can_append)
 
     def list(self, *args, **kwargs):
         tags = self.base.list(*args, **kwargs)

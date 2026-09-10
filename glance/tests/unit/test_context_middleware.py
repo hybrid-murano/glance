@@ -41,8 +41,8 @@ class TestContextMiddleware(base.IsolatedUnitTest):
         req = self._build_request()
         self._build_middleware().process_request(req)
         self.assertEqual('token1', req.context.auth_token)
-        self.assertEqual('user1', req.context.user)
-        self.assertEqual('tenant1', req.context.tenant)
+        self.assertEqual('user1', req.context.user_id)
+        self.assertEqual('tenant1', req.context.project_id)
         self.assertEqual(['role1', 'role2'], req.context.roles)
 
     def test_is_admin_flag(self):
@@ -56,11 +56,11 @@ class TestContextMiddleware(base.IsolatedUnitTest):
         self._build_middleware().process_request(req)
         self.assertFalse(req.context.is_admin)
 
-        # if we change the admin_role attribute, we should be able to use it
-        req = self._build_request()
-        self.config(admin_role='role1')
-        self._build_middleware().process_request(req)
-        self.assertTrue(req.context.is_admin)
+        # the admin_role config option was removed in Wallaby
+        from oslo_config.cfg import NoSuchOptError
+        self.assertRaises(NoSuchOptError,
+                          self.config,
+                          admin_role='role1')
 
     def test_roles_case_insensitive(self):
         # accept role from request
@@ -68,24 +68,11 @@ class TestContextMiddleware(base.IsolatedUnitTest):
         self._build_middleware().process_request(req)
         self.assertTrue(req.context.is_admin)
 
-        # accept role from config
-        req = self._build_request(roles=['role1'])
-        self.config(admin_role='rOLe1')
-        self._build_middleware().process_request(req)
-        self.assertTrue(req.context.is_admin)
-
     def test_roles_stripping(self):
         # stripping extra spaces in request
         req = self._build_request(roles=['\trole1'])
-        self.config(admin_role='role1')
         self._build_middleware().process_request(req)
-        self.assertTrue(req.context.is_admin)
-
-        # stripping extra spaces in config
-        req = self._build_request(roles=['\trole1\n'])
-        self.config(admin_role=' role1\t')
-        self._build_middleware().process_request(req)
-        self.assertTrue(req.context.is_admin)
+        self.assertIn('role1', req.context.roles)
 
     def test_anonymous_access_enabled(self):
         req = self._build_request(identity_status='Nope')
@@ -93,8 +80,8 @@ class TestContextMiddleware(base.IsolatedUnitTest):
         middleware = self._build_middleware()
         middleware.process_request(req)
         self.assertIsNone(req.context.auth_token)
-        self.assertIsNone(req.context.user)
-        self.assertIsNone(req.context.tenant)
+        self.assertIsNone(req.context.user_id)
+        self.assertIsNone(req.context.project_id)
         self.assertEqual([], req.context.roles)
         self.assertFalse(req.context.is_admin)
         self.assertTrue(req.context.read_only)
@@ -141,8 +128,8 @@ class TestUnauthenticatedContextMiddleware(base.IsolatedUnitTest):
         req = webob.Request.blank('/')
         middleware.process_request(req)
         self.assertIsNone(req.context.auth_token)
-        self.assertIsNone(req.context.user)
-        self.assertIsNone(req.context.tenant)
+        self.assertIsNone(req.context.user_id)
+        self.assertIsNone(req.context.project_id)
         self.assertEqual([], req.context.roles)
         self.assertTrue(req.context.is_admin)
 

@@ -47,7 +47,7 @@ class TestProtectedImageRepoProxy(utils.BaseTestCase):
     def setUp(self):
         super(TestProtectedImageRepoProxy, self).setUp()
         self.set_property_protections()
-        self.policy = policy.Enforcer()
+        self.policy = policy.Enforcer(suppress_deprecation_warnings=True)
         self.property_rules = property_utils.PropertyRules(self.policy)
         self.image_factory = glance.domain.ImageFactory()
         extra_props = {'spl_create_prop': 'c',
@@ -101,7 +101,7 @@ class TestProtectedImageProxy(utils.BaseTestCase):
     def setUp(self):
         super(TestProtectedImageProxy, self).setUp()
         self.set_property_protections()
-        self.policy = policy.Enforcer()
+        self.policy = policy.Enforcer(suppress_deprecation_warnings=True)
         self.property_rules = property_utils.PropertyRules(self.policy)
 
     class ImageStub(object):
@@ -124,7 +124,7 @@ class TestExtraPropertiesProxy(utils.BaseTestCase):
     def setUp(self):
         super(TestExtraPropertiesProxy, self).setUp()
         self.set_property_protections()
-        self.policy = policy.Enforcer()
+        self.policy = policy.Enforcer(suppress_deprecation_warnings=True)
         self.property_rules = property_utils.PropertyRules(self.policy)
 
     def test_read_extra_property_as_admin_role(self):
@@ -239,12 +239,12 @@ class TestProtectedImageFactoryProxy(utils.BaseTestCase):
     def setUp(self):
         super(TestProtectedImageFactoryProxy, self).setUp()
         self.set_property_protections()
-        self.policy = policy.Enforcer()
+        self.policy = policy.Enforcer(suppress_deprecation_warnings=True)
         self.property_rules = property_utils.PropertyRules(self.policy)
         self.factory = glance.domain.ImageFactory()
 
     def test_create_image_no_extra_prop(self):
-        self.context = glance.context.RequestContext(tenant=TENANT1,
+        self.context = glance.context.RequestContext(project_id=TENANT1,
                                                      roles=['spl_role'])
         self.image_factory = property_protections.ProtectedImageFactoryProxy(
             self.factory, self.context,
@@ -255,7 +255,7 @@ class TestProtectedImageFactoryProxy(utils.BaseTestCase):
         self.assertEqual(expected_extra_props, image.extra_properties)
 
     def test_create_image_extra_prop(self):
-        self.context = glance.context.RequestContext(tenant=TENANT1,
+        self.context = glance.context.RequestContext(project_id=TENANT1,
                                                      roles=['spl_role'])
         self.image_factory = property_protections.ProtectedImageFactoryProxy(
             self.factory, self.context,
@@ -266,7 +266,7 @@ class TestProtectedImageFactoryProxy(utils.BaseTestCase):
         self.assertEqual(expected_extra_props, image.extra_properties)
 
     def test_create_image_extra_prop_reserved_property(self):
-        self.context = glance.context.RequestContext(tenant=TENANT1,
+        self.context = glance.context.RequestContext(project_id=TENANT1,
                                                      roles=['spl_role'])
         self.image_factory = property_protections.ProtectedImageFactoryProxy(
             self.factory, self.context,
@@ -278,7 +278,7 @@ class TestProtectedImageFactoryProxy(utils.BaseTestCase):
                           extra_properties=extra_props)
 
     def test_create_image_extra_prop_admin(self):
-        self.context = glance.context.RequestContext(tenant=TENANT1,
+        self.context = glance.context.RequestContext(project_id=TENANT1,
                                                      roles=['admin'])
         self.image_factory = property_protections.ProtectedImageFactoryProxy(
             self.factory, self.context,
@@ -289,7 +289,7 @@ class TestProtectedImageFactoryProxy(utils.BaseTestCase):
         self.assertEqual(expected_extra_props, image.extra_properties)
 
     def test_create_image_extra_prop_invalid_role(self):
-        self.context = glance.context.RequestContext(tenant=TENANT1,
+        self.context = glance.context.RequestContext(project_id=TENANT1,
                                                      roles=['imaginary-role'])
         self.image_factory = property_protections.ProtectedImageFactoryProxy(
             self.factory, self.context,

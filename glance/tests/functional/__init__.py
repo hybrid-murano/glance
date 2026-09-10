@@ -14,894 +14,471 @@
 #    under the License.
 
 """
-Base test class for running non-stubbed tests (functional tests)
+Base test classes for running non-stubbed tests (functional tests)
 
-The FunctionalTest class contains helper methods for starting the API
-and Registry server, grabbing the logs of each, cleaning up pidfiles,
-and spinning down the servers.
+This module provides SynchronousAPIBase, the base class for functional testing.
 """
 
-import atexit
-import datetime
-import logging
 import os
-import platform
 import shutil
-import signal
 import socket
 import sys
-import tempfile
+from testtools import content as ttc
+import textwrap
+import threading
 import time
+from unittest import mock
+import uuid
 
-import fixtures
+import glance_store
+from oslo_config import cfg
 from oslo_serialization import jsonutils
-# NOTE(jokke): simplified transition to py3, behaves like py2 xrange
-from six.moves import range
-import six.moves.urllib.parse as urlparse
-import testtools
+import webob
 
+from glance.api import common as api_common
+import glance.async_
+import glance.async_.taskflow_executor  # noqa: register taskflow_executor opts
+from glance.common import config
 from glance.common import utils
+from glance.common import wsgi_app
 from glance.db.sqlalchemy import api as db_api
-from glance import tests as glance_tests
+from glance import housekeeping
 from glance.tests import utils as test_utils
 
-execute, get_unused_port = test_utils.execute, test_utils.get_unused_port
-tracecmd_osmap = {'Linux': 'strace', 'FreeBSD': 'truss'}
+execute = test_utils.execute
+
+SQLITE_CONN_TEMPLATE = 'sqlite:////%s/tests.sqlite'
+CONF = cfg.CONF
+
+# load_paste_app() does not run wsgi_app.init_app(); set pool size once for
+# functional tests (default task_pool_threads is 16).
+glance.async_.set_threadpool_model('native')
+api_common.DEFAULT_POOL_SIZE = 4
 
 
-class Server(object):
+class SynchronousAPIBase(test_utils.BaseTestCase):
+    """A base class that provides synchronous calling into the API.
+
+    This provides a way to directly call into the API WSGI stack
+    without starting a separate server, and with a simple paste
+    pipeline. Configured with multi-store and a real database.
+
+    This differs from other functional test approaches in that it calls
+    directly into the WSGI stack rather than starting a separate server
+    process. This test base is appropriate for situations where you
+    need to be able to mock the state of the world (i.e. warp time, or
+    inject errors) but should not be used for happy-path testing where
+    a separate server process provides more isolation.
+
+    To use this, inherit and run start_server() before you are ready
+    to make API calls (either in your setUp() or per-test if you need
+    to change config or mocking).
+
+    Once started, use the api_get(), api_put(), api_post(), and
+    api_delete() methods to make calls to the API.
+
     """
-    Class used to easily manage starting and stopping
-    a server during functional test runs.
-    """
-    def __init__(self, test_dir, port, sock=None):
+
+    TENANT = str(uuid.uuid4())
+
+    @mock.patch('oslo_db.sqlalchemy.enginefacade.writer.get_engine')
+    def setup_database(self, mock_get_engine):
+        """Configure and prepare a fresh sqlite database."""
+        db_file = 'sqlite:///%s/test.db' % self.test_dir
+        self.config(connection=db_file, group='database')
+
+        # NOTE(danms): Make sure that we clear the current global
+        # database configuration, provision a temporary database file,
+        # and run migrations with our configuration to define the
+        # schema there.
+        db_api.clear_db_env()
+        engine = db_api.get_engine()
+        mock_get_engine.return_value = engine
+        with mock.patch('logging.config'):
+            # NOTE(danms): The alembic config in the env module will break our
+            # BaseTestCase logging setup. So mock that out to prevent it while
+            # we db_sync.
+            test_utils.db_sync(engine=engine)
+
+    def setup_scrubber_conf(self, daemon=False, wakeup_time=300,
+                            scrub_pool_size=12):
+        self.scrubber_conf = os.path.join(
+            self.test_dir, 'glance-scrubber.conf')
+        db_file = 'sqlite:///%s/test.db' % self.test_dir
+        with open(self.scrubber_conf, 'w') as f:
+            f.write(textwrap.dedent("""
+            [DEFAULT]
+            enabled_backends=store1:file,store2:file,store3:file
+            daemon=%(daemon)s
+            wakeup_time=%(wakeup_time)s
+            scrub_pool_size=%(scrub_pool_size)s
+            [database]
+            connection=%(connection)s
+            [store1]
+            filesystem_store_datadir=%(store1)s
+            [store2]
+            filesystem_store_datadir=%(store2)s
+            [store3]
+            filesystem_store_datadir=%(store3)s
+            [os_glance_staging_dir]
+            filesystem_store_datadir=%(staging)s
+            [glance_store]
+            default_backend=store1
+            """) % {
+                "daemon": daemon,
+                "wakeup_time": wakeup_time,
+                "scrub_pool_size": scrub_pool_size,
+                "connection": db_file,
+                "store1": self._store_dir('store1'),
+                "store2": self._store_dir('store2'),
+                "store3": self._store_dir('store3'),
+                "staging": self._store_dir('staging'),
+            })
+
+    def setup_simple_paste(self):
+        """Setup a very simple no-auth paste pipeline.
+
+        This configures the API to be very direct, including only the
+        middleware absolutely required for consistent API calls.
         """
-        Creates a new Server object.
+        self.paste_config = os.path.join(self.test_dir, 'glance-api-paste.ini')
+        with open(self.paste_config, 'w') as f:
+            f.write(textwrap.dedent("""
+            [filter:context]
+            paste.filter_factory = glance.api.middleware.context:\
+                ContextMiddleware.factory
+            [filter:unauthenticated-context]
+            paste.filter_factory = glance.api.middleware.context:\
+                UnauthenticatedContextMiddleware.factory
+            [filter:versionnegotiation]
+            paste.filter_factory = glance.api.middleware.version_negotiation:\
+                VersionNegotiationFilter.factory
+            [filter:fakeauth]
+            paste.filter_factory = glance.tests.utils:\
+                FakeAuthMiddleware.factory
+            [filter:cors]
+            paste.filter_factory = oslo_middleware.cors:filter_factory
+            allowed_origin=http://valid.example.com
+            [filter:gzip]
+            paste.filter_factory = glance.api.middleware.gzip:\
+                GzipMiddleware.factory
+            [filter:cache]
+            paste.filter_factory = glance.api.middleware.cache:\
+            CacheFilter.factory
+            [filter:cachemanage]
+            paste.filter_factory = glance.api.middleware.cache_manage:\
+            CacheManageFilter.factory
+            [pipeline:glance-api-cachemanagement]
+            pipeline = context cache cachemanage gzip rootapp
+            [pipeline:glance-api-cors]
+            pipeline = cors context gzip rootapp
+            [pipeline:glance-api-caching]
+            pipeline = context cache gzip rootapp
+            [pipeline:glance-api]
+            pipeline = context rootapp
+            [pipeline:glance-api-versionnegotiation]
+            pipeline = versionnegotiation unauthenticated-context cache cachemanage rootapp
+            [pipeline:glance-api-fake]
+            pipeline = fakeauth context gzip rootapp
+            [composite:rootapp]
+            paste.composite_factory = glance.api:root_app_factory
+            /: apiversions
+            /v2: apiv2app
+            /healthcheck: healthcheck
+            [app:apiversions]
+            paste.app_factory = glance.api.versions:create_resource
+            [app:apiv2app]
+            paste.app_factory = glance.api.v2.router:API.factory
+            [app:healthcheck]
+            paste.app_factory = oslo_middleware:Healthcheck.app_factory
+            backends = disable_by_file
+            disable_by_file_path = /tmp/test_path
+            """))
 
-        :param test_dir: The directory where all test stuff is kept. This is
-                         passed from the FunctionalTestCase.
-        :param port: The port to start a server up on.
+    def _store_dir(self, store):
+        return os.path.join(self.test_dir, store)
+
+    def setup_single_store(self):
+        """Configures single backend.
+
+        This configures the API with one file-backed store
+        as well as node_staging_uri for imports.
+
         """
-        self.verbose = True
-        self.debug = True
-        self.no_venv = False
-        self.test_dir = test_dir
-        self.bind_port = port
-        self.conf_file_name = None
-        self.conf_base = None
-        self.paste_conf_base = None
-        self.exec_env = None
-        self.deployment_flavor = ''
-        self.show_image_direct_url = False
-        self.show_multiple_locations = False
-        self.property_protection_file = ''
-        self.enable_v1_api = True
-        self.enable_v2_api = True
-        self.enable_v1_registry = True
-        self.enable_v2_registry = True
-        self.needs_database = False
-        self.log_file = None
-        self.sock = sock
-        self.fork_socket = True
-        self.process_pid = None
-        self.server_module = None
-        self.stop_kill = False
-        self.use_user_token = True
-        self.send_identity_credentials = False
+        glance_store.register_opts(CONF)
+        self.config(filesystem_store_datadir=self._store_dir('store1'),
+                    group='glance_store')
+        node_staging_uri = 'file://%s' % os.path.join(
+            self.test_dir, 'staging')
+        utils.safe_mkdirs(node_staging_uri[7:])
+        self.config(node_staging_uri=node_staging_uri)
+        self.config(default_store='file', group='glance_store')
+        glance_store.create_stores(CONF)
+        glance_store.verify_default_store()
 
-    def write_conf(self, **kwargs):
+    def setup_property_protection_files(self):
+        """Setup property protection configuration files.
+
+        This creates property protection files dynamically for testing,
+        similar to how setup_simple_paste() creates paste config files.
+        Creates both roles-based and policies-based property protection
+        files.
         """
-        Writes the configuration file for the server to its intended
-        destination.  Returns the name of the configuration file and
-        the over-ridden config content (may be useful for populating
-        error messages).
-        """
-        if not self.conf_base:
-            raise RuntimeError("Subclass did not populate config_base!")
-
-        conf_override = self.__dict__.copy()
-        if kwargs:
-            conf_override.update(**kwargs)
-
-        # A config file and paste.ini to use just for this test...we don't want
-        # to trample on currently-running Glance servers, now do we?
-
         conf_dir = os.path.join(self.test_dir, 'etc')
-        conf_filepath = os.path.join(conf_dir, "%s.conf" % self.server_name)
-        if os.path.exists(conf_filepath):
-            os.unlink(conf_filepath)
-        paste_conf_filepath = conf_filepath.replace(".conf", "-paste.ini")
-        if os.path.exists(paste_conf_filepath):
-            os.unlink(paste_conf_filepath)
         utils.safe_mkdirs(conf_dir)
 
-        def override_conf(filepath, overridden):
-            with open(filepath, 'w') as conf_file:
-                conf_file.write(overridden)
-                conf_file.flush()
-                return conf_file.name
+        # Create roles-based property protection file
+        property_file_roles = os.path.join(conf_dir,
+                                           'property-protections.conf')
+        with open(property_file_roles, 'w') as f:
+            f.write(textwrap.dedent("""
+            [^x_owner_.*]
+            create = admin,member
+            read = admin,member
+            update = admin,member
+            delete = admin,member
 
-        overridden_core = self.conf_base % conf_override
-        self.conf_file_name = override_conf(conf_filepath, overridden_core)
+            [spl_create_prop]
+            create = admin,spl_role
+            read = admin,spl_role
+            update = admin
+            delete = admin
 
-        overridden_paste = ''
-        if self.paste_conf_base:
-            overridden_paste = self.paste_conf_base % conf_override
-            override_conf(paste_conf_filepath, overridden_paste)
+            [spl_read_prop]
+            create = admin,spl_role
+            read = admin,spl_role
+            update = admin
+            delete = admin
 
-        overridden = ('==Core config==\n%s\n==Paste config==\n%s' %
-                      (overridden_core, overridden_paste))
+            [spl_read_only_prop]
+            create = admin
+            read = admin,spl_role
+            update = admin
+            delete = admin
 
-        return self.conf_file_name, overridden
+            [spl_update_prop]
+            create = admin,spl_role
+            read = admin,spl_role
+            update = admin,spl_role
+            delete = admin
 
-    def start(self, expect_exit=True, expected_exitcode=0, **kwargs):
+            [spl_update_only_prop]
+            create = admin
+            read = admin
+            update = admin,spl_role
+            delete = admin
+
+            [spl_delete_prop]
+            create = admin,spl_role
+            read = admin,spl_role
+            update = admin
+            delete = admin,spl_role
+
+            [spl_delete_empty_prop]
+            create = admin,spl_role
+            read = admin,spl_role
+            update = admin
+            delete = admin,spl_role
+
+            [^x_all_permitted.*]
+            create = @
+            read = @
+            update = @
+            delete = @
+
+            [^x_none_permitted.*]
+            create = !
+            read = !
+            update = !
+            delete = !
+
+            [x_none_read]
+            create = admin,member
+            read = !
+            update = !
+            delete = !
+
+            [x_none_update]
+            create = admin,member
+            read = admin,member
+            update = !
+            delete = admin,member
+
+            [x_none_delete]
+            create = admin,member
+            read = admin,member
+            update = admin,member
+            delete = !
+
+            [x_case_insensitive]
+            create = admin,Member
+            read = admin,Member
+            update = admin,Member
+            delete = admin,Member
+
+            [x_foo_matcher]
+            create = admin
+            read = admin
+            update = admin
+            delete = admin
+
+            [x_foo_*]
+            create = @
+            read = @
+            update = @
+            delete = @
+
+            [.*]
+            create = admin
+            read = admin
+            update = admin
+            delete = admin
+            """))
+
+        # Create policies-based property protection file
+        property_file_policies = os.path.join(
+            conf_dir, 'property-protections-policies.conf')
+        with open(property_file_policies, 'w') as f:
+            f.write(textwrap.dedent("""
+            [spl_creator_policy]
+            create = glance_creator
+            read = glance_creator
+            update = context_is_admin
+            delete = context_is_admin
+
+            [spl_default_policy]
+            create = context_is_admin
+            read = default
+            update = context_is_admin
+            delete = context_is_admin
+
+            [^x_all_permitted.*]
+            create = @
+            read = @
+            update = @
+            delete = @
+
+            [^x_none_permitted.*]
+            create = !
+            read = !
+            update = !
+            delete = !
+
+            [x_none_read]
+            create = context_is_admin
+            read = !
+            update = !
+            delete = !
+
+            [x_none_update]
+            create = context_is_admin
+            read = context_is_admin
+            update = !
+            delete = context_is_admin
+
+            [x_none_delete]
+            create = context_is_admin
+            read = context_is_admin
+            update = context_is_admin
+            delete = !
+
+            [x_foo_matcher]
+            create = context_is_admin
+            read = context_is_admin
+            update = context_is_admin
+            delete = context_is_admin
+
+            [x_foo_*]
+            create = @
+            read = @
+            update = @
+            delete = @
+
+            [.*]
+            create = context_is_admin
+            read = context_is_admin
+            update = context_is_admin
+            delete = context_is_admin
+            """))
+
+        self.property_file_roles = property_file_roles
+        self.property_file_policies = property_file_policies
+
+    def setup_stores(self):
+        """Configures multiple backend stores.
+
+        This configures the API with three file-backed stores (store1,
+        store2, and store3) as well as a os_glance_staging_store for
+        imports.
+
         """
-        Starts the server.
+        self.config(enabled_backends={'store1': 'file', 'store2': 'file',
+                                      'store3': 'file'})
+        glance_store.register_store_opts(CONF,
+                                         reserved_stores=wsgi_app.RESERVED_STORES)
+        self.config(default_backend='store1',
+                    group='glance_store')
+        self.config(filesystem_store_datadir=self._store_dir('store1'),
+                    group='store1')
+        self.config(filesystem_store_datadir=self._store_dir('store2'),
+                    group='store2')
+        self.config(filesystem_store_datadir=self._store_dir('store3'),
+                    group='store3')
+        self.config(filesystem_store_datadir=self._store_dir('staging'),
+                    group='os_glance_staging_store')
+        self.config(filesystem_store_datadir=self._store_dir('tasks'),
+                    group='os_glance_tasks_store')
 
-        Any kwargs passed to this method will override the configuration
-        value in the conf file used in starting the servers.
-        """
+        glance_store.create_multi_stores(CONF,
+                                         reserved_stores=wsgi_app.RESERVED_STORES)
+        glance_store.verify_store()
 
-        # Ensure the configuration file is written
-        self.write_conf(**kwargs)
+    def setUp(self, single_store=False, bypass_headers=False):
+        super(SynchronousAPIBase, self).setUp()
+        self.bypass_headers = bypass_headers
 
-        self.create_database()
-
-        cmd = ("%(server_module)s --config-file %(conf_file_name)s"
-               % {"server_module": self.server_module,
-                  "conf_file_name": self.conf_file_name})
-        cmd = "%s -m %s" % (sys.executable, cmd)
-        # close the sock and release the unused port closer to start time
-        if self.exec_env:
-            exec_env = self.exec_env.copy()
+        self.setup_database()
+        self.setup_simple_paste()
+        if single_store:
+            self.setup_single_store()
         else:
-            exec_env = {}
-        pass_fds = set()
-        if self.sock:
-            if not self.fork_socket:
-                self.sock.close()
-                self.sock = None
-            else:
-                fd = os.dup(self.sock.fileno())
-                exec_env[utils.GLANCE_TEST_SOCKET_FD_STR] = str(fd)
-                pass_fds.add(fd)
-                self.sock.close()
-
-        self.process_pid = test_utils.fork_exec(cmd,
-                                                logfile=os.devnull,
-                                                exec_env=exec_env,
-                                                pass_fds=pass_fds)
-
-        self.stop_kill = not expect_exit
-        if self.pid_file:
-            pf = open(self.pid_file, 'w')
-            pf.write('%d\n' % self.process_pid)
-            pf.close()
-        if not expect_exit:
-            rc = 0
-            try:
-                os.kill(self.process_pid, 0)
-            except OSError:
-                raise RuntimeError("The process did not start")
-        else:
-            rc = test_utils.wait_for_fork(
-                self.process_pid,
-                expected_exitcode=expected_exitcode)
-        # avoid an FD leak
-        if self.sock:
-            os.close(fd)
-            self.sock = None
-        return (rc, '', '')
-
-    def reload(self, expect_exit=True, expected_exitcode=0, **kwargs):
-        """
-        Start and stop the service to reload
-
-        Any kwargs passed to this method will override the configuration
-        value in the conf file used in starting the servers.
-        """
-        self.stop()
-        return self.start(expect_exit=expect_exit,
-                          expected_exitcode=expected_exitcode, **kwargs)
-
-    def create_database(self):
-        """Create database if required for this server"""
-        if self.needs_database:
-            conf_dir = os.path.join(self.test_dir, 'etc')
-            utils.safe_mkdirs(conf_dir)
-            conf_filepath = os.path.join(conf_dir, 'glance-manage.conf')
-
-            with open(conf_filepath, 'w') as conf_file:
-                conf_file.write('[DEFAULT]\n')
-                conf_file.write('sql_connection = %s' % self.sql_connection)
-                conf_file.flush()
-
-            glance_db_env = 'GLANCE_DB_TEST_SQLITE_FILE'
-            if glance_db_env in os.environ:
-                # use the empty db created and cached as a tempfile
-                # instead of spending the time creating a new one
-                db_location = os.environ[glance_db_env]
-                os.system('cp %s %s/tests.sqlite'
-                          % (db_location, self.test_dir))
-            else:
-                cmd = ('%s -m glance.cmd.manage --config-file %s db sync' %
-                       (sys.executable, conf_filepath))
-                execute(cmd, no_venv=self.no_venv, exec_env=self.exec_env,
-                        expect_exit=True)
-
-                # copy the clean db to a temp location so that it
-                # can be reused for future tests
-                (osf, db_location) = tempfile.mkstemp()
-                os.close(osf)
-                os.system('cp %s/tests.sqlite %s'
-                          % (self.test_dir, db_location))
-                os.environ[glance_db_env] = db_location
-
-                # cleanup the temp file when the test suite is
-                # complete
-                def _delete_cached_db():
-                    try:
-                        os.remove(os.environ[glance_db_env])
-                    except Exception:
-                        glance_tests.logger.exception(
-                            "Error cleaning up the file %s" %
-                            os.environ[glance_db_env])
-                atexit.register(_delete_cached_db)
-
-    def stop(self):
-        """
-        Spin down the server.
-        """
-        if not self.process_pid:
-            raise Exception('why is this being called? %s' % self.server_name)
-
-        if self.stop_kill:
-            os.kill(self.process_pid, signal.SIGTERM)
-        rc = test_utils.wait_for_fork(self.process_pid, raise_error=False)
-        return (rc, '', '')
-
-    def dump_log(self, name):
-        log = logging.getLogger(name)
-        if not self.log_file or not os.path.exists(self.log_file):
-            return
-        fptr = open(self.log_file, 'r')
-        for line in fptr:
-            log.info(line.strip())
-
-
-class ApiServer(Server):
-
-    """
-    Server object that starts/stops/manages the API server
-    """
-
-    def __init__(self, test_dir, port, policy_file, delayed_delete=False,
-                 pid_file=None, sock=None, **kwargs):
-        super(ApiServer, self).__init__(test_dir, port, sock=sock)
-        self.server_name = 'api'
-        self.server_module = 'glance.cmd.%s' % self.server_name
-        self.default_store = kwargs.get("default_store", "file")
-        self.key_file = ""
-        self.cert_file = ""
-        self.metadata_encryption_key = "012345678901234567890123456789ab"
-        self.image_dir = os.path.join(self.test_dir, "images")
-        self.pid_file = pid_file or os.path.join(self.test_dir, "api.pid")
-        self.log_file = os.path.join(self.test_dir, "api.log")
-        self.image_size_cap = 1099511627776
-        self.delayed_delete = delayed_delete
-        self.owner_is_tenant = True
-        self.workers = 0
-        self.scrub_time = 5
-        self.image_cache_dir = os.path.join(self.test_dir,
-                                            'cache')
-        self.image_cache_driver = 'sqlite'
-        self.policy_file = policy_file
-        self.policy_default_rule = 'default'
-        self.property_protection_rule_format = 'roles'
-        self.image_member_quota = 10
-        self.image_property_quota = 10
-        self.image_tag_quota = 10
-        self.image_location_quota = 2
-        self.disable_path = None
-
-        self.needs_database = True
-        default_sql_connection = 'sqlite:////%s/tests.sqlite' % self.test_dir
-        self.sql_connection = os.environ.get('GLANCE_TEST_SQL_CONNECTION',
-                                             default_sql_connection)
-        self.data_api = kwargs.get("data_api",
-                                   "glance.db.sqlalchemy.api")
-        self.user_storage_quota = '0'
-        self.lock_path = self.test_dir
-
-        self.location_strategy = 'location_order'
-        self.store_type_location_strategy_preference = ""
-
-        self.send_identity_headers = False
-
-        self.conf_base = """[DEFAULT]
-verbose = %(verbose)s
-debug = %(debug)s
-default_log_levels = eventlet.wsgi.server=DEBUG
-bind_host = 127.0.0.1
-bind_port = %(bind_port)s
-key_file = %(key_file)s
-cert_file = %(cert_file)s
-metadata_encryption_key = %(metadata_encryption_key)s
-registry_host = 127.0.0.1
-registry_port = %(registry_port)s
-use_user_token = %(use_user_token)s
-send_identity_credentials = %(send_identity_credentials)s
-log_file = %(log_file)s
-image_size_cap = %(image_size_cap)d
-delayed_delete = %(delayed_delete)s
-owner_is_tenant = %(owner_is_tenant)s
-workers = %(workers)s
-scrub_time = %(scrub_time)s
-send_identity_headers = %(send_identity_headers)s
-image_cache_dir = %(image_cache_dir)s
-image_cache_driver = %(image_cache_driver)s
-data_api = %(data_api)s
-sql_connection = %(sql_connection)s
-show_image_direct_url = %(show_image_direct_url)s
-show_multiple_locations = %(show_multiple_locations)s
-user_storage_quota = %(user_storage_quota)s
-enable_v1_api = %(enable_v1_api)s
-enable_v2_api = %(enable_v2_api)s
-lock_path = %(lock_path)s
-property_protection_file = %(property_protection_file)s
-property_protection_rule_format = %(property_protection_rule_format)s
-image_member_quota=%(image_member_quota)s
-image_property_quota=%(image_property_quota)s
-image_tag_quota=%(image_tag_quota)s
-image_location_quota=%(image_location_quota)s
-location_strategy=%(location_strategy)s
-allow_additional_image_properties = True
-[oslo_policy]
-policy_file = %(policy_file)s
-policy_default_rule = %(policy_default_rule)s
-[paste_deploy]
-flavor = %(deployment_flavor)s
-[store_type_location_strategy]
-store_type_preference = %(store_type_location_strategy_preference)s
-[glance_store]
-filesystem_store_datadir=%(image_dir)s
-default_store = %(default_store)s
-"""
-        self.paste_conf_base = """[pipeline:glance-api]
-pipeline =
-    cors
-    healthcheck
-    versionnegotiation
-    gzip
-    unauthenticated-context
-    rootapp
-
-[pipeline:glance-api-caching]
-pipeline = cors healthcheck versionnegotiation gzip unauthenticated-context
- cache rootapp
-
-[pipeline:glance-api-cachemanagement]
-pipeline =
-    cors
-    healthcheck
-    versionnegotiation
-    gzip
-    unauthenticated-context
-    cache
-    cache_manage
-    rootapp
-
-[pipeline:glance-api-fakeauth]
-pipeline = cors healthcheck versionnegotiation gzip fakeauth context rootapp
-
-[pipeline:glance-api-noauth]
-pipeline = cors healthcheck versionnegotiation gzip context rootapp
-
-[composite:rootapp]
-paste.composite_factory = glance.api:root_app_factory
-/: apiversions
-/v1: apiv1app
-/v2: apiv2app
-
-[app:apiversions]
-paste.app_factory = glance.api.versions:create_resource
-
-[app:apiv1app]
-paste.app_factory = glance.api.v1.router:API.factory
-
-[app:apiv2app]
-paste.app_factory = glance.api.v2.router:API.factory
-
-[filter:healthcheck]
-paste.filter_factory = oslo_middleware:Healthcheck.factory
-backends = disable_by_file
-disable_by_file_path = %(disable_path)s
-
-[filter:versionnegotiation]
-paste.filter_factory =
- glance.api.middleware.version_negotiation:VersionNegotiationFilter.factory
-
-[filter:gzip]
-paste.filter_factory = glance.api.middleware.gzip:GzipMiddleware.factory
-
-[filter:cache]
-paste.filter_factory = glance.api.middleware.cache:CacheFilter.factory
-
-[filter:cache_manage]
-paste.filter_factory =
- glance.api.middleware.cache_manage:CacheManageFilter.factory
-
-[filter:context]
-paste.filter_factory = glance.api.middleware.context:ContextMiddleware.factory
-
-[filter:unauthenticated-context]
-paste.filter_factory =
- glance.api.middleware.context:UnauthenticatedContextMiddleware.factory
-
-[filter:fakeauth]
-paste.filter_factory = glance.tests.utils:FakeAuthMiddleware.factory
-
-[filter:cors]
-paste.filter_factory = oslo_middleware.cors:filter_factory
-allowed_origin=http://valid.example.com
-"""
-
-
-class RegistryServer(Server):
-
-    """
-    Server object that starts/stops/manages the Registry server
-    """
-
-    def __init__(self, test_dir, port, policy_file, sock=None):
-        super(RegistryServer, self).__init__(test_dir, port, sock=sock)
-        self.server_name = 'registry'
-        self.server_module = 'glance.cmd.%s' % self.server_name
-
-        self.needs_database = True
-        default_sql_connection = 'sqlite:////%s/tests.sqlite' % self.test_dir
-        self.sql_connection = os.environ.get('GLANCE_TEST_SQL_CONNECTION',
-                                             default_sql_connection)
-
-        self.pid_file = os.path.join(self.test_dir, "registry.pid")
-        self.log_file = os.path.join(self.test_dir, "registry.log")
-        self.owner_is_tenant = True
-        self.workers = 0
-        self.api_version = 1
-        self.user_storage_quota = '0'
-        self.metadata_encryption_key = "012345678901234567890123456789ab"
-        self.policy_file = policy_file
-        self.policy_default_rule = 'default'
-        self.disable_path = None
-
-        self.conf_base = """[DEFAULT]
-verbose = %(verbose)s
-debug = %(debug)s
-bind_host = 127.0.0.1
-bind_port = %(bind_port)s
-log_file = %(log_file)s
-sql_connection = %(sql_connection)s
-sql_idle_timeout = 3600
-api_limit_max = 1000
-limit_param_default = 25
-owner_is_tenant = %(owner_is_tenant)s
-enable_v2_registry = %(enable_v2_registry)s
-workers = %(workers)s
-user_storage_quota = %(user_storage_quota)s
-metadata_encryption_key = %(metadata_encryption_key)s
-[oslo_policy]
-policy_file = %(policy_file)s
-policy_default_rule = %(policy_default_rule)s
-[paste_deploy]
-flavor = %(deployment_flavor)s
-"""
-        self.paste_conf_base = """[pipeline:glance-registry]
-pipeline = healthcheck unauthenticated-context registryapp
-
-[pipeline:glance-registry-fakeauth]
-pipeline = healthcheck fakeauth context registryapp
-
-[pipeline:glance-registry-trusted-auth]
-pipeline = healthcheck context registryapp
-
-[app:registryapp]
-paste.app_factory = glance.registry.api:API.factory
-
-[filter:healthcheck]
-paste.filter_factory = oslo_middleware:Healthcheck.factory
-backends = disable_by_file
-disable_by_file_path = %(disable_path)s
-
-[filter:context]
-paste.filter_factory = glance.api.middleware.context:ContextMiddleware.factory
-
-[filter:unauthenticated-context]
-paste.filter_factory =
- glance.api.middleware.context:UnauthenticatedContextMiddleware.factory
-
-[filter:fakeauth]
-paste.filter_factory = glance.tests.utils:FakeAuthMiddleware.factory
-"""
-
-
-class ScrubberDaemon(Server):
-    """
-    Server object that starts/stops/manages the Scrubber server
-    """
-
-    def __init__(self, test_dir, policy_file, daemon=False, **kwargs):
-        # NOTE(jkoelker): Set the port to 0 since we actually don't listen
-        super(ScrubberDaemon, self).__init__(test_dir, 0)
-        self.server_name = 'scrubber'
-        self.server_module = 'glance.cmd.%s' % self.server_name
-        self.daemon = daemon
-
-        self.image_dir = os.path.join(self.test_dir, "images")
-        self.scrub_time = 5
-        self.pid_file = os.path.join(self.test_dir, "scrubber.pid")
-        self.log_file = os.path.join(self.test_dir, "scrubber.log")
-        self.metadata_encryption_key = "012345678901234567890123456789ab"
-        self.lock_path = self.test_dir
-
-        default_sql_connection = 'sqlite:////%s/tests.sqlite' % self.test_dir
-        self.sql_connection = os.environ.get('GLANCE_TEST_SQL_CONNECTION',
-                                             default_sql_connection)
-        self.policy_file = policy_file
-        self.policy_default_rule = 'default'
-
-        self.send_identity_headers = False
-        self.admin_role = 'admin'
-
-        self.conf_base = """[DEFAULT]
-verbose = %(verbose)s
-debug = %(debug)s
-log_file = %(log_file)s
-daemon = %(daemon)s
-wakeup_time = 2
-scrub_time = %(scrub_time)s
-registry_host = 127.0.0.1
-registry_port = %(registry_port)s
-metadata_encryption_key = %(metadata_encryption_key)s
-lock_path = %(lock_path)s
-sql_connection = %(sql_connection)s
-sql_idle_timeout = 3600
-send_identity_headers = %(send_identity_headers)s
-admin_role = %(admin_role)s
-[glance_store]
-filesystem_store_datadir=%(image_dir)s
-[oslo_policy]
-policy_file = %(policy_file)s
-policy_default_rule = %(policy_default_rule)s
-"""
-
-    def start(self, expect_exit=True, expected_exitcode=0, **kwargs):
-        if 'daemon' in kwargs:
-            expect_exit = False
-        return super(ScrubberDaemon, self).start(
-            expect_exit=expect_exit,
-            expected_exitcode=expected_exitcode,
-            **kwargs)
-
-
-class FunctionalTest(test_utils.BaseTestCase):
-
-    """
-    Base test class for any test that wants to test the actual
-    servers and clients and not just the stubbed out interfaces
-    """
-
-    inited = False
-    disabled = False
-    launched_servers = []
-
-    def setUp(self):
-        super(FunctionalTest, self).setUp()
-        self.test_dir = self.useFixture(fixtures.TempDir()).path
-
-        self.api_protocol = 'http'
-        self.api_port, api_sock = test_utils.get_unused_port_and_socket()
-        self.registry_port, reg_sock = test_utils.get_unused_port_and_socket()
-
-        self.tracecmd = tracecmd_osmap.get(platform.system())
+            self.setup_stores()
 
         conf_dir = os.path.join(self.test_dir, 'etc')
         utils.safe_mkdirs(conf_dir)
         self.copy_data_file('schema-image.json', conf_dir)
-        self.copy_data_file('policy.json', conf_dir)
-        self.copy_data_file('property-protections.conf', conf_dir)
-        self.copy_data_file('property-protections-policies.conf', conf_dir)
-        self.property_file_roles = os.path.join(conf_dir,
-                                                'property-protections.conf')
-        property_policies = 'property-protections-policies.conf'
-        self.property_file_policies = os.path.join(conf_dir,
-                                                   property_policies)
-        self.policy_file = os.path.join(conf_dir, 'policy.json')
-
-        self.api_server = ApiServer(self.test_dir,
-                                    self.api_port,
-                                    self.policy_file,
-                                    sock=api_sock)
-
-        self.registry_server = RegistryServer(self.test_dir,
-                                              self.registry_port,
-                                              self.policy_file,
-                                              sock=reg_sock)
-
-        self.scrubber_daemon = ScrubberDaemon(self.test_dir, self.policy_file)
-
-        self.pid_files = [self.api_server.pid_file,
-                          self.registry_server.pid_file,
-                          self.scrubber_daemon.pid_file]
-        self.files_to_destroy = []
-        self.launched_servers = []
+        self.setup_property_protection_files()
 
     def tearDown(self):
-        if not self.disabled:
-            self.cleanup()
-            # We destroy the test data store between each test case,
-            # and recreate it, which ensures that we have no side-effects
-            # from the tests
-            self._reset_database(self.registry_server.sql_connection)
-            self._reset_database(self.api_server.sql_connection)
-        super(FunctionalTest, self).tearDown()
-
-        self.api_server.dump_log('api_server')
-        self.registry_server.dump_log('registry_server')
-        self.scrubber_daemon.dump_log('scrubber_daemon')
-
-    def set_policy_rules(self, rules):
-        fap = open(self.policy_file, 'w')
-        fap.write(jsonutils.dumps(rules))
-        fap.close()
-
-    def _reset_database(self, conn_string):
-        conn_pieces = urlparse.urlparse(conn_string)
-        if conn_string.startswith('sqlite'):
-            # We leave behind the sqlite DB for failing tests to aid
-            # in diagnosis, as the file size is relatively small and
-            # won't interfere with subsequent tests as it's in a per-
-            # test directory (which is blown-away if the test is green)
-            pass
-        elif conn_string.startswith('mysql'):
-            # We can execute the MySQL client to destroy and re-create
-            # the MYSQL database, which is easier and less error-prone
-            # than using SQLAlchemy to do this via MetaData...trust me.
-            database = conn_pieces.path.strip('/')
-            loc_pieces = conn_pieces.netloc.split('@')
-            host = loc_pieces[1]
-            auth_pieces = loc_pieces[0].split(':')
-            user = auth_pieces[0]
-            password = ""
-            if len(auth_pieces) > 1:
-                if auth_pieces[1].strip():
-                    password = "-p%s" % auth_pieces[1]
-            sql = ("drop database if exists %(database)s; "
-                   "create database %(database)s;") % {'database': database}
-            cmd = ("mysql -u%(user)s %(password)s -h%(host)s "
-                   "-e\"%(sql)s\"") % {'user': user, 'password': password,
-                                       'host': host, 'sql': sql}
-            exitcode, out, err = execute(cmd)
-            self.assertEqual(0, exitcode)
-
-    def cleanup(self):
-        """
-        Makes sure anything we created or started up in the
-        tests are destroyed or spun down
-        """
-
-        # NOTE(jbresnah) call stop on each of the servers instead of
-        # checking the pid file.  stop() will wait until the child
-        # server is dead.  This eliminates the possibility of a race
-        # between a child process listening on a port actually dying
-        # and a new process being started
-        servers = [self.api_server,
-                   self.registry_server,
-                   self.scrubber_daemon]
-        for s in servers:
-            try:
-                s.stop()
-            except Exception:
-                pass
-
-        for f in self.files_to_destroy:
-            if os.path.exists(f):
-                os.unlink(f)
-
-    def start_server(self,
-                     server,
-                     expect_launch,
-                     expect_exit=True,
-                     expected_exitcode=0,
-                     **kwargs):
-        """
-        Starts a server on an unused port.
-
-        Any kwargs passed to this method will override the configuration
-        value in the conf file used in starting the server.
-
-        :param server: the server to launch
-        :param expect_launch: true iff the server is expected to
-                              successfully start
-        :param expect_exit: true iff the launched process is expected
-                            to exit in a timely fashion
-        :param expected_exitcode: expected exitcode from the launcher
-        """
-        self.cleanup()
-
-        # Start up the requested server
-        exitcode, out, err = server.start(expect_exit=expect_exit,
-                                          expected_exitcode=expected_exitcode,
-                                          **kwargs)
-        if expect_exit:
-            self.assertEqual(expected_exitcode, exitcode,
-                             "Failed to spin up the requested server. "
-                             "Got: %s" % err)
-
-        self.launched_servers.append(server)
-
-        launch_msg = self.wait_for_servers([server], expect_launch)
-        self.assertTrue(launch_msg is None, launch_msg)
-
-    def start_with_retry(self, server, port_name, max_retries,
-                         expect_launch=True,
-                         **kwargs):
-        """
-        Starts a server, with retries if the server launches but
-        fails to start listening on the expected port.
-
-        :param server: the server to launch
-        :param port_name: the name of the port attribute
-        :param max_retries: the maximum number of attempts
-        :param expect_launch: true iff the server is expected to
-                              successfully start
-        :param expect_exit: true iff the launched process is expected
-                            to exit in a timely fashion
-        """
-        launch_msg = None
-        for i in range(max_retries):
-            exitcode, out, err = server.start(expect_exit=not expect_launch,
-                                              **kwargs)
-            name = server.server_name
-            self.assertEqual(0, exitcode,
-                             "Failed to spin up the %s server. "
-                             "Got: %s" % (name, err))
-            launch_msg = self.wait_for_servers([server], expect_launch)
-            if launch_msg:
-                server.stop()
-                server.bind_port = get_unused_port()
-                setattr(self, port_name, server.bind_port)
-            else:
-                self.launched_servers.append(server)
-                break
-        self.assertTrue(launch_msg is None, launch_msg)
-
-    def start_servers(self, **kwargs):
-        """
-        Starts the API and Registry servers (glance-control api start
-        & glance-control registry start) on unused ports.  glance-control
-        should be installed into the python path
-
-        Any kwargs passed to this method will override the configuration
-        value in the conf file used in starting the servers.
-        """
-        self.cleanup()
-
-        # Start up the API and default registry server
-
-        # We start the registry server first, as the API server config
-        # depends on the registry port - this ordering allows for
-        # retrying the launch on a port clash
-        self.start_with_retry(self.registry_server, 'registry_port', 3,
-                              **kwargs)
-        kwargs['registry_port'] = self.registry_server.bind_port
-
-        self.start_with_retry(self.api_server, 'api_port', 3, **kwargs)
-
-        exitcode, out, err = self.scrubber_daemon.start(**kwargs)
-
-        self.assertEqual(0, exitcode,
-                         "Failed to spin up the Scrubber daemon. "
-                         "Got: %s" % err)
-
-    def ping_server(self, port):
-        """
-        Simple ping on the port. If responsive, return True, else
-        return False.
-
-        :note We use raw sockets, not ping here, since ping uses ICMP and
-        has no concept of ports...
-        """
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # Stop process-global CacheWorker so prefetch threads cannot outlive
+        # this test (native threads + parallel stestr workers).
         try:
-            s.connect(("127.0.0.1", port))
-            s.close()
-            return True
-        except socket.error:
-            return False
-
-    def wait_for_servers(self, servers, expect_launch=True, timeout=30):
-        """
-        Tight loop, waiting for the given server port(s) to be available.
-        Returns when all are pingable. There is a timeout on waiting
-        for the servers to come up.
-
-        :param servers: Glance server ports to ping
-        :param expect_launch: Optional, true iff the server(s) are
-                              expected to successfully start
-        :param timeout: Optional, defaults to 30 seconds
-        :returns: None if launch expectation is met, otherwise an
-                 assertion message
-        """
-        now = datetime.datetime.now()
-        timeout_time = now + datetime.timedelta(seconds=timeout)
-        replied = []
-        while (timeout_time > now):
-            pinged = 0
-            for server in servers:
-                if self.ping_server(server.bind_port):
-                    pinged += 1
-                    if server not in replied:
-                        replied.append(server)
-            if pinged == len(servers):
-                msg = 'Unexpected server launch status'
-                return None if expect_launch else msg
-            now = datetime.datetime.now()
-            time.sleep(0.05)
-
-        failed = list(set(servers) - set(replied))
-        msg = 'Unexpected server launch status for: '
-        for f in failed:
-            msg += ('%s, ' % f.server_name)
-            if os.path.exists(f.pid_file):
-                pid = f.process_pid
-                trace = f.pid_file.replace('.pid', '.trace')
-                if self.tracecmd:
-                    cmd = '%s -p %d -o %s' % (self.tracecmd, pid, trace)
-                    execute(cmd, raise_error=False, expect_exit=False)
-                    time.sleep(0.5)
-                    if os.path.exists(trace):
-                        msg += ('\n%s:\n%s\n' % (self.tracecmd,
-                                                 open(trace).read()))
-
-        self.add_log_details(failed)
-
-        return msg if expect_launch else None
-
-    def stop_server(self, server, name):
-        """
-        Called to stop a single server in a normal fashion using the
-        glance-control stop method to gracefully shut the server down.
-
-        :param server: the server to stop
-        """
-        # Spin down the requested server
-        server.stop()
-
-    def stop_servers(self):
-        """
-        Called to stop the started servers in a normal fashion. Note
-        that cleanup() will stop the servers using a fairly draconian
-        method of sending a SIGTERM signal to the servers. Here, we use
-        the glance-control stop method to gracefully shut the server down.
-        This method also asserts that the shutdown was clean, and so it
-        is meant to be called during a normal test case sequence.
-        """
-
-        # Spin down the API and default registry server
-        self.stop_server(self.api_server, 'API server')
-        self.stop_server(self.registry_server, 'Registry server')
-        self.stop_server(self.scrubber_daemon, 'Scrubber daemon')
-
-        self._reset_database(self.registry_server.sql_connection)
-
-    def run_sql_cmd(self, sql):
-        """
-        Provides a crude mechanism to run manual SQL commands for backend
-        DB verification within the functional tests.
-        The raw result set is returned.
-        """
-        engine = db_api.get_engine()
-        return engine.execute(sql)
+            from glance.api.v2 import cached_images
+        except Exception:
+            cached_images = None
+        if cached_images is not None:
+            worker = cached_images.WORKER
+            if worker is not None:
+                try:
+                    worker.terminate()
+                except Exception:
+                    pass
+                cached_images.WORKER = None
+        # NOTE(pdeore): load_paste_app() does not run wsgi_app.init_app(), so
+        # tasks_pool is never drained via atexit. Shut down and drop the cached
+        # pool after each test so import task threads from the previous test
+        # cannot block the next one (see 992633 / concurrent.futures).
+        try:
+            pool_model = api_common._CACHED_THREAD_POOL.pop('tasks_pool', None)
+            if pool_model is not None:
+                pool = pool_model.pool
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    pool.shutdown(wait=False)
+        except Exception:
+            pass
+        super(SynchronousAPIBase, self).tearDown()
 
     def copy_data_file(self, file_name, dst_dir):
         src_file_name = os.path.join('glance/tests/etc', file_name)
@@ -909,8 +486,574 @@ class FunctionalTest(test_utils.BaseTestCase):
         dst_file_name = os.path.join(dst_dir, file_name)
         return dst_file_name
 
-    def add_log_details(self, servers=None):
-        logs = [s.log_file for s in (servers or self.launched_servers)]
-        for log in logs:
-            if os.path.exists(log):
-                testtools.content.attach_file(self, log)
+    def _mock_localhost_dns(self):
+        """Force localhost to resolve to 127.0.0.1 only.
+
+        Test HTTP servers bind to 127.0.0.1. On hosts where getaddrinfo
+        returns ::1 first, DNS-pinned connections fail with ECONNREFUSED.
+        """
+        real_getaddrinfo = socket.getaddrinfo
+
+        def _ipv4_only(host, port, *args, **kwargs):
+            results = real_getaddrinfo(host, port, *args, **kwargs)
+            if host in ('localhost', 'localhost.'):
+                results = [r for r in results if r[0] == socket.AF_INET]
+            return results
+
+        patcher = mock.patch('socket.getaddrinfo', side_effect=_ipv4_only)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def start_server(self, enable_cache=True, set_worker_url=True,
+                     use_fake_auth=False, run_staging_cleaner=False,
+                     enable_cors=False, enable_version_negotiation=False):
+        """Builds and "starts" the API server.
+
+        Note that this doesn't actually start a separate server process,
+        but instead builds the WSGI application directly. The terminology
+        is used here to maintain consistency with other test patterns.
+        """
+        config.set_config_defaults()
+        root_app = 'glance-api'
+        if enable_version_negotiation:
+            root_app = 'glance-api-versionnegotiation'
+            self.config(image_cache_dir=self._store_dir('cache'))
+        elif enable_cache:
+            root_app = 'glance-api-cachemanagement'
+            self.config(image_cache_dir=self._store_dir('cache'))
+
+        if enable_cors:
+            root_app = 'glance-api-cors'
+
+        if use_fake_auth:
+            root_app = 'glance-api-fake'
+
+        if set_worker_url:
+            self.config(worker_self_reference_url='http://workerx')
+
+        if run_staging_cleaner:
+            cleaner = housekeeping.StagingStoreCleaner(db_api)
+            # NOTE(danms): Start thread as a daemon. It is still a
+            # single-shot, but this will not block our shutdown if it is
+            # running.
+            cleanup_thread = threading.Thread(
+                target=cleaner.clean_orphaned_staging_residue,
+                daemon=True)
+            cleanup_thread.start()
+
+        self.api = config.load_paste_app(root_app,
+                                         conf_file=self.paste_config)
+        self.config(enforce_new_defaults=True,
+                    group='oslo_policy')
+        # Serialize taskflow execution to reduce sqlite lock contention
+        # during functional tests. Production uWSGI uses parallel mode.
+        self.config(engine_mode='serial', group='taskflow_executor')
+
+    def start_scrubber(self, daemon=False, wakeup_time=300,
+                       restore=None, raise_error=True):
+        self.setup_scrubber_conf(daemon=daemon, wakeup_time=wakeup_time)
+        exe_cmd = f"{sys.executable} -m glance.cmd.scrubber"
+
+        # Modify command based on restore and daemon flags
+        if restore:
+            exe_cmd += f" --restore {restore}"
+        if daemon:
+            exe_cmd += " --daemon"
+
+        # Prepare the final command string with the config directory
+        cmd = f"{exe_cmd} --config-dir {self.test_dir}"
+
+        # Determine if we need to return the process object
+        expect_exit = not daemon
+        return_process = daemon
+
+        # Execute the command and return the result
+        return execute(cmd, raise_error=raise_error, expect_exit=expect_exit,
+                       return_process=return_process)
+
+    def _headers(self, custom_headers=None):
+        base_headers = {
+            'X-Identity-Status': 'Confirmed',
+            'X-Auth-Token': '932c5c84-02ac-4fe5-a9ba-620af0e2bb96',
+            'X-User-Id': 'f9a41d13-0c13-47e9-bee2-ce4e8bfe958e',
+            'X-Tenant-Id': self.TENANT,
+            'Content-Type': 'application/json',
+            'X-Roles': 'admin',
+        }
+        base_headers.update(custom_headers or {})
+        return base_headers
+
+    def api_request(self, method, url, headers=None, data=None,
+                    json=None, body_file=None):
+        """Perform a request against the API.
+
+        NOTE: Most code should use api_get(), api_post(), api_put(),
+              or api_delete() instead!
+
+        :param method: The HTTP method to use (i.e. GET, POST, etc)
+        :param url: The *path* part of the URL to call (i.e. /v2/images)
+        :param headers: Optional updates to the default set of headers
+        :param data: Optional bytes data payload to send (overrides @json)
+        :param json: Optional dict structure to be jsonified and sent as
+                     the payload (mutually exclusive with @data)
+        :param body_file: Optional io.IOBase to provide as the input data
+                          stream for the request (overrides @data)
+        :returns: A webob.Response object
+        """
+        if not self.bypass_headers:
+            headers = self._headers(headers)
+        else:
+            # Ensure headers is at least an empty dict, not None
+            if headers is None:
+                headers = {}
+        # Set a base URL for the request so application_url is available
+        # Use host_url to ensure application_url is properly set
+        req = webob.Request.blank(url, method=method,
+                                  headers=headers)
+        if not req.application_url:
+            req.environ['wsgi.url_scheme'] = 'http'
+            req.environ['HTTP_HOST'] = 'localhost'
+            req.environ['SERVER_NAME'] = 'localhost'
+            req.environ['SERVER_PORT'] = '80'
+        if json and not data:
+            data = jsonutils.dumps(json).encode()
+        if data and not body_file:
+            req.body = data
+        elif body_file:
+            req.body_file = body_file
+        return self._call_api(req)
+
+    def api_get(self, url, headers=None, data=None, json=None):
+        """Perform a GET request against the API.
+
+        :param url: The *path* part of the URL to call (i.e. /v2/images)
+        :param headers: Optional updates to the default set of headers
+        :param data: Optional bytes data payload to send (overrides @json)
+        :param json: Optional dict structure to be jsonified and sent as
+                     the payload (mutually exclusive with @data)
+        :returns: A webob.Response object
+        """
+        return self.api_request('GET', url, headers=headers,
+                                data=data, json=json)
+
+    def api_post(self, url, headers=None, data=None, json=None,
+                 body_file=None):
+        """Perform a POST request against the API.
+
+        :param url: The *path* part of the URL to call (i.e. /v2/images)
+        :param headers: Optional updates to the default set of headers
+        :param data: Optional bytes data payload to send (overrides @json)
+        :param json: Optional dict structure to be jsonified and sent as
+                     the payload (mutually exclusive with @data)
+        :param body_file: Optional io.IOBase to provide as the input data
+                          stream for the request (overrides @data)
+        :returns: A webob.Response object
+        """
+        return self.api_request('POST', url, headers=headers,
+                                data=data, json=json,
+                                body_file=body_file)
+
+    def api_put(self, url, headers=None, data=None, json=None, body_file=None):
+        """Perform a PUT request against the API.
+
+        :param url: The *path* part of the URL to call (i.e. /v2/images)
+        :param headers: Optional updates to the default set of headers
+        :param data: Optional bytes data payload to send (overrides @json,
+                     mutually exclusive with body_file)
+        :param json: Optional dict structure to be jsonified and sent as
+                     the payload (mutually exclusive with @data)
+        :param body_file: Optional io.IOBase to provide as the input data
+                          stream for the request (overrides @data)
+        :returns: A webob.Response object
+        """
+        return self.api_request('PUT', url, headers=headers,
+                                data=data, json=json,
+                                body_file=body_file)
+
+    def api_delete(self, url, headers=None, data=None, json=None):
+        """Perform a DELETE request against the API.
+
+        :param url: The *path* part of the URL to call (i.e. /v2/images)
+        :param headers: Optional updates to the default set of headers
+        :param data: Optional bytes data payload to send (overrides @json)
+        :param json: Optional dict structure to be jsonified and sent as
+                     the payload (mutually exclusive with @data)
+        :returns: A webob.Response object
+        """
+        return self.api_request('DELETE', url, headers=headers,
+                                data=data, json=json)
+
+    def _call_api(self, req):
+        """Call the WSGI application and handle Controller responses.
+
+        This wraps the WSGI application call and handles cases where the
+        version negotiation middleware returns a Controller object instead
+        of a Response.
+
+        :param req: A webob.Request object
+        :returns: A webob.Response object
+        """
+        response = self.api(req)
+        # The version negotiation filter may return a Controller for
+        # unknown versions, which needs to be called to get the Response
+        if hasattr(response, '__call__') and not hasattr(
+                response, 'status_code'):
+            response = response(req)
+        return response
+
+    def api_patch(self, url, patches, headers=None):
+        """Perform a PATCH request against the API.
+
+        :param url: The *path* part of the URL to call (i.e. /v2/images)
+        :param patches: One or more patch dicts
+        :param headers: Optional updates to the default set of headers
+        :returns: A webob.Response object
+        """
+        json = patches if isinstance(patches, list) else list(patches)
+
+        if not headers:
+            headers = {}
+        headers['Content-Type'] = \
+            'application/openstack-images-v2.1-json-patch'
+        return self.api_request('PATCH', url, headers=headers,
+                                json=json)
+
+    def _import_copy(self, image_id, stores, headers=None):
+        """Do an import of image_id to the given stores."""
+        body = {'method': {'name': 'copy-image'},
+                'stores': stores,
+                'all_stores': False}
+
+        return self.api_post(
+            '/v2/images/%s/import' % image_id,
+            headers=headers,
+            json=body)
+
+    def _import_direct(self, image_id, stores, headers=None):
+        """Do an import of image_id to the given stores."""
+        body = {'method': {'name': 'glance-direct'},
+                'stores': stores,
+                'all_stores': False}
+
+        return self.api_post(
+            '/v2/images/%s/import' % image_id,
+            headers=headers,
+            json=body)
+
+    def _import_web_download(self, image_id, stores, url, headers=None):
+        """Do an import of image_id to the given stores."""
+        body = {'method': {'name': 'web-download',
+                           'uri': url},
+                'stores': stores,
+                'all_stores': False}
+
+        return self.api_post(
+            '/v2/images/%s/import' % image_id,
+            headers=headers,
+            json=body)
+
+    def _create_and_upload(self, data_iter=None, expected_code=204,
+                           visibility=None):
+        data = {
+            'name': 'foo',
+            'container_format': 'bare',
+            'disk_format': 'raw'
+        }
+        if visibility:
+            data['visibility'] = visibility
+
+        resp = self.api_post('/v2/images',
+                             json=data)
+        self.assertEqual(201, resp.status_code, resp.text)
+        image = jsonutils.loads(resp.text)
+
+        if data_iter:
+            resp = self.api_put(
+                '/v2/images/%s/file' % image['id'],
+                headers={'Content-Type': 'application/octet-stream'},
+                body_file=data_iter)
+        else:
+            resp = self.api_put(
+                '/v2/images/%s/file' % image['id'],
+                headers={'Content-Type': 'application/octet-stream'},
+                data=b'IMAGEDATA')
+        self.assertEqual(expected_code, resp.status_code)
+
+        return image['id']
+
+    def _create_and_stage(self, data_iter=None, expected_code=204,
+                          visibility=None, extra={}):
+        data = {
+            'name': 'foo',
+            'container_format': 'bare',
+            'disk_format': 'raw',
+        }
+        if visibility:
+            data['visibility'] = visibility
+
+        data.update(extra)
+        resp = self.api_post('/v2/images',
+                             json=data)
+        image = jsonutils.loads(resp.text)
+
+        if data_iter:
+            resp = self.api_put(
+                '/v2/images/%s/stage' % image['id'],
+                headers={'Content-Type': 'application/octet-stream'},
+                body_file=data_iter)
+        else:
+            resp = self.api_put(
+                '/v2/images/%s/stage' % image['id'],
+                headers={'Content-Type': 'application/octet-stream'},
+                data=b'IMAGEDATA')
+        self.assertEqual(expected_code, resp.status_code)
+
+        return image['id']
+
+    def _wait_for_import(self, image_id, retries=10):
+        for i in range(0, retries):
+            image = self.api_get('/v2/images/%s' % image_id).json
+            if not image.get('os_glance_import_task'):
+                break
+            self.addDetail('Create-Import task id',
+                           ttc.text_content(image['os_glance_import_task']))
+            time.sleep(1)
+
+        self.assertIsNone(image.get('os_glance_import_task'),
+                          'Timed out waiting for task to complete')
+
+        # Wait until task is finished before delete and similar ops.
+        self._wait_for_latest_task_termination(image_id)
+
+        return image
+
+    def _wait_for_latest_task_termination(self, image_id, max_sec=5,
+                                          delay_sec=0.1):
+        """Wait until latest task reaches success or failure."""
+        done_time = time.time() + max_sec
+        while time.time() <= done_time:
+            try:
+                task = self._get_latest_task(image_id)
+            except AssertionError:
+                time.sleep(delay_sec)
+                continue
+            if task['status'] in ('success', 'failure'):
+                return task
+            time.sleep(delay_sec)
+
+        task = self._get_latest_task(image_id)
+        self.assertIn(task['status'], ('success', 'failure'),
+                      'Timed out waiting for task to finish on image %s'
+                      % image_id)
+        return task
+
+    def _create_and_import(self, stores=[], data_iter=None, expected_code=202,
+                           visibility=None, extra={}):
+        """Create an image, stage data, and import into the given stores.
+
+        :returns: image_id
+        """
+        image_id = self._create_and_stage(data_iter=data_iter,
+                                          visibility=visibility,
+                                          extra=extra)
+
+        resp = self._import_direct(image_id, stores)
+        self.assertEqual(expected_code, resp.status_code)
+
+        if expected_code >= 400:
+            return image_id
+
+        # Make sure it becomes active
+        image = self._wait_for_import(image_id)
+        self.assertEqual('active', image['status'])
+
+        return image_id
+
+    def _task_api_get(self, url):
+        """GET a tasks API path (requires tasks_api_access/admin role)."""
+        return self.api_get(url, headers={'X-Roles': 'admin'})
+
+    def _get_latest_task(self, image_id):
+        tasks = self.api_get('/v2/images/%s/tasks' % image_id).json['tasks']
+        tasks = sorted(tasks, key=lambda t: t['updated_at'])
+        self.assertGreater(len(tasks), 0)
+        return tasks[-1]
+
+    def _admin_headers(self):
+        """Return admin headers, bypassing subclass role overrides."""
+        return SynchronousAPIBase._headers(self)
+
+    def _find_image_task(self, image_id, task_id):
+        tasks = self.api_get('/v2/images/%s/tasks' % image_id).json['tasks']
+        for task in tasks:
+            if task['id'] == task_id:
+                return task
+        return None
+
+    def _get_task_by_id(self, task_id):
+        """Get task by ID using admin credentials for reliable status."""
+        resp = self.api_get('/v2/tasks/%s' % task_id,
+                            headers=self._admin_headers())
+        if resp.status_code == 200:
+            return resp.json
+        return None
+
+    def _get_import_task(self, image_id, task_id=None, exclude_task_ids=None,
+                         max_sec=2, delay_sec=0.1):
+        """Get import task for image. Retry if task is not ready yet."""
+        if task_id is not None:
+            return self._task_api_get('/v2/tasks/%s' % task_id).json
+
+        exclude_task_ids = set(exclude_task_ids or [])
+        done_time = time.time() + max_sec
+        while time.time() <= done_time:
+            image = self.api_get('/v2/images/%s' % image_id).json
+            lock_task_id = image.get('os_glance_import_task')
+            if lock_task_id and lock_task_id not in exclude_task_ids:
+                return self._task_api_get('/v2/tasks/%s' % lock_task_id).json
+
+            tasks = self.api_get('/v2/images/%s/tasks' % image_id).json['tasks']
+            active_tasks = sorted(
+                [t for t in tasks
+                 if t['status'] in ('pending', 'processing')
+                 and t['id'] not in exclude_task_ids],
+                key=lambda t: t['updated_at'])
+            if active_tasks:
+                return self._task_api_get(
+                    '/v2/tasks/%s' % active_tasks[-1]['id']).json
+
+            # Import may fail before we observe an active task; use the
+            # latest task once the import lock has been released.
+            recent_tasks = sorted(
+                [t for t in tasks if t['id'] not in exclude_task_ids],
+                key=lambda t: t['updated_at'])
+            if recent_tasks:
+                return self._task_api_get(
+                    '/v2/tasks/%s' % recent_tasks[-1]['id']).json
+
+            time.sleep(delay_sec)
+
+        self.fail('Timed out waiting for import task on image %s' % image_id)
+
+    def _wait_for_task_status(self, task_id, expected_status, max_sec=2,
+                              delay_sec=0.1):
+        """Wait until task has expected status."""
+        done_time = time.time() + max_sec
+        task = None
+        while time.time() <= done_time:
+            task = self._get_task_by_id(task_id)
+            if task is None:
+                task = self._task_api_get('/v2/tasks/%s' % task_id).json
+            if task['status'] == expected_status:
+                return task
+            time.sleep(delay_sec)
+
+        last_status = task['status'] if task else 'unknown'
+        self.fail('Timed out waiting for task %s status %s (last status=%s)'
+                  % (task_id, expected_status, last_status))
+
+    def _wait_for_task_status_in(self, task_id, expected_statuses,
+                                 max_sec=2, delay_sec=0.1):
+        """Wait until task has one of the expected statuses."""
+        if isinstance(expected_statuses, str):
+            expected_statuses = (expected_statuses,)
+        done_time = time.time() + max_sec
+        task = None
+        while time.time() <= done_time:
+            task = self._get_task_by_id(task_id)
+            if task is None:
+                task = self.api_get('/v2/tasks/%s' % task_id).json
+            if task['status'] in expected_statuses:
+                return task
+            time.sleep(delay_sec)
+
+        last_status = task['status'] if task else 'unknown'
+        self.fail('Timed out waiting for task %s status in %s '
+                  '(last status=%s)'
+                  % (task_id, expected_statuses, last_status))
+
+    def _wait_for_task_failure(self, image_id, max_sec=40, delay_sec=0.2,
+                               start_delay_sec=0.1):
+        """Wait for import task to fail.
+
+        :param image_id: The image ID to check
+        :param max_sec: Maximum seconds to wait (default: 40)
+        :param delay_sec: Seconds to sleep between checks (default: 0.2)
+        :param start_delay_sec: Seconds to wait before first check (default: 0.1)
+        :returns: The task dict from the API response
+        """
+        if start_delay_sec:
+            time.sleep(start_delay_sec)
+
+        task = self._get_import_task(image_id, max_sec=10, delay_sec=delay_sec)
+        task_id = task['id']
+
+        done_time = time.time() + max_sec
+        last_status = task['status']
+        while time.time() <= done_time:
+            # Prefer /v2/tasks/{id} with admin credentials: the image tasks
+            # list can lag behind terminal status under CI load.
+            task = self._get_task_by_id(task_id)
+            if task is None:
+                task = self._find_image_task(image_id, task_id)
+            if task is not None:
+                last_status = task['status']
+                if task['status'] == 'failure':
+                    return task
+                if task['status'] == 'success':
+                    self.fail("Import unexpectedly succeeded "
+                              "(task status=success)")
+            time.sleep(delay_sec)
+
+        try:
+            last_status = self._task_api_get(
+                '/v2/tasks/%s' % task_id).json['status']
+        except AssertionError:
+            pass
+        self.fail('Timed out waiting for import failure on image %s '
+                  '(last status=%s)' % (image_id, last_status))
+
+    def _wait_for_import_lock_clear(self, image_id, max_sec=5,
+                                    delay_sec=0.1):
+        """Wait until os_glance_import_task is cleared from the image."""
+        done_time = time.time() + max_sec
+        image = None
+        while time.time() <= done_time:
+            image = self.api_get('/v2/images/%s' % image_id).json
+            if not image.get('os_glance_import_task'):
+                return image
+            time.sleep(delay_sec)
+
+        self.assertEqual('', image.get('os_glance_import_task', ''),
+                         'Timed out waiting for import lock to clear on '
+                         'image %s' % image_id)
+        return image
+
+    def _wait_for_image_status(self, image_id, expected_status, max_sec=10,
+                               delay_sec=0.1):
+        """Wait until image has expected status."""
+        done_time = time.time() + max_sec
+        image = None
+        while time.time() <= done_time:
+            image = self.api_get('/v2/images/%s' % image_id).json
+            if image['status'] == expected_status:
+                return image
+            time.sleep(delay_sec)
+
+        last_status = image['status'] if image else 'unknown'
+        self.fail('Timed out waiting for image %s status %s (last status=%s)'
+                  % (image_id, expected_status, last_status))
+
+    def _create(self):
+        return self.api_post('/v2/images',
+                             json={'name': 'foo',
+                                   'container_format': 'bare',
+                                   'disk_format': 'raw'})
+
+    def _create_metadef_resource(self, path=None, data=None,
+                                 expected_code=201):
+        resp = self.api_post(path,
+                             json=data)
+        md_resource = jsonutils.loads(resp.text)
+        self.assertEqual(expected_code, resp.status_code)
+        return md_resource

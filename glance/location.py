@@ -13,22 +13,24 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import collections
+from collections import abc
 import copy
+import functools
 
 from cryptography import exceptions as crypto_exception
-import debtcollector
+from cursive import exception as cursive_exception
+from cursive import signature_utils
 import glance_store as store
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import encodeutils
 from oslo_utils import excutils
+from oslo_utils.imageutils import format_inspector
 
 from glance.common import exception
-from glance.common import signature_utils
+from glance.common import store_utils
 from glance.common import utils
 import glance.domain.proxy
-from glance.i18n import _, _LE, _LI
+from glance.i18n import _, _LE, _LI, _LW
 
 
 CONF = cfg.CONF
@@ -40,6 +42,7 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
     def __init__(self, image_repo, context, store_api, store_utils):
         self.context = context
         self.store_api = store_api
+        self.image_repo = image_repo
         proxy_kwargs = {'context': context, 'store_api': store_api,
                         'store_utils': store_utils}
         super(ImageRepoProxy, self).__init__(image_repo,
@@ -49,7 +52,7 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
         self.db_api = glance.db.get_api()
 
     def _set_acls(self, image):
-        public = image.visibility == 'public'
+        public = image.visibility in ['public', 'community']
         member_ids = []
         if image.locations and not public:
             member_repo = _get_member_repo_for_store(image,
@@ -58,9 +61,27 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
                                                      self.store_api)
             member_ids = [m.member_id for m in member_repo.list()]
         for location in image.locations:
-            self.store_api.set_acls(location['url'], public=public,
-                                    read_tenants=member_ids,
-                                    context=self.context)
+            if CONF.enabled_backends:
+                # NOTE(whoami-rajat): Do not set_acls if store is not defined
+                # on this node. This is possible in case of edge deployment
+                # that image location is present but the actual store is
+                # not related to this node.
+                image_store = location['metadata'].get('store')
+                if image_store not in CONF.enabled_backends:
+                    msg = (_("Store %s is not available on "
+                             "this node, skipping `_set_acls` "
+                             "call.") % image_store)
+                    LOG.debug(msg)
+                    continue
+                self.store_api.set_acls_for_multi_store(
+                    location['url'], image_store,
+                    public=public, read_tenants=member_ids,
+                    context=self.context
+                )
+            else:
+                self.store_api.set_acls(location['url'], public=public,
+                                        read_tenants=member_ids,
+                                        context=self.context)
 
     def add(self, image):
         result = super(ImageRepoProxy, self).add(image)
@@ -72,29 +93,70 @@ class ImageRepoProxy(glance.domain.proxy.Repo):
         self._set_acls(image)
         return result
 
+    def get(self, image_id):
+        image = super(ImageRepoProxy, self).get(image_id)
+        if CONF.enabled_backends:
+            try:
+                store_utils.update_store_in_locations(
+                    self.context, image, self.image_repo)
+            except exception.Forbidden:
+                # NOTE(danms): We may not be able to complete a store
+                # update if we do not own the image. That should not
+                # break us, so avoid raising Forbidden in that
+                # case. Note that modifications to @image here will
+                # still be returned to the user, just not saved in the
+                # DB. That is probably what we want anyway.
+                pass
+        else:
+            _update_s3_locations_for_single_store(image, self.image_repo)
+        return image
+
+
+def _update_s3_locations_for_single_store(image, image_repo):
+    store_updated = False
+    for loc in image.locations:
+        if loc['url'].startswith(('s3://', 's3+http://', 's3+https://')):
+            if store_utils._update_s3_location_credentials(loc):
+                store_updated = True
+    if store_updated:
+        image_repo.save(image)
+
 
 def _get_member_repo_for_store(image, context, db_api, store_api):
-        image_member_repo = glance.db.ImageMemberRepo(
-            context, db_api, image)
-        store_image_repo = glance.location.ImageMemberRepoProxy(
-            image_member_repo, image, context, store_api)
+    image_member_repo = glance.db.ImageMemberRepo(context, db_api, image)
+    store_image_repo = glance.location.ImageMemberRepoProxy(
+        image_member_repo, image, context, store_api)
 
-        return store_image_repo
+    return store_image_repo
 
 
-def _check_location_uri(context, store_api, store_utils, uri):
+def _check_location_uri(context, store_api, store_utils, uri,
+                        backend=None):
     """Check if an image location is valid.
 
     :param context: Glance request context
     :param store_api: store API module
     :param store_utils: store utils module
     :param uri: location's uri string
+    :param backend: A backend name for the store
     """
+
+    # NOTE(abhishekk): Validate before contacting the backend so restricted
+    # HTTP(S) URIs never trigger an outbound request (SSRF).
+    if not store_utils.validate_external_location(uri):
+        reason = _('Invalid location')
+        raise exception.BadStoreUri(message=reason)
 
     try:
         # NOTE(zhiyan): Some stores return zero when it catch exception
-        is_ok = (store_utils.validate_external_location(uri) and
-                 store_api.get_size_from_backend(uri, context=context) > 0)
+        if CONF.enabled_backends:
+            size_from_backend = store_api.get_size_from_uri_and_backend(
+                uri, backend, context=context)
+        else:
+            size_from_backend = store_api.get_size_from_backend(
+                uri, context=context)
+
+        is_ok = size_from_backend > 0
     except (store.UnknownScheme, store.NotFound, store.BadStoreUri):
         is_ok = False
     if not is_ok:
@@ -103,15 +165,25 @@ def _check_location_uri(context, store_api, store_utils, uri):
 
 
 def _check_image_location(context, store_api, store_utils, location):
-    _check_location_uri(context, store_api, store_utils, location['url'])
+    backend = None
+    if CONF.enabled_backends:
+        backend = location['metadata'].get('store')
+
+    _check_location_uri(context, store_api, store_utils, location['url'],
+                        backend=backend)
     store_api.check_location_metadata(location['metadata'])
 
 
 def _set_image_size(context, image, locations):
     if not image.size:
         for location in locations:
-            size_from_backend = store.get_size_from_backend(
-                location['url'], context=context)
+            if CONF.enabled_backends:
+                size_from_backend = store.get_size_from_uri_and_backend(
+                    location['url'], location['metadata'].get('store'),
+                    context=context)
+            else:
+                size_from_backend = store.get_size_from_backend(
+                    location['url'], context=context)
 
             if size_from_backend:
                 # NOTE(flwang): This assumes all locations have the same size
@@ -159,13 +231,14 @@ class ImageFactoryProxy(glance.domain.proxy.ImageFactory):
         return super(ImageFactoryProxy, self).new_image(**kwargs)
 
 
-class StoreLocations(collections.MutableSequence):
+@functools.total_ordering
+class StoreLocations(abc.MutableSequence):
     """
     The proxy for store location property. It takes responsibility for::
 
-    1. Location uri correctness checking when adding a new location.
-    2. Remove the image data from the store when a location is removed
-       from an image.
+        1. Location uri correctness checking when adding a new location.
+        2. Remove the image data from the store when a location is removed
+           from an image.
 
     """
     def __init__(self, image_proxy, value):
@@ -211,6 +284,17 @@ class StoreLocations(collections.MutableSequence):
                 self.image_proxy.context,
                 self.image_proxy.image.image_id,
                 location)
+        except store.exceptions.NotFound:
+            # NOTE(rosmaita): This can happen if the data was deleted by an
+            # operator from the backend, or a race condition from multiple
+            # delete-from-store requests. The old way to deal with this was
+            # that the user could just delete the image when the data is gone,
+            # but with multi-store, that is no longer a good option. So we
+            # intentionally leave the location popped (in other words, the
+            # pop() succeeds) but we also reraise the NotFound so that the
+            # calling code knows what happened.
+            with excutils.save_and_reraise_exception():
+                pass
         except Exception:
             with excutils.save_and_reraise_exception():
                 self.value.insert(i, location)
@@ -254,7 +338,7 @@ class StoreLocations(collections.MutableSequence):
                 raise NotImplementedError("slice with step")
             self.__delslice__(i.start, i.stop)
             return
-        location = None
+
         try:
             location = self.value[i]
         except Exception:
@@ -269,7 +353,7 @@ class StoreLocations(collections.MutableSequence):
     def __delslice__(self, i, j):
         i = 0 if i is None else max(i, 0)
         j = len(self) if j is None else max(j, 0)
-        locations = []
+
         try:
             locations = self.value[i:j]
         except Exception:
@@ -298,11 +382,11 @@ class StoreLocations(collections.MutableSequence):
         else:
             return other
 
-    def __cmp__(self, other):
-        return cmp(self.value, self.__cast(other))
-
     def __eq__(self, other):
         return self.value == self.__cast(other)
+
+    def __lt__(self, other):
+        return self.value < self.__cast(other)
 
     def __iter__(self):
         return iter(self.value)
@@ -403,61 +487,217 @@ class ImageProxy(glance.domain.proxy.Image):
                     self.image.image_id,
                     location)
 
-    def set_data(self, data, size=None):
+    def _upload_to_store(self, data, verifier, store=None, size=None):
+        """
+        Upload data to store
+
+        :param data: data to upload to store
+        :param verifier: for signature verification
+        :param store: store to upload data to
+        :param size: data size
+        :return:
+        """
+        hashing_algo = self.image.os_hash_algo or CONF['hashing_algorithm']
+        if CONF.enabled_backends:
+            (location, size, checksum,
+             multihash, loc_meta) = self.store_api.add_with_multihash(
+                CONF,
+                self.image.image_id,
+                utils.wrap_data_for_store_upload(data),
+                size,
+                store,
+                hashing_algo,
+                context=self.context,
+                verifier=verifier)
+        else:
+            (location,
+             size,
+             checksum,
+             multihash,
+             loc_meta) = self.store_api.add_to_backend_with_multihash(
+                CONF,
+                self.image.image_id,
+                utils.wrap_data_for_store_upload(data),
+                size,
+                hashing_algo,
+                context=self.context,
+                verifier=verifier)
+        self._verify_signature(verifier, location, loc_meta)
+        for attr, data in {"size": size, "os_hash_value": multihash,
+                           "checksum": checksum}.items():
+            self._verify_uploaded_data(data, attr)
+        self.image.locations.append({'url': location, 'metadata': loc_meta,
+                                     'status': 'active'})
+        self.image.checksum = checksum
+        self.image.os_hash_value = multihash
+        self.image.size = size
+        self.image.os_hash_algo = hashing_algo
+
+    def _verify_signature(self, verifier, location, loc_meta):
+        """
+        Verify signature of uploaded data.
+
+        :param verifier: for signature verification
+        """
+        # NOTE(bpoulos): if verification fails, exception will be raised
+        if verifier is not None:
+            try:
+                verifier.verify()
+                msg = _LI("Successfully verified signature for image %s")
+                LOG.info(msg, self.image.image_id)
+            except crypto_exception.InvalidSignature:
+                if CONF.enabled_backends:
+                    self.store_api.delete(location,
+                                          loc_meta.get('store'),
+                                          context=self.context)
+                else:
+                    self.store_api.delete_from_backend(location,
+                                                       context=self.context)
+                raise cursive_exception.SignatureVerificationError(
+                    _('Signature verification failed')
+                )
+
+    def _verify_uploaded_data(self, value, attribute_name):
+        """
+        Verify value of attribute_name uploaded data
+
+        :param value: value to compare
+        :param attribute_name: attribute name of the image to compare with
+        """
+        image_value = getattr(self.image, attribute_name)
+        if image_value is not None and value != image_value:
+            msg = _("%s of uploaded data is different from current "
+                    "value set on the image.")
+            LOG.error(msg, attribute_name)
+            raise exception.UploadException(msg % attribute_name)
+
+    def set_data(self, data, size=None, backend=None, set_active=True):
         if size is None:
             size = 0  # NOTE(markwash): zero -> unknown size
 
         # Create the verifier for signature verification (if correct properties
         # are present)
-        if (signature_utils.should_create_verifier(
-                self.image.extra_properties)):
+        extra_props = self.image.extra_properties
+        verifier = None
+        if signature_utils.should_create_verifier(extra_props):
             # NOTE(bpoulos): if creating verifier fails, exception will be
             # raised
+            img_signature = extra_props[signature_utils.SIGNATURE]
+            hash_method = extra_props[signature_utils.HASH_METHOD]
+            key_type = extra_props[signature_utils.KEY_TYPE]
+            cert_uuid = extra_props[signature_utils.CERT_UUID]
             verifier = signature_utils.get_verifier(
-                self.context, self.image.extra_properties)
+                context=self.context,
+                img_signature_certificate_uuid=cert_uuid,
+                img_signature_hash_method=hash_method,
+                img_signature=img_signature,
+                img_signature_key_type=key_type
+            )
+
+        if self.image.container_format == 'bare':
+            # FIXME(danms): We do not pass an expected_format here because
+            # we do not (currently) want to interrupt the data pipeline if
+            # the format does not match.
+            LOG.debug('Enabling in-flight format inspection for %s',
+                      self.image.disk_format)
+            data = format_inspector.InspectWrapper(data)
         else:
-            verifier = None
+            # FIXME(danms): Either warn here if we are unable to inspect non-
+            # bare images or maybe make this a hard fail
+            pass
 
-        location, size, checksum, loc_meta = self.store_api.add_to_backend(
-            CONF,
-            self.image.image_id,
-            utils.LimitingReader(utils.CooperativeReader(data),
-                                 CONF.image_size_cap),
-            size,
-            context=self.context,
-            verifier=verifier)
-
-        self._verify_signature_if_needed(checksum)
-
-        # NOTE(bpoulos): if verification fails, exception will be raised
-        if verifier:
+        try:
+            self._upload_to_store(data, verifier, backend, size)
+        except format_inspector.ImageFormatError as e:
+            raise exception.InvalidImageData(str(e))
+        finally:
             try:
-                verifier.verify()
-                LOG.info(_LI("Successfully verified signature for image %s"),
-                         self.image.image_id)
-            except crypto_exception.InvalidSignature:
-                raise exception.SignatureVerificationError(
-                    _('Signature verification failed')
-                )
+                data.close()
+            except AttributeError:
+                # We did not get a closeable or file-like object as data and/or
+                # did not wrap it because of container_format
+                pass
 
-        self.image.locations = [{'url': location, 'metadata': loc_meta,
-                                 'status': 'active'}]
-        self.image.size = size
-        self.image.checksum = checksum
-        self.image.status = 'active'
+        virtual_size = 0
+        try:
+            matches = data.formats
+            matched_formats = {str(i): i for i in matches}
+            if matched_formats.keys() == {'iso', 'gpt'}:
+                # If iso+gpt, we choose the iso because bootable-as-block ISOs
+                # can legitimately have a GPT bootloader in front.
+                LOG.debug('Detected format as ISO+GPT, allowing as ISO')
+                inspector = matched_formats['iso']
+            else:
+                # If multiple formats matched, but not exactly iso+gpt,
+                # this will raise to disallow those combinations.
+                inspector = data.format
+            format = str(inspector)
+            if format == self.image.disk_format:
+                virtual_size = inspector.virtual_size
+                LOG.info('Image format matched and virtual size computed: %i',
+                         virtual_size)
+            elif (format == 'raw' and
+                  self.image.disk_format not in format_inspector.ALL_FORMATS):
+                # Things like AMI are not inspectable, so as long as we did not
+                # recognize the format of the payload, allow it through.
+                LOG.info('Image format %s is not an inspectable type',
+                         self.image.disk_format)
+            elif self.image.disk_format == 'raw':
+                # This is something we can't inspect, so we allow it
+                LOG.warning('Image claims %r disk_format but is actually %r',
+                            data.format, format)
+                # If we are pretending this is really raw, don't use the
+                # detected rich format's virtual_size, but just use the
+                # actual size in bytes, as if we did not recognize the format.
+                virtual_size = inspector.actual_size
+            else:
+                raise format_inspector.ImageFormatError(
+                    _('Image disk_format %s does not match stream data %s' % (
+                        self.image.disk_format, format)))
+            inspector.safety_check()
+        except AttributeError:
+            # We must not have wrapped this for inspection because of
+            # container_format
+            pass
+        except format_inspector.ImageFormatError as e:
+            # No format matched!
+            if CONF.image_format.require_image_format_match:
+                raise exception.InvalidImageData(str(e))
+            else:
+                LOG.warning('Image format %s did not match; '
+                            'unable to calculate virtual size',
+                            self.image.disk_format)
+        except format_inspector.SafetyCheckFailed as e:
+            nonfatal = set(CONF.image_format.gpt_safety_checks_nonfatal)
+            fatal = e.failures.keys() - nonfatal
+            if self.image.disk_format in ('aki', 'ari'):
+                # For image formats that may have an
+                # intentionally-invalid GPT/MBR header, we always treat the
+                # MBR check as non-fatal. Things like kernel images may
+                # contain an intentionally-invalid but recognizeable MBR
+                # header which this check would reject. For things we expect
+                # to be GPT (including raw) we want that check to fail but
+                # we can be tolerant for the non-disk-image types.
+                fatal.discard('mbr')
+            if inspector.NAME == 'gpt' and not fatal:
+                # All the failures were non-fatal (per config or policy) so
+                # log them and continue
+                LOG.warning('Non-fatal %s', e)
+            else:
+                LOG.warning('Image %s %s', format, e)
+                raise exception.InvalidImageData('Image failed safety checks')
+        except Exception as e:
+            LOG.error(_LE('Unable to determine stream format because: %s'), e)
+            # FIXME(danms): Do this based on config
+            if CONF.image_format.require_image_format_match:
+                raise exception.InvalidImageData(
+                    _('Image format inspection failed'))
 
-    @debtcollector.removals.remove(
-        message="This will be removed in the N cycle.")
-    def _verify_signature_if_needed(self, checksum):
-        # Verify the signature (if correct properties are present)
-        if (signature_utils.should_verify_signature(
-                self.image.extra_properties)):
-            # NOTE(bpoulos): if verification fails, exception will be raised
-            result = signature_utils.verify_signature(
-                self.context, checksum, self.image.extra_properties)
-            if result:
-                LOG.info(_LI("Successfully verified signature for image %s"),
-                         self.image.image_id)
+        if virtual_size:
+            self.image.virtual_size = virtual_size
+
+        if set_active and self.image.status != 'active':
+            self.image.status = 'active'
 
     def get_data(self, offset=0, chunk_size=None):
         if not self.image.locations:
@@ -470,22 +710,28 @@ class ImageProxy(glance.domain.proxy.Image):
         err = None
         for loc in self.image.locations:
             try:
-                data, size = self.store_api.get_from_backend(
-                    loc['url'],
-                    offset=offset,
-                    chunk_size=chunk_size,
-                    context=self.context)
+                backend = loc['metadata'].get('store')
+                if CONF.enabled_backends:
+                    data, size = self.store_api.get(
+                        loc['url'], backend, offset=offset,
+                        chunk_size=chunk_size, context=self.context
+                    )
+                else:
+                    data, size = self.store_api.get_from_backend(
+                        loc['url'],
+                        offset=offset,
+                        chunk_size=chunk_size,
+                        context=self.context)
 
                 return data
             except Exception as e:
-                LOG.warn(_('Get image %(id)s data failed: '
-                           '%(err)s.')
-                         % {'id': self.image.image_id,
-                            'err': encodeutils.exception_to_unicode(e)})
+                LOG.warning(_LW('Get image %(id)s data failed: '
+                                '%(err)s.'),
+                            {'id': self.image.image_id, 'err': e})
                 err = e
         # tried all locations
         LOG.error(_LE('Glance tried all active locations to get data for '
-                      'image %s but all have failed.') % self.image.image_id)
+                      'image %s but all have failed.'), self.image.image_id)
         raise err
 
 
@@ -498,13 +744,31 @@ class ImageMemberRepoProxy(glance.domain.proxy.Repo):
         super(ImageMemberRepoProxy, self).__init__(repo)
 
     def _set_acls(self):
-        public = self.image.visibility == 'public'
+        public = self.image.visibility in ['public', 'community']
         if self.image.locations and not public:
             member_ids = [m.member_id for m in self.repo.list()]
             for location in self.image.locations:
-                self.store_api.set_acls(location['url'], public=public,
-                                        read_tenants=member_ids,
-                                        context=self.context)
+                if CONF.enabled_backends:
+                    # NOTE(whoami-rajat): Do not set_acls if store is not
+                    # defined on this node. This is possible in case of edge
+                    # deployment that image location is present but the actual
+                    # store is not related to this node.
+                    image_store = location['metadata'].get('store')
+                    if image_store not in CONF.enabled_backends:
+                        msg = (_("Store %s is not available on "
+                                 "this node, skipping `_set_acls` "
+                                 "call.") % image_store)
+                        LOG.debug(msg)
+                        continue
+                    self.store_api.set_acls_for_multi_store(
+                        location['url'], image_store,
+                        public=public, read_tenants=member_ids,
+                        context=self.context
+                    )
+                else:
+                    self.store_api.set_acls(location['url'], public=public,
+                                            read_tenants=member_ids,
+                                            context=self.context)
 
     def add(self, member):
         super(ImageMemberRepoProxy, self).add(member)

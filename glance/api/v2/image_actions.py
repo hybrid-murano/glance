@@ -12,11 +12,15 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+
+import http.client as http
+
 import glance_store
 from oslo_log import log as logging
 import webob.exc
 
 from glance.api import policy
+from glance.api.v2 import policy as api_policy
 from glance.common import exception
 from glance.common import utils
 from glance.common import wsgi
@@ -43,9 +47,22 @@ class ImageActionsController(object):
     def deactivate(self, req, image_id):
         image_repo = self.gateway.get_repo(req.context)
         try:
+            # FIXME(danms): This will still enforce the get_image policy
+            # which we don't want
             image = image_repo.get(image_id)
+
+            # NOTE(abhishekk): This is the right place to check whether user
+            # have permission to deactivate the image and remove the policy
+            # check later from the policy layer.
+            api_pol = api_policy.ImageAPIPolicy(req.context, image,
+                                                self.policy)
+            api_pol.deactivate_image()
+
+            status = image.status
             image.deactivate()
-            image_repo.save(image)
+            # not necessary to change the status if it's already 'deactivated'
+            if status == 'active':
+                image_repo.save(image, from_state='active')
             LOG.info(_LI("Image %s is deactivated"), image_id)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
@@ -59,9 +76,22 @@ class ImageActionsController(object):
     def reactivate(self, req, image_id):
         image_repo = self.gateway.get_repo(req.context)
         try:
+            # FIXME(danms): This will still enforce the get_image policy
+            # which we don't want
             image = image_repo.get(image_id)
+
+            # NOTE(abhishekk): This is the right place to check whether user
+            # have permission to reactivate the image and remove the policy
+            # check later from the policy layer.
+            api_pol = api_policy.ImageAPIPolicy(req.context, image,
+                                                self.policy)
+            api_pol.reactivate_image()
+
+            status = image.status
             image.reactivate()
-            image_repo.save(image)
+            # not necessary to change the status if it's already 'active'
+            if status == 'deactivated':
+                image_repo.save(image, from_state='deactivated')
             LOG.info(_LI("Image %s is reactivated"), image_id)
         except exception.NotFound as e:
             raise webob.exc.HTTPNotFound(explanation=e.msg)
@@ -75,10 +105,10 @@ class ImageActionsController(object):
 class ResponseSerializer(wsgi.JSONResponseSerializer):
 
     def deactivate(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
     def reactivate(self, response, result):
-        response.status_int = 204
+        response.status_int = http.NO_CONTENT
 
 
 def create_resource():

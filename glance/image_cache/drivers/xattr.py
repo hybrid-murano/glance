@@ -20,7 +20,7 @@ that has atimes set.
 Assumptions
 ===========
 
-1. Cache data directory exists on a filesytem that updates atime on
+1. Cache data directory exists on a filesystem that updates atime on
    reads ('noatime' should NOT be set)
 
 2. Cache data directory exists on a filesystem that supports xattrs.
@@ -50,8 +50,6 @@ $image_cache_dir/
   invalid/
   queue/
 """
-
-from __future__ import absolute_import
 from contextlib import contextmanager
 import errno
 import os
@@ -60,13 +58,12 @@ import time
 
 from oslo_config import cfg
 from oslo_log import log as logging
-from oslo_utils import encodeutils
 from oslo_utils import excutils
-import six
+from oslo_utils import fileutils
 import xattr
 
 from glance.common import exception
-from glance.i18n import _, _LI, _LW
+from glance.i18n import _, _LI
 from glance.image_cache.drivers import base
 
 LOG = logging.getLogger(__name__)
@@ -115,8 +112,7 @@ class Driver(base.Driver):
                                                        reason=msg)
         else:
             # Cleanup after ourselves...
-            if os.path.exists(fake_image_filepath):
-                os.unlink(fake_image_filepath)
+            fileutils.delete_if_exists(fake_image_filepath)
 
     def get_cache_size(self):
         """
@@ -157,7 +153,6 @@ class Driver(base.Driver):
             entry['hits'] = self.get_hit_count(image_id)
 
             entries.append(entry)
-        entries.sort()  # Order by ID
         return entries
 
     def is_cached(self, image_id):
@@ -222,7 +217,7 @@ class Driver(base.Driver):
         """
         files = [f for f in get_all_regular_files(self.queue_dir)]
         for file in files:
-            os.unlink(file)
+            fileutils.delete_if_exists(file)
         return len(files)
 
     def delete_queued_image(self, image_id):
@@ -232,8 +227,7 @@ class Driver(base.Driver):
         :param image_id: Image ID
         """
         path = self.get_image_filepath(image_id, 'queue')
-        if os.path.exists(path):
-            os.unlink(path)
+        fileutils.delete_if_exists(path)
 
     def get_least_recently_accessed(self):
         """
@@ -280,16 +274,17 @@ class Driver(base.Driver):
             if self.is_queued(image_id):
                 LOG.debug("Removing image '%s' from queue after "
                           "caching it.", image_id)
-                os.unlink(self.get_image_filepath(image_id, 'queue'))
+                fileutils.delete_if_exists(
+                    self.get_image_filepath(image_id, 'queue'))
 
         def rollback(e):
-            set_attr('error', encodeutils.exception_to_unicode(e))
+            set_attr('error', str(e))
 
             invalid_path = self.get_image_filepath(image_id, 'invalid')
             LOG.debug("Fetch of cache file failed (%(e)s), rolling back by "
                       "moving '%(incomplete_path)s' to "
                       "'%(invalid_path)s'",
-                      {'e': encodeutils.exception_to_unicode(e),
+                      {'e': e,
                        'incomplete_path': incomplete_path,
                        'invalid_path': invalid_path})
             os.rename(incomplete_path, invalid_path)
@@ -432,12 +427,8 @@ def get_all_regular_files(basepath):
 
 
 def delete_cached_file(path):
-    if os.path.exists(path):
-        LOG.debug("Deleting image cache file '%s'", path)
-        os.unlink(path)
-    else:
-        LOG.warn(_LW("Cached image file '%s' doesn't exist, unable to"
-                     " delete") % path)
+    LOG.debug("Deleting image cache file '%s'", path)
+    fileutils.delete_if_exists(path)
 
 
 def _make_namespaced_xattr_key(key, namespace='user'):
@@ -483,10 +474,8 @@ def set_xattr(path, key, value):
     If xattrs aren't supported by the file-system, we skip setting the value.
     """
     namespaced_key = _make_namespaced_xattr_key(key)
-    if not isinstance(value, six.binary_type):
-        value = str(value)
-        if six.PY3:
-            value = value.encode('utf-8')
+    if not isinstance(value, bytes):
+        value = str(value).encode('utf-8')
     xattr.setxattr(path, namespaced_key, value)
 
 

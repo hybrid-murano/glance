@@ -15,20 +15,16 @@
 #    under the License.
 
 import datetime
+from unittest import mock
 import uuid
 
-import mock
+import glance.async_
+from glance.common import exception
+from glance import domain
+import glance.tests.utils as test_utils
 from oslo_config import cfg
 import oslo_utils.importutils
-
-import glance.async
-from glance.async import taskflow_executor
-from glance.common import exception
-from glance.common.glare import definitions
-from glance.common import timeutils
-from glance import domain
-from glance.glare import domain as artifacts_domain
-import glance.tests.utils as test_utils
+from oslo_utils import timeutils
 
 
 CONF = cfg.CONF
@@ -50,7 +46,7 @@ class TestImageFactory(test_utils.BaseTestCase):
         self.assertIsNotNone(image.created_at)
         self.assertEqual(image.created_at, image.updated_at)
         self.assertEqual('queued', image.status)
-        self.assertEqual('private', image.visibility)
+        self.assertEqual('shared', image.visibility)
         self.assertIsNone(image.owner)
         self.assertIsNone(image.name)
         self.assertIsNone(image.size)
@@ -70,7 +66,7 @@ class TestImageFactory(test_utils.BaseTestCase):
         self.assertIsNotNone(image.created_at)
         self.assertEqual(image.created_at, image.updated_at)
         self.assertEqual('queued', image.status)
-        self.assertEqual('private', image.visibility)
+        self.assertEqual('shared', image.visibility)
         self.assertEqual(TENANT1, image.owner)
         self.assertEqual('image-1', image.name)
         self.assertIsNone(image.size)
@@ -93,7 +89,7 @@ class TestImageFactory(test_utils.BaseTestCase):
         self.assertIsNotNone(image.created_at)
         self.assertEqual(image.created_at, image.updated_at)
         self.assertEqual('queued', image.status)
-        self.assertEqual('private', image.visibility)
+        self.assertEqual('shared', image.visibility)
         self.assertIsNone(image.owner)
         self.assertEqual('image-1', image.name)
         self.assertIsNone(image.size)
@@ -153,6 +149,8 @@ class TestImage(test_utils.BaseTestCase):
     def test_visibility_enumerated(self):
         self.image.visibility = 'public'
         self.image.visibility = 'private'
+        self.image.visibility = 'shared'
+        self.image.visibility = 'community'
         self.assertRaises(ValueError, setattr,
                           self.image, 'visibility', 'ellison')
 
@@ -298,7 +296,7 @@ class TestExtraProperties(test_utils.BaseTestCase):
         a_dict = {'foo': 'bar', 'snitch': 'golden'}
         extra_properties = domain.ExtraProperties(a_dict)
         ref_extra_properties = {'boo': 'far', 'gnitch': 'solden'}
-        self.assertFalse(extra_properties.__eq__(ref_extra_properties))
+        self.assertNotEqual(ref_extra_properties, extra_properties)
 
     def test_eq_with_unequal_ExtraProperties_object(self):
         a_dict = {'foo': 'bar', 'snitch': 'golden'}
@@ -306,13 +304,13 @@ class TestExtraProperties(test_utils.BaseTestCase):
         ref_extra_properties = domain.ExtraProperties()
         ref_extra_properties['gnitch'] = 'solden'
         ref_extra_properties['boo'] = 'far'
-        self.assertFalse(extra_properties.__eq__(ref_extra_properties))
+        self.assertNotEqual(ref_extra_properties, extra_properties)
 
     def test_eq_with_incompatible_object(self):
         a_dict = {'foo': 'bar', 'snitch': 'golden'}
         extra_properties = domain.ExtraProperties(a_dict)
         random_list = ['foo', 'bar']
-        self.assertFalse(extra_properties.__eq__(random_list))
+        self.assertNotEqual(random_list, extra_properties)
 
 
 class TestTaskFactory(test_utils.BaseTestCase):
@@ -325,7 +323,11 @@ class TestTaskFactory(test_utils.BaseTestCase):
         task_type = 'import'
         owner = TENANT1
         task_input = 'input'
+        image_id = 'fake_image_id'
+        user_id = 'fake_user'
+        request_id = 'fake_request_id'
         task = self.task_factory.new_task(task_type, owner,
+                                          image_id, user_id, request_id,
                                           task_input=task_input,
                                           result='test_result',
                                           message='test_message')
@@ -339,15 +341,21 @@ class TestTaskFactory(test_utils.BaseTestCase):
         self.assertEqual(task_input, task.task_input)
         self.assertEqual('test_message', task.message)
         self.assertEqual('test_result', task.result)
+        self.assertEqual(image_id, task.image_id)
+        self.assertEqual(user_id, task.user_id)
+        self.assertEqual(request_id, task.request_id)
 
     def test_new_task_invalid_type(self):
         task_type = 'blah'
+        image_id = 'fake_image_id'
+        user_id = 'fake_user'
+        request_id = 'fake_request_id'
         owner = TENANT1
         self.assertRaises(
             exception.InvalidTaskType,
             self.task_factory.new_task,
             task_type,
-            owner,
+            owner, image_id, user_id, request_id
         )
 
 
@@ -357,10 +365,14 @@ class TestTask(test_utils.BaseTestCase):
         super(TestTask, self).setUp()
         self.task_factory = domain.TaskFactory()
         task_type = 'import'
+        image_id = 'fake_image_id'
+        user_id = 'fake_user'
+        request_id = 'fake_request_id'
         owner = TENANT1
         task_ttl = CONF.task.task_time_to_live
         self.task = self.task_factory.new_task(task_type,
-                                               owner,
+                                               owner, image_id, user_id,
+                                               request_id,
                                                task_time_to_live=task_ttl)
 
     def test_task_invalid_status(self):
@@ -373,6 +385,9 @@ class TestTask(test_utils.BaseTestCase):
             task_type='import',
             status=status,
             owner=None,
+            image_id='fake_image_id',
+            user_id='fake_user',
+            request_id='fake_request_id',
             expires_at=None,
             created_at=timeutils.utcnow(),
             updated_at=timeutils.utcnow(),
@@ -439,7 +454,8 @@ class TestTask(test_utils.BaseTestCase):
 
     @mock.patch.object(timeutils, 'utcnow')
     def test_succeed(self, mock_utcnow):
-        mock_utcnow.return_value = datetime.datetime.utcnow()
+        mock_utcnow.return_value = datetime.datetime.now(
+            datetime.timezone.utc).replace(tzinfo=None)
         self.task.begin_processing()
         self.task.succeed('{"location": "file://home"}')
         self.assertEqual('success', self.task.status)
@@ -454,7 +470,8 @@ class TestTask(test_utils.BaseTestCase):
 
     @mock.patch.object(timeutils, 'utcnow')
     def test_fail(self, mock_utcnow):
-        mock_utcnow.return_value = datetime.datetime.utcnow()
+        mock_utcnow.return_value = datetime.datetime.now(
+            datetime.timezone.utc).replace(tzinfo=None)
         self.task.begin_processing()
         self.task.fail('{"message": "connection failed"}')
         self.assertEqual('failure', self.task.status)
@@ -467,12 +484,12 @@ class TestTask(test_utils.BaseTestCase):
             self.task.expires_at
         )
 
-    @mock.patch.object(glance.async.TaskExecutor, 'begin_processing')
+    @mock.patch.object(glance.async_.TaskExecutor, 'begin_processing')
     def test_run(self, mock_begin_processing):
-        executor = glance.async.TaskExecutor(context=mock.ANY,
-                                             task_repo=mock.ANY,
-                                             image_repo=mock.ANY,
-                                             image_factory=mock.ANY)
+        executor = glance.async_.TaskExecutor(context=mock.ANY,
+                                              task_repo=mock.ANY,
+                                              image_repo=mock.ANY,
+                                              image_factory=mock.ANY)
         self.task.run(executor)
 
         mock_begin_processing.assert_called_once_with(self.task.task_id)
@@ -485,6 +502,9 @@ class TestTaskStub(test_utils.BaseTestCase):
         self.task_type = 'import'
         self.owner = TENANT1
         self.task_ttl = CONF.task.task_time_to_live
+        self.image_id = 'fake_image_id'
+        self.user_id = 'fake_user'
+        self.request_id = 'fake_request_id'
 
     def test_task_stub_init(self):
         self.task_factory = domain.TaskFactory()
@@ -495,7 +515,10 @@ class TestTaskStub(test_utils.BaseTestCase):
             self.owner,
             'expires_at',
             'created_at',
-            'updated_at'
+            'updated_at',
+            self.image_id,
+            self.user_id,
+            self.request_id,
         )
         self.assertEqual(self.task_id, task.task_id)
         self.assertEqual(self.task_type, task.type)
@@ -504,6 +527,9 @@ class TestTaskStub(test_utils.BaseTestCase):
         self.assertEqual('expires_at', task.expires_at)
         self.assertEqual('created_at', task.created_at)
         self.assertEqual('updated_at', task.updated_at)
+        self.assertEqual(self.image_id, task.image_id)
+        self.assertEqual(self.user_id, task.user_id)
+        self.assertEqual(self.request_id, task.request_id)
 
     def test_task_stub_get_status(self):
         status = 'pending'
@@ -514,7 +540,10 @@ class TestTaskStub(test_utils.BaseTestCase):
             self.owner,
             'expires_at',
             'created_at',
-            'updated_at'
+            'updated_at',
+            self.image_id,
+            self.user_id,
+            self.request_id,
         )
         self.assertEqual(status, task.status)
 
@@ -546,7 +575,28 @@ class TestTaskExecutorFactory(test_utils.BaseTestCase):
         mock_executor.assert_called_once_with(context,
                                               self.task_repo,
                                               self.image_repo,
-                                              self.image_factory)
+                                              self.image_factory,
+                                              admin_repo=None)
+
+    def test_new_task_executor_with_admin(self):
+        admin_repo = mock.MagicMock()
+        task_executor_factory = domain.TaskExecutorFactory(
+            self.task_repo,
+            self.image_repo,
+            self.image_factory,
+            admin_repo=admin_repo)
+        context = mock.Mock()
+        with mock.patch.object(oslo_utils.importutils,
+                               'import_class') as mock_import_class:
+            mock_executor = mock.Mock()
+            mock_import_class.return_value = mock_executor
+            task_executor_factory.new_task_executor(context)
+
+        mock_executor.assert_called_once_with(context,
+                                              self.task_repo,
+                                              self.image_repo,
+                                              self.image_factory,
+                                              admin_repo=admin_repo)
 
     def test_new_task_executor_error(self):
         task_executor_factory = domain.TaskExecutorFactory(self.task_repo,
@@ -561,34 +611,7 @@ class TestTaskExecutorFactory(test_utils.BaseTestCase):
                               task_executor_factory.new_task_executor,
                               context)
 
-    def test_new_task_eventlet_backwards_compatibility(self):
-        context = mock.MagicMock()
-
-        self.config(task_executor='eventlet', group='task')
-
-        task_executor_factory = domain.TaskExecutorFactory(self.task_repo,
-                                                           self.image_repo,
-                                                           self.image_factory)
-
-        # NOTE(flaper87): "eventlet" executor. short name to avoid > 79.
-        te_evnt = task_executor_factory.new_task_executor(context)
-        self.assertIsInstance(te_evnt, taskflow_executor.TaskExecutor)
-
-
-class TestArtifact(definitions.ArtifactType):
-    prop1 = definitions.Dict()
-    prop2 = definitions.Integer(min_value=10)
-
-
-class TestArtifactTypeFactory(test_utils.BaseTestCase):
-
-    def setUp(self):
-        super(TestArtifactTypeFactory, self).setUp()
-        context = mock.Mock(owner='me')
-        self.factory = artifacts_domain.ArtifactFactory(context, TestArtifact)
-
-    def test_new_artifact_min_params(self):
-        artifact = self.factory.new_artifact("foo", "1.0.0-alpha")
-        self.assertEqual('creating', artifact.state)
-        self.assertEqual('me', artifact.owner)
-        self.assertTrue(artifact.id is not None)
+    def test_task_executor_eventlet_rejected(self):
+        self.assertRaises(ValueError,
+                          self.config,
+                          task_executor='eventlet', group='task')
