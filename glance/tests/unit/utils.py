@@ -47,10 +47,10 @@ BASE_URI = 'http://storeurl.com/container'
 
 def sort_url_by_qs_keys(url):
     # NOTE(kragniz): this only sorts the keys of the query string of a url.
-    # For example, an input of '/v2/tasks?sort_key=id&sort_dir=asc&limit=10'
-    # returns '/v2/tasks?limit=10&sort_dir=asc&sort_key=id'. This is to prevent
-    # non-deterministic ordering of the query string causing problems with unit
-    # tests.
+    # For example, an input of '/v2/images?sort_key=id&sort_dir=asc&limit=10'
+    # returns '/v2/images?limit=10&sort_dir=asc&sort_key=id'. This is to
+    # prevent non-deterministic ordering of the query string causing problems
+    # with unit tests.
 
     parsed = urllib.parse.urlparse(url)
     queries = urllib.parse.parse_qsl(parsed.query, True)

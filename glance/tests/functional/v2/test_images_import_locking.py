@@ -109,7 +109,7 @@ class TestImageImportLocking(functional.SynchronousAPIBase):
             # to avoid sqlite contention with the new import task.
             state['want_run'] = False
             first_import_task = self._wait_for_task_status(
-                first_import_task['id'], 'failure', max_sec=10)
+                image_id, first_import_task['id'], 'failure', max_sec=10)
             time.sleep(0.2)
         else:
             self.assertEqual(409, resp.status_code)
@@ -117,7 +117,8 @@ class TestImageImportLocking(functional.SynchronousAPIBase):
             # sqlite locks for later tests in this worker process.
             state['want_run'] = False
             first_import_task = self._wait_for_task_status_in(
-                first_import_task['id'], ('failure', 'success'), max_sec=10)
+                image_id, first_import_task['id'],
+                ('failure', 'success'), max_sec=10)
 
         self.addDetail('First task', ttc.text_content(str(first_import_task)))
 
@@ -144,7 +145,7 @@ class TestImageImportLocking(functional.SynchronousAPIBase):
             # Under native threads the replacement import may finish before
             # we poll; accept either in-progress or terminal success.
             second_import_task = self._wait_for_task_status_in(
-                second_import_task['id'],
+                image_id, second_import_task['id'],
                 ('processing', 'success'),
                 max_sec=10)
         else:
@@ -205,7 +206,8 @@ class TestImageImportLocking(functional.SynchronousAPIBase):
         def grab_task_status():
             image = self.api_get('/v2/images/%s' % image_id).json
             task_id = image['os_glance_import_task']
-            task = self.api_get('/v2/tasks/%s' % task_id).json
+            task = self._find_image_task(image_id, task_id)
+            self.assertIsNotNone(task)
             msg = task['message']
             if msg not in statuses:
                 statuses.append(msg)

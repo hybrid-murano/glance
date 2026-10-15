@@ -43,7 +43,6 @@ from glance import task_cancellation_tracker as tracker
 from glance.tests.unit import base
 from glance.tests.unit.keymgr import fake as fake_keymgr
 import glance.tests.unit.utils as unit_test_utils
-from glance.tests.unit.v2 import test_tasks_resource
 import glance.tests.utils as test_utils
 
 CONF = cfg.CONF
@@ -3600,8 +3599,7 @@ class TestImagesController(base.IsolatedUnitTest):
 
     @mock.patch.object(glance.notifier.ImageRepoProxy, 'get')
     def test_image_import_locked(self, mock_get):
-        task = test_tasks_resource._db_fixture(test_tasks_resource.UUID1,
-                                               status='pending')
+        task = _db_task_fixtures(UUID1, status='pending')
         self.db.task_create(None, task)
         image = FakeImage(status='uploading')
         # Image is locked with a valid task that has not aged out, so
@@ -3657,8 +3655,8 @@ class TestImagesController(base.IsolatedUnitTest):
             task_input = {'backend': ['store2']}
         else:
             task_input = {}
-        task = test_tasks_resource._db_fixture(
-            test_tasks_resource.UUID1,
+        task = _db_task_fixtures(
+            UUID1,
             status=task_status,
             input=task_input)
         self.db.task_create(None, task)
@@ -3766,8 +3764,8 @@ class TestImagesController(base.IsolatedUnitTest):
                           image, task, task.id)
 
     def test_enforce_lock_log_not_bustable(self, task_status='processing'):
-        task = test_tasks_resource._db_fixture(
-            test_tasks_resource.UUID1,
+        task = _db_task_fixtures(
+            UUID1,
             status=task_status)
         self.db.task_create(None, task)
         request = unit_test_utils.get_fake_request(tenant=TENANT1)
@@ -4075,8 +4073,7 @@ class TestImagesController(base.IsolatedUnitTest):
 
     @mock.patch.object(glance.notifier.ImageRepoProxy, 'get')
     def test_add_location_locked(self, mock_get):
-        task = test_tasks_resource._db_fixture(test_tasks_resource.UUID1,
-                                               status='pending')
+        task = _db_task_fixtures(UUID1, status='pending')
         self.db.task_create(None, task)
         image = FakeImage(status='queued')
         # Image is locked with a valid task that has not aged out, so
@@ -4109,8 +4106,8 @@ class TestImagesController(base.IsolatedUnitTest):
             task_input = {'backend': ['store2']}
         else:
             task_input = {}
-        task = test_tasks_resource._db_fixture(
-            test_tasks_resource.UUID1,
+        task = _db_task_fixtures(
+            UUID1,
             status=task_status,
             input=task_input)
         self.db.task_create(None, task)

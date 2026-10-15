@@ -20,7 +20,6 @@ from glance.api.v2 import metadef_objects
 from glance.api.v2 import metadef_properties
 from glance.api.v2 import metadef_resource_types
 from glance.api.v2 import metadef_tags
-from glance.api.v2 import tasks
 from glance.common import wsgi
 
 
@@ -31,9 +30,6 @@ class Controller(object):
             custom_image_properties)
         self.member_schema = image_members.get_schema()
         self.member_collection_schema = image_members.get_collection_schema()
-        self.task_schema = tasks.get_task_schema()
-        self.task_collection_schema = tasks.get_collection_schema()
-
         # Metadef schemas
         self.metadef_namespace_schema = metadef_namespaces.get_schema()
         self.metadef_namespace_collection_schema = (
@@ -66,12 +62,6 @@ class Controller(object):
 
     def members(self, req):
         return self.member_collection_schema.minimal()
-
-    def task(self, req):
-        return self.task_schema.minimal()
-
-    def tasks(self, req):
-        return self.task_collection_schema.minimal()
 
     def metadef_namespace(self, req):
         return self.metadef_namespace_schema.raw()

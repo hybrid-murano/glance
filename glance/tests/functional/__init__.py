@@ -869,10 +869,6 @@ class SynchronousAPIBase(test_utils.BaseTestCase):
 
         return image_id
 
-    def _task_api_get(self, url):
-        """GET a tasks API path (requires tasks_api_access/admin role)."""
-        return self.api_get(url, headers={'X-Roles': 'admin'})
-
     def _get_latest_task(self, image_id):
         tasks = self.api_get('/v2/images/%s/tasks' % image_id).json['tasks']
         tasks = sorted(tasks, key=lambda t: t['updated_at'])
@@ -890,19 +886,14 @@ class SynchronousAPIBase(test_utils.BaseTestCase):
                 return task
         return None
 
-    def _get_task_by_id(self, task_id):
-        """Get task by ID using admin credentials for reliable status."""
-        resp = self.api_get('/v2/tasks/%s' % task_id,
-                            headers=self._admin_headers())
-        if resp.status_code == 200:
-            return resp.json
-        return None
-
     def _get_import_task(self, image_id, task_id=None, exclude_task_ids=None,
                          max_sec=2, delay_sec=0.1):
         """Get import task for image. Retry if task is not ready yet."""
         if task_id is not None:
-            return self._task_api_get('/v2/tasks/%s' % task_id).json
+            task = self._find_image_task(image_id, task_id)
+            self.assertIsNotNone(
+                task, 'Task %s not found for image %s' % (task_id, image_id))
+            return task
 
         exclude_task_ids = set(exclude_task_ids or [])
         done_time = time.time() + max_sec
@@ -910,7 +901,9 @@ class SynchronousAPIBase(test_utils.BaseTestCase):
             image = self.api_get('/v2/images/%s' % image_id).json
             lock_task_id = image.get('os_glance_import_task')
             if lock_task_id and lock_task_id not in exclude_task_ids:
-                return self._task_api_get('/v2/tasks/%s' % lock_task_id).json
+                task = self._find_image_task(image_id, lock_task_id)
+                self.assertIsNotNone(task)
+                return task
 
             tasks = self.api_get('/v2/images/%s/tasks' % image_id).json['tasks']
             active_tasks = sorted(
@@ -919,8 +912,7 @@ class SynchronousAPIBase(test_utils.BaseTestCase):
                  and t['id'] not in exclude_task_ids],
                 key=lambda t: t['updated_at'])
             if active_tasks:
-                return self._task_api_get(
-                    '/v2/tasks/%s' % active_tasks[-1]['id']).json
+                return active_tasks[-1]
 
             # Import may fail before we observe an active task; use the
             # latest task once the import lock has been released.
@@ -928,23 +920,20 @@ class SynchronousAPIBase(test_utils.BaseTestCase):
                 [t for t in tasks if t['id'] not in exclude_task_ids],
                 key=lambda t: t['updated_at'])
             if recent_tasks:
-                return self._task_api_get(
-                    '/v2/tasks/%s' % recent_tasks[-1]['id']).json
+                return recent_tasks[-1]
 
             time.sleep(delay_sec)
 
         self.fail('Timed out waiting for import task on image %s' % image_id)
 
-    def _wait_for_task_status(self, task_id, expected_status, max_sec=2,
-                              delay_sec=0.1):
+    def _wait_for_task_status(self, image_id, task_id, expected_status,
+                              max_sec=2, delay_sec=0.1):
         """Wait until task has expected status."""
         done_time = time.time() + max_sec
         task = None
         while time.time() <= done_time:
-            task = self._get_task_by_id(task_id)
-            if task is None:
-                task = self._task_api_get('/v2/tasks/%s' % task_id).json
-            if task['status'] == expected_status:
+            task = self._find_image_task(image_id, task_id)
+            if task is not None and task['status'] == expected_status:
                 return task
             time.sleep(delay_sec)
 
@@ -952,7 +941,7 @@ class SynchronousAPIBase(test_utils.BaseTestCase):
         self.fail('Timed out waiting for task %s status %s (last status=%s)'
                   % (task_id, expected_status, last_status))
 
-    def _wait_for_task_status_in(self, task_id, expected_statuses,
+    def _wait_for_task_status_in(self, image_id, task_id, expected_statuses,
                                  max_sec=2, delay_sec=0.1):
         """Wait until task has one of the expected statuses."""
         if isinstance(expected_statuses, str):
@@ -960,10 +949,8 @@ class SynchronousAPIBase(test_utils.BaseTestCase):
         done_time = time.time() + max_sec
         task = None
         while time.time() <= done_time:
-            task = self._get_task_by_id(task_id)
-            if task is None:
-                task = self.api_get('/v2/tasks/%s' % task_id).json
-            if task['status'] in expected_statuses:
+            task = self._find_image_task(image_id, task_id)
+            if task is not None and task['status'] in expected_statuses:
                 return task
             time.sleep(delay_sec)
 
@@ -991,11 +978,7 @@ class SynchronousAPIBase(test_utils.BaseTestCase):
         done_time = time.time() + max_sec
         last_status = task['status']
         while time.time() <= done_time:
-            # Prefer /v2/tasks/{id} with admin credentials: the image tasks
-            # list can lag behind terminal status under CI load.
-            task = self._get_task_by_id(task_id)
-            if task is None:
-                task = self._find_image_task(image_id, task_id)
+            task = self._find_image_task(image_id, task_id)
             if task is not None:
                 last_status = task['status']
                 if task['status'] == 'failure':
@@ -1005,11 +988,6 @@ class SynchronousAPIBase(test_utils.BaseTestCase):
                               "(task status=success)")
             time.sleep(delay_sec)
 
-        try:
-            last_status = self._task_api_get(
-                '/v2/tasks/%s' % task_id).json['status']
-        except AssertionError:
-            pass
         self.fail('Timed out waiting for import failure on image %s '
                   '(last status=%s)' % (image_id, last_status))
 

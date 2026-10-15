@@ -186,7 +186,7 @@ class RequestTest(test_utils.BaseTestCase):
         self.assertIsNone(request.best_match_language())
 
     def test_http_error_response_codes(self):
-        sample_id, member_id, tag_val, task_id = 'abc', '123', '1', '2'
+        sample_id, member_id, tag_val = 'abc', '123', '1'
 
         """Makes sure v2 unallowed methods return 405"""
         unallowed_methods = [
@@ -194,8 +194,6 @@ class RequestTest(test_utils.BaseTestCase):
             ('/schemas/images', ['POST', 'PUT', 'DELETE', 'PATCH', 'HEAD']),
             ('/schemas/member', ['POST', 'PUT', 'DELETE', 'PATCH', 'HEAD']),
             ('/schemas/members', ['POST', 'PUT', 'DELETE', 'PATCH', 'HEAD']),
-            ('/schemas/task', ['POST', 'PUT', 'DELETE', 'PATCH', 'HEAD']),
-            ('/schemas/tasks', ['POST', 'PUT', 'DELETE', 'PATCH', 'HEAD']),
             ('/images', ['PUT', 'DELETE', 'PATCH', 'HEAD']),
             ('/images/%s' % sample_id, ['POST', 'PUT', 'HEAD']),
             ('/images/%s/file' % sample_id,
@@ -206,8 +204,6 @@ class RequestTest(test_utils.BaseTestCase):
                 ['PUT', 'DELETE', 'PATCH', 'HEAD']),
             ('/images/%s/members/%s' % (sample_id, member_id),
                 ['POST', 'PATCH', 'HEAD']),
-            ('/tasks', ['PUT', 'DELETE', 'PATCH', 'HEAD']),
-            ('/tasks/%s' % task_id, ['POST', 'PUT', 'PATCH', 'HEAD']),
         ]
         api = test_utils.FakeAuthMiddleware(router_v2.API(routes.Mapper()))
         for uri, methods in unallowed_methods:

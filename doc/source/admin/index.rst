@@ -11,7 +11,6 @@ Glance Administration Guide
    property-protections
    apache-httpd
    notifications
-   tasks
    controllingservers
    flows
    interoperable-image-import
