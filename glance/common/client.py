@@ -87,9 +87,10 @@ class HTTPSClientAuthConnection(http.client.HTTPSConnection):
 
     def __init__(self, host, port, key_file, cert_file,
                  ca_file, timeout=None, insecure=False):
+        # Keep CA trust explicit, including during HTTPS initialization.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         http.client.HTTPSConnection.__init__(self, host, port,
-                                             key_file=key_file,
-                                             cert_file=cert_file)
+                                             context=context)
         self.key_file = key_file
         self.cert_file = cert_file
         self.ca_file = ca_file
@@ -101,23 +102,26 @@ class HTTPSClientAuthConnection(http.client.HTTPSConnection):
         Connect to a host on a given (SSL) port.
         If ca_file is pointing somewhere, use it to check Server Certificate.
 
-        Redefined/copied and extended from httplib.py:1105 (Python 2.6.x).
-        This is needed to pass cert_reqs=ssl.CERT_REQUIRED as parameter to
-        ssl.wrap_socket(), which forces SSL to check server certificate against
-        our client certificate.
+        TLS protocols and ciphers follow platform policy; trust comes only
+        from ca_file.
         """
         sock = socket.create_connection((self.host, self.port), self.timeout)
         if self._tunnel_host:
             self.sock = sock
             self._tunnel()
-        # Check CA file unless 'insecure' is specified
-        if self.insecure is True:
-            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
-                                        cert_reqs=ssl.CERT_NONE)
-        else:
-            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
-                                        ca_certs=self.ca_file,
-                                        cert_reqs=ssl.CERT_REQUIRED)
+
+        # Rebuild trust so removed CAs are not retained on reconnect.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        if self.key_file and self.cert_file:
+            context.load_cert_chain(certfile=self.cert_file,
+                                    keyfile=self.key_file)
+        if self.insecure:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        elif self.ca_file:
+            context.load_verify_locations(cafile=self.ca_file)
+
+        self.sock = context.wrap_socket(sock, server_hostname=self.host)
 
 
 class BaseClient(object):
