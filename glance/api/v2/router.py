@@ -39,6 +39,7 @@ class API(wsgi.Router):
         reject_method_resource = wsgi.Resource(wsgi.RejectMethodController())
 
         schemas_resource = schemas.create_resource(custom_image_properties)
+        tasks_resource = tasks.create_resource()
         mapper.connect('/schemas/image',
                        controller=schemas_resource,
                        action='image',
@@ -78,17 +79,20 @@ class API(wsgi.Router):
                        allowed_methods='GET')
 
         mapper.connect('/schemas/task',
-                       controller=schemas_resource,
-                       action='task',
-                       conditions={'method': ['GET']})
+                       controller=tasks_resource,
+                       action='gone',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
         mapper.connect('/schemas/task',
                        controller=reject_method_resource,
                        action='reject',
                        allowed_methods='GET')
+
         mapper.connect('/schemas/tasks',
-                       controller=schemas_resource,
-                       action='tasks',
-                       conditions={'method': ['GET']})
+                       controller=tasks_resource,
+                       action='gone',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
         mapper.connect('/schemas/tasks',
                        controller=reject_method_resource,
                        action='reject',
@@ -557,15 +561,15 @@ class API(wsgi.Router):
                        action='reject',
                        allowed_methods='GET, PUT, DELETE')
 
-        tasks_resource = tasks.create_resource()
         mapper.connect('/tasks',
                        controller=tasks_resource,
-                       action='create',
+                       action='gone',
                        conditions={'method': ['POST']})
         mapper.connect('/tasks',
                        controller=tasks_resource,
-                       action='index',
-                       conditions={'method': ['GET']})
+                       action='gone',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
         mapper.connect('/tasks',
                        controller=reject_method_resource,
                        action='reject',
@@ -573,12 +577,14 @@ class API(wsgi.Router):
 
         mapper.connect('/tasks/{task_id}',
                        controller=tasks_resource,
-                       action='get',
-                       conditions={'method': ['GET']})
+                       action='gone',
+                       conditions={'method': ['GET']},
+                       body_reject=True)
         mapper.connect('/tasks/{task_id}',
                        controller=tasks_resource,
-                       action='delete',
-                       conditions={'method': ['DELETE']})
+                       action='gone',
+                       conditions={'method': ['DELETE']},
+                       body_reject=True)
         mapper.connect('/tasks/{task_id}',
                        controller=reject_method_resource,
                        action='reject',

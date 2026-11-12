@@ -248,11 +248,6 @@ can also be used to set policies for Image service actions.
 
           "manage_image_cache": "role:admin",
 
-          "get_task": "",
-          "get_tasks": "",
-          "add_task": "",
-          "modify_task": "",
-
           "deactivate": "",
           "reactivate": "",
 

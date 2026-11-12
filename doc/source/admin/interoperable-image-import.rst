@@ -59,23 +59,6 @@ be set:
     ``['glance-direct','web-download']``.  See the next section for a
     description of these import methods.
 
-Additionally, your policies must be such that an ordinary end user
-can manipulate tasks.  In releases prior to Pike, we recommended that
-the task-related policies be admin-only so that end users could not
-access the Tasks API.  In Pike, a new policy was introduced that controls
-access to the Tasks API.  Thus it is now possible to keep the individual
-task policies unrestricted while not exposing the Tasks API to end
-users.  Thus, the following is the recommended configuration for the
-task-related policies:
-
-.. code-block:: ini
-
-   "get_task": "",
-   "get_tasks": "",
-   "add_task": "",
-   "modify_task": "",
-   "tasks_api_access": "role:admin",
-
 Image Import Methods
 --------------------
 

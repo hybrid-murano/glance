@@ -1,0 +1,23 @@
+
+upgrade:
+  - |
+    Starting with the 2027.1 release, the deprecated Image API
+    ``/v2/tasks`` endpoints and their schema endpoints return ``410 Gone``.
+    Use the interoperable image import API and
+    ``GET /v2/images/{image_id}/tasks`` instead.
+
+    The public Tasks API was deprecated in Mitaka, has not been available to
+    non-admin users by default, and has not had meaningful test coverage for
+    at least three years. The following policy rules are removed and should
+    be deleted from customized policy files:
+
+    * ``get_task``
+    * ``get_tasks``
+    * ``add_task``
+    * ``modify_task``
+    * ``tasks_api_access``
+
+    The internal task machinery used by the interoperable image import
+    workflow is unchanged. Compatibility routes remain only to return
+    ``410 Gone``.
+
